@@ -232,6 +232,36 @@ fn uuid_short() -> String {
     uuid::Uuid::new_v4().to_string()[..8].to_string()
 }
 
+/// Sanitize LLM text output by redacting incomplete or invalid tool call markers.
+/// Valid, complete tool calls are preserved. Only applies to text shown to the user
+/// — the parser still sees the raw input for tool dispatch.
+pub fn sanitize_output(text: &str) -> String {
+    // Redact incomplete <tool_call ...> tags (no closing </tool_call)
+    let incomplete_re = regex::Regex::new(
+        r#"<tool_call\s+name="[^"]*"(?:\s+call_id="[^"]*")?\s*>(?:(?!</tool_call).)*$"#
+    ).unwrap();
+    let mut result = incomplete_re
+        .replace_all(text, "[invalid tool call]")
+        .to_string();
+
+    // Redact lone opening <tool_call tags without any attributes
+    let lone_tag_re = regex::Regex::new(r#"<tool_call[^>]*>"#).unwrap();
+    // Only strip if it wasn't already replaced above
+    result = lone_tag_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let tag = caps.get(0).unwrap().as_str();
+            // If it's a complete opening tag for a valid tool call (will have closing tag), keep it
+            if tag.contains("name=\"") {
+                tag.to_string()
+            } else {
+                "[invalid tool call]".to_string()
+            }
+        })
+        .to_string();
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

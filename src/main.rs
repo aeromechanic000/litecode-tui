@@ -411,14 +411,18 @@ fn run_app(
                 agent::retry::PipelineResult::StreamChunk { content } => {
                     // Remove thinking indicator on first chunk
                     ui_state.stop_thinking();
+                    // Sanitize forged tool call markers before display
+                    let sanitized = agent::tools_parser::sanitize_output(&content);
                     // Append chunk to streaming output — don't mark processing done
-                    ui_state.append_stream_chunk(&content);
+                    ui_state.append_stream_chunk(&sanitized);
                     continue;
                 }
                 agent::retry::PipelineResult::StreamDone { content } => {
                     app_state.is_processing = false;
                     ui_state.stop_thinking();
                     ui_state.finish_stream();
+                    // Sanitize output for display
+                    let content = agent::tools_parser::sanitize_output(&content);
                     tracing::info!("stream complete: {} bytes", content.len());
                     if content.len() < 100 {
                         tracing::warn!(
@@ -616,10 +620,13 @@ fn run_app(
                     tracing::debug!("plan content:\n{}", plan);
                     ui_state.stop_thinking();
                     if plan.starts_with("(plan unavailable") {
-                        // Plan step failed — proceed without plan
+                        // Plan step failed — extract actual error and proceed without plan
+                        let error_detail = plan
+                            .strip_prefix("(plan unavailable: ")
+                            .and_then(|s| s.strip_suffix(')'))
+                            .unwrap_or("unknown error");
                         ui_state.add_output(OutputLine::System(
-                            "Plan step skipped (fast model unavailable). Executing directly..."
-                                .into(),
+                            format!("Plan skipped ({}). Executing directly...", error_detail),
                         ));
                         ui_state.start_thinking();
                         spawn_execution_with_plan(
@@ -778,10 +785,6 @@ fn run_app(
                                         "user confirmed: applying file ({} remaining)",
                                         app_state.pending_confirmations.len()
                                     );
-                                    cache_approval_for_action(
-                                        &mut app_state.approval_cache,
-                                        &action,
-                                    );
                                     let sandbox =
                                         sandbox::Sandbox::new(app_state.workspace.clone());
                                     apply_pending_action(
@@ -851,12 +854,6 @@ fn run_app(
                                     std::mem::take(&mut app_state.pending_confirmations);
                                 let total = remaining.len();
                                 let mut applied = 0;
-                                for action in &remaining {
-                                    cache_approval_for_action(
-                                        &mut app_state.approval_cache,
-                                        action,
-                                    );
-                                }
                                 for action in remaining {
                                     apply_pending_action(
                                         &mut ui_state,
@@ -1410,6 +1407,10 @@ fn run_app(
                                     // Record in session
                                     app_state.current_session.add_message("user", &input);
                                     ui_state.start_thinking();
+                                    // Track KV cache prefix hash before spawning
+                                    app_state.context_manager.set_static_prefix_hash(
+                                        app_state.prompt_builder.static_prefix_hash()
+                                    );
                                     spawn_request_for_mode(
                                         &mut app_state,
                                         &ollama_client,
@@ -1645,6 +1646,7 @@ fn spawn_plan_then_execute(
     let fast_model = app_state.config.effective_fast_model().to_string();
     let endpoint = app_state.config.ollama_endpoint.clone();
     let connect_timeout = app_state.config.connect_timeout;
+    let context_window_limit = app_state.config.context_window_limit;
     let max_file_lines = app_state.config.max_file_lines;
     let input = input.to_string();
     let history_ctx = app_state
@@ -1683,6 +1685,7 @@ fn spawn_plan_then_execute(
             ollama_endpoint: endpoint,
             connect_timeout,
             fast_model: fast_model.clone(),
+            context_window_limit,
             ..config::Config::default()
         };
         let bg_client = match ollama::OllamaClient::new(&bg_config) {
@@ -1739,8 +1742,9 @@ fn spawn_plan_then_execute(
             }
             Err(e) => {
                 // Plan step failed — fall back to direct streaming without plan
+                tracing::warn!("plan step failed for fast model '{}': {}", fast_model, e);
                 let _ = tx.send(agent::retry::PipelineResult::PlanReady {
-                    plan: format!("(plan unavailable: {})", e),
+                    plan: format!("(plan unavailable: fast model '{}' — {})", fast_model, e),
                 });
             }
         }
@@ -2295,6 +2299,7 @@ fn spawn_skill_request(
     let max_retries = app_state.config.max_retries;
     let endpoint = app_state.config.ollama_endpoint.clone();
     let connect_timeout = app_state.config.connect_timeout;
+    let context_window_limit = app_state.config.context_window_limit;
     let user_message = args.to_string();
     let kind = if skill.name == "simplify" || skill.name == "review" || skill.name == "test" {
         agent::retry::ResponseKind::CodeImplementation
@@ -2329,6 +2334,7 @@ fn spawn_skill_request(
         let bg_config = config::Config {
             ollama_endpoint: endpoint,
             connect_timeout,
+            context_window_limit,
             ..config::Config::default()
         };
         let bg_client = match ollama::OllamaClient::new(&bg_config) {
@@ -2481,6 +2487,7 @@ fn spawn_agent_loop(
 
     let endpoint = app_state.config.ollama_endpoint.clone();
     let connect_timeout = app_state.config.connect_timeout;
+    let context_window_limit = app_state.config.context_window_limit;
     let workspace = app_state.workspace.clone();
     let tool_config = app_state.config.clone();
     let input = input.to_string();
@@ -2504,6 +2511,7 @@ fn spawn_agent_loop(
         let bg_config = config::Config {
             ollama_endpoint: endpoint,
             connect_timeout,
+            context_window_limit,
             ..config::Config::default()
         };
         let client = match ollama::OllamaClient::new(&bg_config) {
@@ -2796,6 +2804,7 @@ fn maybe_trigger_summarization(
 
     let endpoint = app_state.config.ollama_endpoint.clone();
     let connect_timeout = app_state.config.connect_timeout;
+    let context_window_limit = app_state.config.context_window_limit;
     let history = app_state.conversation_history.clone();
     let config = app_state.summarizer_config.clone();
 
@@ -2811,6 +2820,7 @@ fn maybe_trigger_summarization(
         let bg_config = config::Config {
             ollama_endpoint: endpoint,
             connect_timeout,
+            context_window_limit,
             ..config::Config::default()
         };
         let client = match ollama::OllamaClient::new(&bg_config) {
@@ -3220,25 +3230,6 @@ fn pending_action_risk(action: &app::PendingAction) -> approval::RiskLevel {
     }
 }
 
-fn cache_approval_for_action(cache: &mut approval::ApprovalCache, action: &app::PendingAction) {
-    match action {
-        app::PendingAction::WriteFile { path, .. } => {
-            let sig = approval::ApprovalCache::file_signature("write", &path.display().to_string());
-            cache.approve(&sig);
-        }
-        app::PendingAction::DeleteFile { path } => {
-            let sig =
-                approval::ApprovalCache::file_signature("delete", &path.display().to_string());
-            cache.approve(&sig);
-        }
-        app::PendingAction::ExecuteCommand { cmd, args } => {
-            let arg_strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            let sig = approval::ApprovalCache::command_signature(cmd, &arg_strs);
-            cache.approve(&sig);
-        }
-    }
-}
-
 /// Auto-apply all file changes (Auto mode — no confirmation needed).
 fn auto_apply_changes(
     app_state: &mut AppState,
@@ -3342,55 +3333,10 @@ fn enter_file_confirmation(
 
     app_state.clear_pending();
     let mut queued = 0;
-    let mut auto_approved = 0;
 
     for change in changes {
         let full_path = app_state.workspace.join(&change.path);
         let path_str = change.path.display().to_string();
-
-        // Check approval cache — skip already-approved items
-        let sig = approval::ApprovalCache::file_signature(&change.action, &path_str);
-        if app_state.approval_cache.is_approved(&sig)
-            || app_state.approval_cache.is_action_approved(&change.action)
-        {
-            // Auto-apply this cached approval
-            let fc = match if change.action == "delete" {
-                file_ops.prepare_delete(&full_path)
-            } else {
-                file_ops.prepare_write(&full_path, &change.content)
-            } {
-                Ok(fc) => fc,
-                Err(e) => {
-                    ui_state.add_output(OutputLine::Error(format!("Blocked {}: {}", path_str, e)));
-                    continue;
-                }
-            };
-            match file_ops.apply_change(&fc) {
-                Ok(()) => {
-                    ui_state.add_output(OutputLine::System(format!(
-                        "[cached] {} {}",
-                        if change.action == "delete" {
-                            "Deleted"
-                        } else {
-                            "Wrote"
-                        },
-                        path_str
-                    )));
-                    if change.action != "delete" {
-                        run_syntax_check(ui_state, &full_path, &sandbox);
-                        run_lsp_diagnostics(ui_state, &full_path, &app_state.workspace);
-                    }
-                    auto_approved += 1;
-                }
-                Err(e) => {
-                    ui_state.add_output(OutputLine::Error(format!(
-                        "Failed to apply {}: {}",
-                        path_str, e
-                    )));
-                }
-            }
-            continue;
-        }
 
         let fc = match if change.action == "delete" {
             file_ops.prepare_delete(&full_path)
@@ -3399,11 +3345,7 @@ fn enter_file_confirmation(
         } {
             Ok(fc) => fc,
             Err(e) => {
-                ui_state.add_output(OutputLine::Error(format!(
-                    "Blocked {}: {}",
-                    change.path.display(),
-                    e
-                )));
+                ui_state.add_output(OutputLine::Error(format!("Blocked {}: {}", path_str, e)));
                 continue;
             }
         };
@@ -3451,19 +3393,9 @@ fn enter_file_confirmation(
 
     if queued > 0 {
         app_state.awaiting_confirmation = true;
-        let extra = if auto_approved > 0 {
-            format!(" ({} auto-approved from cache)", auto_approved)
-        } else {
-            String::new()
-        };
         ui_state.add_output(OutputLine::System(format!(
-            "Apply {} file(s)? y/n/a (y=yes, n=no, a=apply all):{}",
-            queued, extra
-        )));
-    } else if auto_approved > 0 {
-        ui_state.add_output(OutputLine::System(format!(
-            "All {} file(s) auto-approved from cache.",
-            auto_approved
+            "Apply {} file(s)? y/n/a (y=yes, n=no, a=apply all):",
+            queued
         )));
     }
 }

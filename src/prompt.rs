@@ -1,6 +1,8 @@
 use crate::app::AppMode;
 use crate::config::Config;
 use crate::skills::SkillRegistry;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Priority for prompt sections — controls order and inclusion when budget is tight.
@@ -404,6 +406,30 @@ Always validate changes before applying (syntax checks, tests)."#
             .map(|l| l.content)
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+
+    /// Hash of the static prefix for KV cache stability validation.
+    /// This hash should remain constant across turns as long as mode, skills,
+    /// and project context don't change.
+    pub fn static_prefix_hash(&self) -> u64 {
+        let prefix = self.static_prefix();
+        let mut hasher = DefaultHasher::new();
+        prefix.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Validate that the prompt structure is KV-cache friendly.
+    /// Returns Ok if the static prefix is stable and doesn't contain volatile data.
+    pub fn validate_for_kv_cache(&self) -> Result<(), String> {
+        let static_text = self.static_prefix();
+        // Date/time must only appear in the volatile tail (environment block)
+        if static_text.contains("Date:") || static_text.contains("Current date:") {
+            return Err("Static prefix contains date/time — this breaks KV cache stability".into());
+        }
+        if static_text.is_empty() {
+            return Err("Static prefix is empty — no cache benefit".into());
+        }
+        Ok(())
     }
 }
 

@@ -538,10 +538,9 @@ LitePilot is local-first with Ollama. Multi-provider support is out of scope.
 | **P1** | M11.1 (Working set), M11.2 (Session resume), M11.3 (Project context), M11.4 (Init optimization), M11.5 (Session recap) | Daily usability — DONE |
 | **P2** | M12.2 (Stream guardrails), M12.3 (Risk approval), M12.4 (Auto routing) | Production hardening — DONE |
 | **P3** | M13.1 (Snapshots), M13.2 (Hooks), M13.3 (OS sandbox), M13.4 (LSP) | Enterprise-grade features — DONE |
-
-**Recommended order:** M10.5.1 → M10.5.2 (P0 scaffolding) → M10.5.3 →
-M10.5.4 → M10.5.5 (P1 scaffolding) → Phase 11 (usability). The scaffolding
-builds on Phase 10's foundations and makes them actually reliable for small models.
+| **P1** | M14.1–M14.4 | Agent reliability & transport hardening — TODO |
+| **P2** | M14.5–M14.7 | KV cache optimization & context management — TODO |
+| **P3** | M14.8 | Hardware-aware adaptation — TODO |
 
 ---
 
@@ -583,3 +582,238 @@ cargo test -- --ignored             # Integration tests (needs Ollama)
 cargo clippy -- -D warnings         # Zero warnings
 cargo fmt --check                   # Zero formatting issues
 ```
+
+---
+
+## Phase 14 — Agent Reliability & KV Cache Optimization (v3.0)
+
+Reference: `notes/guide-to-ollama-kv-cache-and-context-management.md`,
+`notes/challenges-and-ideas-to-small-model-coding-agents.md`,
+`notes/deepseek-tui-agent-design.md`
+
+Phases 10–13 built the core agent. Phase 14 closes the remaining gaps
+identified by comparing with the design notes. Focus areas: accurate token
+management, tool execution efficiency, transport resilience, and KV cache
+prefix stability.
+
+---
+
+### M14.1 Accurate Token Counting via `/api/tokenize` — P1 TODO
+
+**Problem:** Context window management (`context::build_messages`,
+`context_usage_percent`) relies on heuristic token estimation (~4 chars/token).
+This is inaccurate — can overshoot (truncating too aggressively) or undershoot
+(risking context overflow and Ollama errors). The KV cache guide explicitly
+recommends using `/api/tokenize` for precise counts.
+
+**Target:** Use Ollama's `/api/tokenize` endpoint for actual token counts in
+context budget calculations. Fall back to estimation only when the endpoint is
+unavailable.
+
+**Tasks:**
+- [ ] Add `tokenize(model, prompt) -> Result<usize>` to `OllamaClient` — calls `POST /api/tokenize`
+- [ ] Cache tokenize results per model (HashMap<String, usize>) to avoid redundant API calls for the same prompt
+- [ ] Replace `estimate_prompt_tokens()` calls in `context::build_messages()` with `tokenize()` for budget calculation
+- [ ] Use `tokenize()` in context overflow detection (`ContextManager::context_usage_percent`) when the model is known
+- [ ] Keep `estimate_prompt_tokens()` as fallback for offline/tokenize-failure cases
+- [ ] Add context budget test: build_messages stays within 90% of window with actual token counts
+- [ ] Add wiremock test for tokenize endpoint with mocked responses
+
+**Files:** `src/ollama/mod.rs`, `src/ollama/chat.rs`, `src/context.rs`, `src/util/text.rs`
+
+---
+
+### M14.2 Parallel Tool Execution — P1 TODO
+
+**Problem:** The agent loop executes tools one at a time, even when multiple
+read-only tools (read_file, list_dir, search_files) could run concurrently.
+This is a significant latency penalty, especially for multi-tool agent turns
+where the LLM requests 3–5 file reads.
+
+**Target:** Classify tools as parallel-safe (read-only) or serial (writes,
+commands). Execute parallel-safe tools concurrently using `join_all`. Serial
+tools execute one at a time with approval gates.
+
+**Tasks:**
+- [ ] Add `ToolCapability` enum to `src/tools/mod.rs`: `ReadOnly`, `Write`, `SideEffect`
+- [ ] Add `fn capabilities(&self) -> Vec<ToolCapability>` to the tool trait
+- [ ] Classify existing tools: read_file/list_dir/search_files = ReadOnly, write_file/edit_file = Write, exec_shell = SideEffect
+- [ ] In `agent_loop.rs`, split tool calls into batches: parallel-safe batch vs serial queue
+- [ ] Execute parallel batch with `tokio::join!` or `futures::join_all`
+- [ ] Collect all parallel results before feeding back to LLM
+- [ ] Maintain ordering in UI output (show parallel results in tool-call order)
+- [ ] Add integration test: 3 parallel reads complete faster than 3 serial reads
+
+**Files:** `src/tools/mod.rs`, `src/agent/agent_loop.rs`, `src/tools/file_ops.rs`, `src/tools/search.rs`
+
+---
+
+### M14.3 Fake Tool Call Detection & Stream Hardening — P1 TODO
+
+**Problem:** Small models sometimes output text that mimics tool-call markers
+(e.g., `[TOOL_CALL]`, `<tool_call`) in their regular text responses. This can
+cause the parser to misinterpret prose as a tool invocation. DeepSeek-TUI
+scrubs these markers from text output to prevent prompt injection.
+
+Separately, if a streaming connection drops early (first few chunks), the user
+sees a confusing error. DeepSeek-TUI auto-retries transparently (up to 2x)
+before surfacing the error.
+
+**Target:** (a) Scrub forged tool-call markers from text output. (b) Add
+transparent stream retry on early failures.
+
+**Tasks:**
+- [ ] Add `scrub_tool_call_markers(text: &str) -> String` to `src/agent/tools_parser.rs`
+- [ ] Detect and remove: `[TOOL_CALL]`, `<tool_call`, `<function_call`, `### TOOL:` and similar patterns
+- [ ] Apply scrubbing to text chunks in `agent_loop.rs` before displaying
+- [ ] Add `MAX_TRANSPARENT_STREAM_RETRIES = 2` constant
+- [ ] In `generate_stream()`, if the stream fails before receiving any content chunks, retry automatically
+- [ ] Only surface error to user after all transparent retries exhausted
+- [ ] Add unit tests for marker scrubbing with various patterns
+- [ ] Add wiremock test: stream fails on first attempt, succeeds on retry
+
+**Files:** `src/agent/tools_parser.rs`, `src/ollama/chat.rs`, `src/agent/agent_loop.rs`
+
+---
+
+### M14.4 Exponential Backoff for Ollama Retries — P1 TODO
+
+**Problem:** `chat_with_retry()` retries immediately on failure. When Ollama
+is under load (e.g., model loading, GPU memory pressure), immediate retries
+compound the problem. DeepSeek-TUI uses exponential backoff with jitter for
+transient errors.
+
+**Target:** Add configurable backoff between retries. Distinguish between
+retryable errors (timeout, 500, connection reset) and non-retryable errors
+(404 model not found, 400 bad request).
+
+**Tasks:**
+- [ ] Add `LlmError` enum to `src/ollama/mod.rs` with variants: `Timeout`, `ServerError(status)`, `NetworkError`, `NotFound`, `InvalidRequest`
+- [ ] Add `LlmError::is_retryable() -> bool` — timeout/500/network = true, 404/400 = false
+- [ ] In `chat_with_retry()`, sleep with exponential backoff (1s, 2s, 4s) + random jitter (0–500ms) between retries
+- [ ] Skip retry entirely for non-retryable errors (return immediately with clear error message)
+- [ ] Log backoff timing: "retry {n}/{max} in {delay}ms for {error}"
+- [ ] Add config: `retry_backoff_base_ms = 1000` (default 1s base)
+- [ ] Add wiremock test: server returns 500, then 200 on retry with timing assertion
+
+**Files:** `src/ollama/mod.rs`, `src/agent/retry.rs`, `src/config.rs`
+
+---
+
+### M14.5 KV Cache Prefix Stability Audit — P2 TODO
+
+**Problem:** M10.2 implemented layered prompts with a static/volatile split,
+but the KV cache only gets a hit when the **byte-identical prefix** matches.
+If any part of the "static" layer changes between turns (e.g., date string
+leaking into the wrong layer, working set changing the injected file list),
+the entire prefix cache misses and all tokens must be recomputed.
+
+**Target:** Audit and guarantee that the static prefix is truly byte-stable
+across turns. Add a runtime verification mechanism.
+
+**Tasks:**
+- [ ] Audit `PromptBuilder::build()` to verify static layers don't include volatile data
+- [ ] Ensure `current_datetime()` is only in the volatile tail (verify it's not in system prompt, project context, or mode overlay)
+- [ ] Ensure working set summary is only in the volatile tail
+- [ ] Ensure conversation summary is only in the volatile tail
+- [ ] Add `PromptBuilder::static_hash() -> u64` — hash of the static prefix for cache validation
+- [ ] Log static hash at start of each request: if hash changes between turns, log warning with diff
+- [ ] Add unit test: build() called twice without config changes produces identical static prefix
+- [ ] Add integration test: KV cache hit rate > 80% on second turn with same model
+
+**Files:** `src/prompt.rs`, `src/main.rs`
+
+---
+
+### M14.6 Seam-Based Context Compaction — P2 TODO
+
+**Problem:** Current compaction uses LLM summarization (M10.3) which replaces
+older messages with a summary. This works but is lossy — specific code snippets,
+error messages, and file paths from earlier turns are compressed away. The
+DeepSeek-TUI design notes describe a "seam" approach: progressive compression
+with a verbatim recent window.
+
+**Target:** Multi-level context preservation. Recent turns (last N) stay
+verbatim. Older turns get progressively compressed. Important messages (errors,
+file changes, pinned) are always preserved.
+
+**Tasks:**
+- [ ] Add `SeamLevel` enum: `Verbatim`, `Compressed(summary)`, `Archived(dense_summary)`
+- [ ] Define soft seams at context thresholds (e.g., 50%, 75%, 90%)
+- [ ] Recent window: last 6 messages always verbatim (no summarization)
+- [ ] Mid window: messages older than 6 but within 50% of context get compressed to summaries
+- [ ] Deep window: messages beyond mid window get archived to dense one-line summaries
+- [ ] Pinned messages (errors, file paths, code patches) are never summarized
+- [ ] Progressive recompaction: on each new summarization trigger, existing seams can be fused into denser blocks
+- [ ] Replace current `maybe_compact()` + `compact_with_summary()` with seam-based approach
+- [ ] Add unit tests for seam level assignment and progressive compression
+
+**Files:** `src/context.rs`, `src/agent/summarizer.rs`
+
+---
+
+### M14.7 Config Propagation Fix for Background Threads — P2 TODO
+
+**Problem:** Background threads (plan step, summarizer, recap) construct their
+own `Config` with `..Config::default()`, which can miss user-configured values
+like `context_window_limit`. This caused the "fast model unavailable" bug
+(fixed in commit immediately after v2.3). The fix should be systemic: all
+background threads receive a complete config snapshot.
+
+**Target:** Ensure all background thread spawns receive a complete, consistent
+config rather than partial defaults.
+
+**Tasks:**
+- [ ] Audit all `std::thread::spawn` calls that create `OllamaClient` or `Config`
+- [ ] Identify every `..Config::default()` usage in background thread construction
+- [ ] For each: either (a) pass the full `app_state.config.clone()` or (b) pass only the specific fields needed via a dedicated struct
+- [ ] Add `BackgroundConfig` struct or similar to make the contract explicit — which fields are needed by each background operation
+- [ ] Verify `context_window_limit` is propagated everywhere `num_ctx` matters
+- [ ] Add tracing: log the actual `num_ctx` and `model` used by each background operation
+
+**Files:** `src/main.rs`, potentially `src/config.rs`
+
+---
+
+### M14.8 Hardware-Aware Inference Adaptation — P3 TODO
+
+**Problem:** Ollama may run on GPU (fast inference, large KV cache) or CPU
+(slow inference, memory-constrained). The agent has no awareness of this and
+uses the same timeouts, context windows, and retry strategies regardless. The
+KV cache guide recommends using `/api/show` for hardware detection.
+
+**Target:** Detect GPU/CPU mode at startup and adapt timeouts, context
+management, and UI indicators accordingly.
+
+**Tasks:**
+- [ ] Add `detect_hardware(endpoint, model) -> HardwareInfo` to `OllamaClient` — calls `GET /api/show`
+- [ ] `HardwareInfo` struct: `gpu: bool`, `vram_mb: Option<u64>`, `device_family: Option<String>` (cuda/metal/rocm/cpu)
+- [ ] Run hardware detection during startup, after model selection
+- [ ] Adapt timeouts: CPU mode uses longer timeouts (600s vs 300s for streaming)
+- [ ] Show hardware indicator in status bar: `GPU:metal` / `CPU`
+- [ ] On CPU: warn if context_window_limit > 32K — recommend smaller window
+- [ ] Log hardware info at startup for diagnostics
+- [ ] Fall back gracefully if `/api/show` doesn't include hardware fields
+
+**Files:** `src/ollama/mod.rs`, `src/ui/mod.rs`, `src/config.rs`, `src/main.rs`
+
+---
+
+## Phase 14 — Implementation Order
+
+```
+M14.7 Config propagation fix        (fix known bugs first)
+  → M14.1 Token counting            (foundation for context management)
+  → M14.5 KV cache prefix audit     (verify existing cache works correctly)
+  → M14.4 Exponential backoff       (transport resilience)
+  → M14.3 Fake tool call detection  (agent reliability)
+  → M14.2 Parallel tool execution   (performance)
+  → M14.6 Seam-based compaction     (advanced context management)
+  → M14.8 Hardware detection        (polish)
+```
+
+M14.7 and M14.1 are highest priority because they fix known bugs and provide
+the foundation (accurate token counts) that other improvements build on.
+M14.5 validates that the existing KV cache system actually works as intended.
+M14.2–M14.4 improve the agent loop reliability and performance.
+M14.6 and M14.8 are quality-of-life improvements for later.

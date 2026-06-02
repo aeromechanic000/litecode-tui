@@ -38,7 +38,8 @@ src/
 │
 ├── ollama/
 │   ├── mod.rs           OllamaClient + ContextManager (KV cache handle lifecycle,
-│   │                    cache hit rate, context usage tracking)
+│   │                    cache hit rate, context usage tracking, static prefix hash)
+│   │                    tokenize() for accurate token counting via /api/tokenize
 │   ├── chat.rs          /api/chat (blocking, for skills) + /api/generate (streaming,
 │   │                    with KV cache context handle reuse). GenerateChunk carries
 │   │                    prompt_eval_count, eval_count, context on final chunk.
@@ -48,13 +49,15 @@ src/
 ├── agent/
 │   ├── mod.rs           Agent pipeline: plan→edit→auto flow, file change parsing
 │   ├── agent_loop.rs    Tool-use agent loop: LLM ↔ tool dispatch cycle
-│   ├── tools_parser.rs  Parse text/JSON tool calls from LLM output
+│   ├── tools_parser.rs  Parse text/JSON tool calls from LLM output + sanitize_output()
+│   │                    scrubs forged tool call markers from display
 │   ├── planner.rs       Plan mode: builds prompt context for read-only analysis
 │   ├── editor.rs        Edit mode: generates file changes, presents diff for approval
 │   ├── auto_run.rs      Auto mode: full pipeline orchestration constants
 │   ├── prompts.rs       System prompts per model tier, model-size-adaptive templates
-│   ├── retry.rs         chat_with_retry(), PipelineResult (StreamChunk/StreamDone/
-│   │                    StreamMeta/PlanReady/StepStart/ToolStart/ToolResultReady)
+│   ├── retry.rs         chat_with_retry() with exponential backoff,
+│   │                    ErrorClass (Retryable/Permanent) error classification,
+│   │                    PipelineResult (StreamChunk/StreamDone/StreamMeta/...)
 │   ├── summarizer.rs    Background conversation summarization with priority pinning
 │   ├── diagnostics.rs   Post-write syntax diagnostics for correction feedback
 │   └── syntax.rs        Multi-language syntax checker (Python/JS/Shell/Rust/Go/C/C++)
@@ -95,7 +98,7 @@ src/
 │   ├── parser.rs        Markdown + YAML frontmatter skill parser
 │   └── builtin.rs       Built-in skills population to ~/.litepilot/skills/
 │
-├── approval.rs          Approval cache: file/command signature matching, risk classification
+├── approval.rs          Risk classification (Safe/Write/Destructive), command classification
 ├── hooks.rs             JsonlSink: structured event logging (turn start/complete, tool events)
 ├── logger.rs            File logging init (tracing-appender)
 ├── lsp.rs               LSP client: pyright, typescript-language-server, rust-analyzer
@@ -136,12 +139,13 @@ Subsequent requests:
 
 ### ContextManager (`ollama/mod.rs`)
 
-Tracks: `context_handle`, `total_prompt_tokens`, `last_prompt_eval_count`, `last_model`.
+Tracks: `context_handle`, `total_prompt_tokens`, `last_prompt_eval_count`, `last_model`, `static_prefix_hash`.
 
 - `context_handle_for_model(model)` — returns handle only if it matches the model (incompatible across models)
 - `update_from_response()` — stores new handle, replaces old, updates eval stats
 - `cache_hit_rate()` — `(total - prompt_eval_count) / total * 100%`
 - `context_usage_percent(window)` — current usage vs model's context window
+- `set_static_prefix_hash(hash)` — tracks static prompt prefix hash, warns on change (KV cache miss)
 
 ### Display in UI
 
@@ -169,6 +173,27 @@ Used for Auto mode code requests:
 2. LLM outputs tool calls → parsed by `tools_parser.rs` → executed via `tools/`
 3. Tool results fed back to LLM → repeat until `done`
 4. Events (ToolStart, ToolResult, TextChunk, Done) sent through PipelineResult channel
+
+---
+
+## Tool Call Sanitization
+
+`tools_parser::sanitize_output()` scrubs forged tool call markers from LLM text output
+before display. Incomplete `<tool_call` tags without closing markers are replaced with
+`[invalid tool call]`. Applied at the display layer in `StreamChunk` and `StreamDone`
+processing, so the parser still sees raw input for tool dispatch but the user never sees
+forged markers.
+
+---
+
+## Layered System Prompt & KV Cache Stability
+
+`PromptBuilder` (`src/prompt.rs`) separates the system prompt into:
+
+- **Static layers** (byte-identical across turns): base identity → mode overlay → skills → project context
+- **Volatile tail** (rebuilt each turn): working set summary, conversation summary, completed tasks, current goal, environment block (date/time)
+
+The static prefix is hashed (`static_prefix_hash()`) and tracked by `ContextManager`. If the hash changes between turns, a warning is logged indicating a KV cache miss. `validate_for_kv_cache()` checks that no volatile data (e.g., date/time) has leaked into static layers.
 
 ---
 
@@ -218,7 +243,7 @@ Prompts adapt to model size via `agent::prompts::system_prompt_for_size()`: shor
 | Edit | Yes | Yes | Required (/apply) | Shift+Tab |
 | Auto | Yes | Yes | None (sandboxed) | Shift+Tab |
 
-File change confirmation in Edit mode uses approval cache — already-approved files are auto-applied. Risk classification (Write/Destructive) requires double-key for destructive ops.
+File change confirmation in Edit mode requires y/n/a for every file change. Risk classification (Write/Destructive) requires double-key for destructive ops.
 
 ---
 
@@ -233,12 +258,23 @@ File change confirmation in Edit mode uses approval cache — already-approved f
 
 ## Response Validation & Retry
 
-Retries on **response quality** (not API errors) since local models can produce malformed output:
+Two retry layers:
+
+### Response Quality Retry
+Retries on **response quality** since local models can produce malformed output:
 
 1. `validate_response()` checks structure (file markers, code fences, action markers)
 2. On failure: builds correction prompt showing previous mistakes
 3. Retries up to `max_retries` times
 4. Returns Success / Exhausted (last attempt) / Failed (Ollama error)
+
+### Transport Retry with Exponential Backoff
+When `chat_with_retry()` encounters an Ollama error:
+
+1. `classify_error()` categorizes as Retryable (timeout, connection errors, 5xx) or Permanent (404, 400)
+2. Retryable errors: sleep with exponential backoff (1s base, doubling, 16s cap, with jitter), then retry
+3. Permanent errors: return immediately with descriptive message (e.g., "Model not found")
+4. Backoff prevents overwhelming Ollama during model loading or GPU memory pressure
 
 ---
 

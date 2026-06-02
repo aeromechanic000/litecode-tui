@@ -10,9 +10,9 @@ No cloud. No API keys. No data leaving your hardware. Runs on local Ollama model
 
 **Skills.** `/review` for code audits, `/explain` for understanding, `/simplify` for refactoring, `/test` for generating tests, `/search` for finding things. Add custom skills by dropping `.md` files in `~/.litepilot/skills/`.
 
-**Self-correction.** Validates its own output. When it produces malformed code blocks, it retries with an explanation of what went wrong.
+**Self-correction.** Validates its own output. When it produces malformed code blocks, it retries with an explanation of what went wrong. Retries use exponential backoff so Ollama isn't overwhelmed.
 
-**KV cache management.** Uses Ollama's `/api/generate` endpoint with manual context handle tracking for KV cache reuse across turns. Shows cache hit rate after each response and warns when context is getting full.
+**KV cache management.** Uses Ollama's `/api/generate` endpoint with manual context handle tracking for KV cache reuse across turns. Layered system prompts keep a byte-identical static prefix across turns for maximum cache hits. Shows cache hit rate after each response and warns when context is getting full.
 
 **Streaming.** Shows thoughts as they form, token by token.
 
@@ -75,7 +75,7 @@ It responds with file changes. Type `/apply` to write them to disk.
 
 ### KV Cache Context Management
 
-LitePilot tracks the KV cache context handle from Ollama's `/api/generate` responses. Each turn reuses the cached key-value tensors from the previous turn, avoiding redundant computation. The status bar shows context usage (`ctx:N%`), and after each response you'll see the cache hit rate:
+LitePilot tracks the KV cache context handle from Ollama's `/api/generate` responses. Each turn reuses the cached key-value tensors from the previous turn, avoiding redundant computation. The system prompt is split into static layers (identical across turns) and a volatile tail (per-turn data like date and working set) so the KV cache prefix matches reliably. The status bar shows context usage (`ctx:N%`), and after each response you'll see the cache hit rate:
 
 ```
 KV cache: 94.2% hit (1920 cached, 128 recomputed, 256 generated)
@@ -153,8 +153,10 @@ src/
 ├── ollama/              OllamaClient + ContextManager (KV cache handle lifecycle)
 │                          /api/generate (streaming, cache reuse)
 │                          /api/chat (blocking, for skills)
-├── agent/               Planning, editing, retry, tool-use agent loop,
-│                          summarization, syntax checking, diagnostics
+│                          /api/tokenize (accurate token counting)
+├── agent/               Planning, editing, retry with exponential backoff,
+│                          tool-use agent loop, summarization, syntax checking,
+│                          diagnostics, fake tool call scrubbing
 ├── tools/               Tool definitions for agent loop (file ops, search, shell)
 ├── sandbox/             Path validation, command filtering, platform sandboxes
 ├── search/              DuckDuckGo search with disk cache

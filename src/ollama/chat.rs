@@ -100,15 +100,28 @@ impl OllamaClient {
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("Sending chat request to Ollama at {}", url))?;
+            .with_context(|| {
+                format!(
+                    "Ollama at {} did not respond (is it running?) for model '{}'",
+                    url, model
+                )
+            })?;
 
         if resp.status() == StatusCode::NOT_FOUND {
-            anyhow::bail!("Model '{}' not found in Ollama", model);
+            anyhow::bail!(
+                "Ollama returned 404 for model '{}' — it may have been removed, try re-pulling",
+                model
+            );
         }
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Ollama chat error {}: {}", status, text);
+            anyhow::bail!(
+                "Ollama returned error {} for model '{}': {}",
+                status,
+                model,
+                text
+            );
         }
 
         let raw: serde_json::Value = resp.json().await?;

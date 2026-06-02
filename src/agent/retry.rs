@@ -127,6 +127,73 @@ fn truncate_for_context(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Whether an Ollama error is worth retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Transient error — safe to retry with backoff.
+    Retryable,
+    /// Permanent error — retries won't help (404, 400, parse failure).
+    Permanent,
+}
+
+/// Classify an error message from Ollama.
+pub fn classify_error(error_msg: &str) -> ErrorClass {
+    let lower = error_msg.to_lowercase();
+
+    // Model not found — user action needed
+    if lower.contains("404") || lower.contains("not found") {
+        return ErrorClass::Permanent;
+    }
+
+    // Bad request — our fault, retrying won't fix it
+    if lower.contains("400") || lower.contains("invalid request") {
+        return ErrorClass::Permanent;
+    }
+
+    // Rate limiting — retryable with longer delay
+    if lower.contains("429") || lower.contains("rate limit") {
+        return ErrorClass::Retryable;
+    }
+
+    // Timeout / connection errors — retryable
+    if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connect error")
+        || lower.contains("broken pipe")
+        || lower.contains("eof")
+    {
+        return ErrorClass::Retryable;
+    }
+
+    // Server errors — retryable (Ollama may be loading model)
+    if lower.contains("500")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+        || lower.contains("internal server error")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+    {
+        return ErrorClass::Retryable;
+    }
+
+    // Default: treat as permanent (validation, logic errors)
+    ErrorClass::Permanent
+}
+
+/// Exponential backoff delay: base 1s, doubling, capped at 16s, with random jitter.
+fn backoff_delay(attempt: usize) -> std::time::Duration {
+    let base_ms: u64 = 1000;
+    let max_ms: u64 = 16_000;
+    let delay_ms = base_ms.saturating_mul(2u64.saturating_pow(attempt as u32)).min(max_ms);
+    // Add 0-500ms jitter
+    let jitter = delay_ms % 500;
+    std::time::Duration::from_millis(delay_ms + jitter)
+}
+
 /// Runs a chat request with retry logic.
 ///
 /// On validation failure, retries up to `max_retries` times, appending
@@ -160,10 +227,31 @@ pub async fn chat_with_retry(
         let response = match client.chat(model, messages, think).await {
             Ok(r) => r,
             Err(e) => {
-                return RetryResult::Failed {
-                    last_error: format!("Ollama error: {:#}", e),
-                    attempts: attempt,
-                };
+                let error_msg = format!("{:#}", e);
+                match classify_error(&error_msg) {
+                    ErrorClass::Retryable if attempt < max_retries => {
+                        let delay = backoff_delay(attempt);
+                        tracing::warn!(
+                            "retryable error (attempt {}/{}): {}, retrying in {}ms",
+                            attempt + 1,
+                            max_retries,
+                            error_msg,
+                            delay.as_millis()
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    _ => {
+                        return RetryResult::Failed {
+                            last_error: if attempt > 0 {
+                                format!("Ollama error after {} retries: {}", attempt, error_msg)
+                            } else {
+                                format!("Ollama error: {}", error_msg)
+                            },
+                            attempts: attempt,
+                        };
+                    }
+                }
             }
         };
 

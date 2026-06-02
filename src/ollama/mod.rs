@@ -17,6 +17,7 @@ pub struct ContextManager {
     last_prompt_eval_count: Option<usize>,
     last_eval_count: Option<usize>,
     last_model: Option<String>,
+    static_prefix_hash: Option<u64>,
 }
 
 impl ContextManager {
@@ -27,6 +28,7 @@ impl ContextManager {
             last_prompt_eval_count: None,
             last_eval_count: None,
             last_model: None,
+            static_prefix_hash: None,
         }
     }
 
@@ -67,6 +69,26 @@ impl ContextManager {
         self.last_prompt_eval_count = None;
         self.last_eval_count = None;
         self.last_model = None;
+        self.static_prefix_hash = None;
+    }
+
+    /// Record the expected static prefix hash for KV cache validation.
+    pub fn set_static_prefix_hash(&mut self, hash: u64) {
+        if let Some(prev) = self.static_prefix_hash {
+            if prev != hash {
+                tracing::warn!(
+                    "KV cache: static prefix hash changed ({:016x} → {:016x}), expect cache miss",
+                    prev,
+                    hash
+                );
+            }
+        }
+        self.static_prefix_hash = Some(hash);
+    }
+
+    #[allow(dead_code)]
+    pub fn static_prefix_hash(&self) -> Option<u64> {
+        self.static_prefix_hash
     }
 
     /// Estimated KV cache hit rate as a percentage (0.0 – 100.0).
@@ -235,6 +257,49 @@ impl OllamaClient {
 
         result.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(result)
+    }
+
+    /// Count tokens using Ollama's `/api/tokenize` endpoint.
+    /// Returns the actual token count from the model's tokenizer.
+    pub async fn tokenize(&self, model: &str, text: &str) -> Result<usize> {
+        let url = format!("{}/api/tokenize", self.endpoint);
+        let body = serde_json::json!({
+            "model": model,
+            "prompt": text
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&body)
+            .send()
+            .await
+            .context("Calling Ollama /api/tokenize")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Tokenize request failed with status {}", resp.status());
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let count = json
+            .get("tokens")
+            .and_then(|t| t.as_array())
+            .map(|arr| arr.len())
+            .or_else(|| json.get("count").and_then(|c| c.as_u64()).map(|n| n as usize))
+            .ok_or_else(|| anyhow::anyhow!("Invalid tokenize response: no tokens array"))?;
+
+        Ok(count)
+    }
+
+    /// Count tokens exactly via `/api/tokenize`, falling back to heuristic estimation.
+    pub async fn count_tokens(&self, model: &str, text: &str) -> usize {
+        match self.tokenize(model, text).await {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::debug!("tokenize failed, using estimation: {}", e);
+                crate::util::text::estimate_tokens(text)
+            }
+        }
     }
 }
 
