@@ -30,8 +30,8 @@ pub enum ModelSlot {
 impl ModelSlot {
     fn label(&self) -> &'static str {
         match self {
-            ModelSlot::Exec => "Exec (6-14B)",
-            ModelSlot::Eval => "Eval (14B+)",
+            ModelSlot::Exec => "Exec",
+            ModelSlot::Eval => "Eval",
         }
     }
 
