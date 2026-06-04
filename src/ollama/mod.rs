@@ -261,6 +261,7 @@ impl OllamaClient {
 
     /// Count tokens using Ollama's `/api/tokenize` endpoint.
     /// Returns the actual token count from the model's tokenizer.
+    #[allow(dead_code)]
     pub async fn tokenize(&self, model: &str, text: &str) -> Result<usize> {
         let url = format!("{}/api/tokenize", self.endpoint);
         let body = serde_json::json!({
@@ -292,6 +293,7 @@ impl OllamaClient {
     }
 
     /// Count tokens exactly via `/api/tokenize`, falling back to heuristic estimation.
+    #[allow(dead_code)]
     pub async fn count_tokens(&self, model: &str, text: &str) -> usize {
         match self.tokenize(model, text).await {
             Ok(count) => count,

@@ -420,6 +420,7 @@ Always validate changes before applying (syntax checks, tests)."#
 
     /// Validate that the prompt structure is KV-cache friendly.
     /// Returns Ok if the static prefix is stable and doesn't contain volatile data.
+    #[allow(dead_code)]
     pub fn validate_for_kv_cache(&self) -> Result<(), String> {
         let static_text = self.static_prefix();
         // Date/time must only appear in the volatile tail (environment block)

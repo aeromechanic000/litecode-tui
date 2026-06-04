@@ -80,11 +80,13 @@ impl ApprovalCache {
     }
 
     /// Build a signature for a file action: "write:path" or "delete:path".
+    #[allow(dead_code)]
     pub fn file_signature(action: &str, path: &str) -> String {
         format!("{}:{}", action, path)
     }
 
     /// Build a signature for a command: "exec:cmd arg1 arg2".
+    #[allow(dead_code)]
     pub fn command_signature(cmd: &str, args: &[&str]) -> String {
         if args.is_empty() {
             format!("exec:{}", cmd)
@@ -99,6 +101,7 @@ impl ApprovalCache {
     }
 
     /// Record an approval for the rest of the session.
+    #[allow(dead_code)]
     pub fn approve(&mut self, signature: &str) {
         self.approved.insert(signature.to_string());
     }
@@ -112,6 +115,7 @@ impl ApprovalCache {
     }
 
     /// Check if an action type has wildcard approval.
+    #[allow(dead_code)]
     pub fn is_action_approved(&self, action: &str) -> bool {
         self.approved.contains(&format!("{}:*", action))
     }
