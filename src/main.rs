@@ -110,10 +110,9 @@ fn main() -> Result<()> {
         config.ollama_endpoint
     );
     tracing::info!(
-        "models: fast={} core={} audit={}",
-        config.effective_fast_model(),
-        config.core_model,
-        config.effective_audit_model()
+        "models: exec={} eval={}",
+        config.exec_model,
+        config.effective_eval_model()
     );
     tracing::info!("mode: {}", config.default_mode);
 
@@ -290,10 +289,9 @@ fn run_app(
             app_state.config.ollama_endpoint
         )));
         ui_state.add_output(OutputLine::System(format!(
-            "[Fast]:{} [Core]:{} [Audit]:{}",
-            app_state.config.effective_fast_model(),
-            app_state.config.core_model,
-            app_state.config.effective_audit_model()
+            "[Exec]:{} [Eval]:{}",
+            app_state.config.exec_model,
+            app_state.config.effective_eval_model()
         )));
     } else {
         tracing::error!("ollama ping FAILED: {}", app_state.config.ollama_endpoint);
@@ -323,7 +321,7 @@ fn run_app(
                     match &r {
                         agent::retry::RetryResult::Success { content, attempts } => {
                             app_state.event_sink.turn_complete(
-                                &app_state.config.core_model,
+                                &app_state.config.exec_model,
                                 content.len(),
                                 *attempts,
                                 0,
@@ -334,7 +332,7 @@ fn run_app(
                             content, attempts, ..
                         } => {
                             app_state.event_sink.turn_complete(
-                                &app_state.config.core_model,
+                                &app_state.config.exec_model,
                                 content.len(),
                                 *attempts,
                                 0,
@@ -451,7 +449,7 @@ fn run_app(
                         let history_before = app_state.conversation_history.len();
                         context::maybe_compact(
                             &mut app_state.conversation_history,
-                            &app_state.config.core_model,
+                            &app_state.config.exec_model,
                         );
                         if app_state.conversation_history.len() < history_before {
                             tracing::info!(
@@ -1500,19 +1498,14 @@ fn spawn_llm_request(
     input: &str,
     tx: mpsc::Sender<agent::retry::PipelineResult>,
 ) {
-    let model = if app_state.config.auto_model_routing {
-        match router::classify_request(input) {
-            router::ModelTier::Fast => app_state.config.effective_fast_model().to_string(),
-            router::ModelTier::Core => app_state.config.core_model.clone(),
-            router::ModelTier::Audit => app_state.config.effective_audit_model().to_string(),
-        }
-    } else {
-        app_state.config.core_model.clone()
+    let model = match router::classify_request(input) {
+        router::ModelTier::Exec => app_state.config.exec_model.clone(),
+        router::ModelTier::Eval => app_state.config.effective_eval_model().to_string(),
     };
     if model.is_empty() {
         let _ = tx.send(agent::retry::PipelineResult::Retry(
             agent::retry::RetryResult::Failed {
-                last_error: "No core model configured. Run setup or edit ~/.litepilot/config.toml"
+                last_error: "No exec model configured. Run setup or edit ~/.litepilot/config.toml"
                     .into(),
                 attempts: 0,
             },
@@ -1635,7 +1628,7 @@ fn spawn_llm_request(
     });
 }
 
-/// Plan-then-execute: runs a quick plan step on the fast model, sends PlanReady,
+/// Plan-then-execute: runs a quick plan step on the exec model, sends PlanReady,
 /// then the main loop waits for user approval before calling spawn_execution_with_plan.
 fn spawn_plan_then_execute(
     app_state: &AppState,
@@ -1643,7 +1636,7 @@ fn spawn_plan_then_execute(
     input: &str,
     tx: mpsc::Sender<agent::retry::PipelineResult>,
 ) {
-    let fast_model = app_state.config.effective_fast_model().to_string();
+    let exec_model = app_state.config.exec_model.clone();
     let endpoint = app_state.config.ollama_endpoint.clone();
     let connect_timeout = app_state.config.connect_timeout;
     let context_window_limit = app_state.config.context_window_limit;
@@ -1662,7 +1655,7 @@ fn spawn_plan_then_execute(
 
     tracing::info!(
         "spawn_plan_then_execute: model={}, history_msgs={}, workspace={}",
-        fast_model,
+        exec_model,
         app_state.conversation_history.len(),
         workspace.display()
     );
@@ -1684,7 +1677,7 @@ fn spawn_plan_then_execute(
         let bg_config = config::Config {
             ollama_endpoint: endpoint,
             connect_timeout,
-            fast_model: fast_model.clone(),
+            exec_model: exec_model.clone(),
             context_window_limit,
             ..config::Config::default()
         };
@@ -1701,7 +1694,7 @@ fn spawn_plan_then_execute(
             }
         };
 
-        // Quick plan step using fast model
+        // Quick plan step using exec model
         let project_listing = std::fs::read_dir(&workspace)
             .map(|entries| {
                 entries
@@ -1731,7 +1724,7 @@ fn spawn_plan_then_execute(
             ollama::chat::ChatMessage::user(&user_msg),
         ];
 
-        match rt.block_on(bg_client.chat(&fast_model, messages, false)) {
+        match rt.block_on(bg_client.chat(&exec_model, messages, false)) {
             Ok(resp) => {
                 let plan = resp.content;
                 let _ = tx.send(agent::retry::PipelineResult::PlanReady { plan: plan.clone() });
@@ -1742,9 +1735,9 @@ fn spawn_plan_then_execute(
             }
             Err(e) => {
                 // Plan step failed — fall back to direct streaming without plan
-                tracing::warn!("plan step failed for fast model '{}': {}", fast_model, e);
+                tracing::warn!("plan step failed for exec model '{}': {}", exec_model, e);
                 let _ = tx.send(agent::retry::PipelineResult::PlanReady {
-                    plan: format!("(plan unavailable: fast model '{}' — {})", fast_model, e),
+                    plan: format!("(plan unavailable: exec model '{}' — {})", exec_model, e),
                 });
             }
         }
@@ -1758,7 +1751,7 @@ fn spawn_execution_with_plan(
     plan: &str,
     tx: mpsc::Sender<agent::retry::PipelineResult>,
 ) {
-    let model = app_state.config.core_model.clone();
+    let model = app_state.config.exec_model.clone();
     if model.is_empty() {
         let _ = tx.send(agent::retry::PipelineResult::Retry(
             agent::retry::RetryResult::Failed {
@@ -2271,7 +2264,7 @@ fn spawn_skill_request(
     args: &str,
     tx: mpsc::Sender<agent::retry::PipelineResult>,
 ) {
-    let model = app_state.config.core_model.clone();
+    let model = app_state.config.exec_model.clone();
     if model.is_empty() {
         let _ = tx.send(agent::retry::PipelineResult::Retry(
             agent::retry::RetryResult::Failed {
@@ -2474,7 +2467,7 @@ fn spawn_agent_loop(
     input: &str,
     tx: mpsc::Sender<agent::retry::PipelineResult>,
 ) {
-    let model = app_state.config.core_model.clone();
+    let model = app_state.config.exec_model.clone();
     if model.is_empty() {
         let _ = tx.send(agent::retry::PipelineResult::Retry(
             agent::retry::RetryResult::Failed {
@@ -2583,7 +2576,7 @@ fn spawn_request_for_mode(
 
     // Emit structured event
     app_state.event_sink.turn_started(
-        &app_state.config.core_model,
+        &app_state.config.exec_model,
         &app_state.mode.to_string(),
         input.len(),
     );
@@ -2636,15 +2629,13 @@ fn spawn_auto_pipeline(
     let max_search_tokens = app_state.config.max_search_context_tokens;
 
     // Clone config values needed by the background thread
-    let fast_model = app_state.config.effective_fast_model().to_string();
-    let core_model = app_state.config.core_model.clone();
-    let audit_model = app_state.config.effective_audit_model().to_string();
+    let exec_model = app_state.config.exec_model.clone();
+    let eval_model = app_state.config.effective_eval_model().to_string();
 
     tracing::info!(
-        "spawn_auto_pipeline: fast={}, core={}, audit={}, max_retries={}, web_search={}",
-        fast_model,
-        core_model,
-        audit_model,
+        "spawn_auto_pipeline: exec={}, eval={}, max_retries={}, web_search={}",
+        exec_model,
+        eval_model,
         max_retries,
         web_search_enabled
     );
@@ -2677,9 +2668,8 @@ fn spawn_auto_pipeline(
         let bg_config = config::Config {
             ollama_endpoint: endpoint,
             connect_timeout,
-            fast_model,
-            core_model,
-            audit_model,
+            exec_model,
+            eval_model,
             max_retries,
             ..config::Config::default()
         };
@@ -2797,8 +2787,8 @@ fn maybe_trigger_summarization(
         return;
     }
 
-    let fast_model = app_state.config.effective_fast_model().to_string();
-    if fast_model.is_empty() {
+    let exec_model = app_state.config.exec_model.clone();
+    if exec_model.is_empty() {
         return;
     }
 
@@ -2832,7 +2822,7 @@ fn maybe_trigger_summarization(
         };
         match rt.block_on(agent::summarizer::summarize(
             &client,
-            &fast_model,
+            &exec_model,
             &history,
             &config,
         )) {

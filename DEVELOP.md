@@ -376,7 +376,7 @@ Tasks requiring deep code understanding, cross-file reasoning, or architectural 
 
 ### Level 4: Expert Capability
 
-Tasks that push the boundaries of small local models (3-8B parameters). These are challenging even for cloud agents. Success here demonstrates genuine agent capability.
+Tasks that push the boundaries of local models. These are challenging even for cloud agents. Success here demonstrates genuine agent capability.
 
 | ID | Task | Prompt | Pass Criteria |
 |----|------|--------|---------------|
@@ -402,8 +402,8 @@ Tasks at the edge of current agent capability — difficult for Claude Code, pot
 
 ### Scoring Guide
 
-| Level | Expected Pass Rate (Claude Code) | Expected Pass Rate (qwen3.5:4b local) | Significance |
-|-------|----------------------------------|----------------------------------------|-------------|
+| Level | Expected Pass Rate (Claude Code) | Expected Pass Rate (qwen3:8b local) | Significance |
+|-------|----------------------------------|--------------------------------------|-------------|
 | Level 1 | 100% | 90-100% | Baseline — must work |
 | Level 2 | 95-100% | 70-90% | Practical daily use |
 | Level 3 | 80-95% | 30-60% | Professional capability |
@@ -412,7 +412,7 @@ Tasks at the edge of current agent capability — difficult for Claude Code, pot
 
 ### Comparison with Mainstream Agents
 
-| Capability | Claude Code | OpenAI Codex | DeepSeek | LitePilot (qwen3.5:4b) |
+| Capability | Claude Code | OpenAI Codex | DeepSeek | LitePilot (qwen3:8b) |
 |-----------|-------------|-------------|----------|------------------------|
 | Simple file creation | Excellent | Excellent | Excellent | Good |
 | Multi-file generation | Excellent | Good | Excellent | Moderate |

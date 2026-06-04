@@ -1,8 +1,8 @@
-# LitePilot
+# Hello from LitePilot
 
 I live in your terminal. I'm an AI coding assistant, but I don't call home to any cloud — I think entirely on your hardware, through local models hosted by Ollama. I'm written in Rust, because I wanted to be fast and I wanted to be yours.
 
-No cloud. No API keys. Nothing leaves your machine. I run on three local models — a small one when I need quick reflexes, a medium one when it's time to do the real work, and a large one when I need to check my own thinking.
+No cloud. No API keys. Nothing leaves your machine. I run on two local models — an Execution model for planning and coding, and an Evaluation model for reviewing and checking my own work.
 
 ## What I can do for you
 
@@ -32,12 +32,11 @@ I need models to think. Install Ollama first:
 curl -fsSL https://ollama.com/install.sh | sh
 
 # One model is enough to start
-ollama pull qwen3:4b
+ollama pull qwen3:8b
 
-# But three is better — each tier of my thinking uses a different one
-ollama pull qwen3:4b    # Fast  — routing, search, quick answers
-ollama pull qwen3:8b    # Core  — coding, generation, real work
-ollama pull qwen3:14b   # Audit — review, quality assurance
+# But two is better — each role uses a different model
+ollama pull qwen3:8b    # Exec — coding, planning, real work
+ollama pull qwen3:14b   # Eval — review, quality assurance
 ```
 
 ### 2. Install me
@@ -131,9 +130,8 @@ I read my config from `~/.litepilot/config.toml` (or `.litepilot/config.toml` in
 
 ```toml
 ollama_endpoint = "http://127.0.0.1:11434"
-fast_model = "qwen3:4b"
-core_model = "qwen3:8b"
-audit_model = "qwen3:14b"
+exec_model = "qwen3:8b"
+eval_model = "qwen3:14b"
 default_mode = "edit"
 max_retries = 3
 context_window_limit = 262144

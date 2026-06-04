@@ -23,33 +23,29 @@ pub enum WizardStep {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSlot {
-    Fast,
-    Core,
-    Audit,
+    Exec,
+    Eval,
 }
 
 impl ModelSlot {
     fn label(&self) -> &'static str {
         match self {
-            ModelSlot::Fast => "Fast (3-5B)",
-            ModelSlot::Core => "Core (6-7B)",
-            ModelSlot::Audit => "Audit (7-14B)",
+            ModelSlot::Exec => "Exec (6-14B)",
+            ModelSlot::Eval => "Eval (14B+)",
         }
     }
 
     fn description(&self) -> &'static str {
         match self {
-            ModelSlot::Fast => "Quick planning & routing",
-            ModelSlot::Core => "Main coding assistant",
-            ModelSlot::Audit => "Code review & quality",
+            ModelSlot::Exec => "Main coding & planning",
+            ModelSlot::Eval => "Review & quality assurance",
         }
     }
 
     fn next(self) -> Option<Self> {
         match self {
-            ModelSlot::Fast => Some(ModelSlot::Core),
-            ModelSlot::Core => Some(ModelSlot::Audit),
-            ModelSlot::Audit => None,
+            ModelSlot::Exec => Some(ModelSlot::Eval),
+            ModelSlot::Eval => None,
         }
     }
 }
@@ -67,9 +63,8 @@ struct WizardState {
     selected_index: usize,
     scroll_offset: usize,
     current_slot: ModelSlot,
-    fast_model: Option<String>,
-    core_model: Option<String>,
-    audit_model: Option<String>,
+    exec_model: Option<String>,
+    eval_model: Option<String>,
     error_msg: Option<String>,
     context_index: usize,
 }
@@ -89,22 +84,18 @@ impl WizardState {
             models: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
-            current_slot: ModelSlot::Fast,
-            fast_model: None,
-            core_model: None,
-            audit_model: None,
+            current_slot: ModelSlot::Exec,
+            exec_model: None,
+            eval_model: None,
             error_msg: None,
             context_index: DEFAULT_CONTEXT_INDEX,
         };
         // Pre-fill from existing config if present
-        if !existing_config.fast_model.is_empty() {
-            state.fast_model = Some(existing_config.fast_model.clone());
+        if !existing_config.exec_model.is_empty() {
+            state.exec_model = Some(existing_config.exec_model.clone());
         }
-        if !existing_config.core_model.is_empty() {
-            state.core_model = Some(existing_config.core_model.clone());
-        }
-        if !existing_config.audit_model.is_empty() {
-            state.audit_model = Some(existing_config.audit_model.clone());
+        if !existing_config.eval_model.is_empty() {
+            state.eval_model = Some(existing_config.eval_model.clone());
         }
         // Pre-fill context window from config
         if let Some(idx) = CONTEXT_OPTIONS
@@ -136,9 +127,8 @@ impl WizardState {
     /// Position selected_index on the model already chosen for the current slot
     fn jump_to_existing_model(&mut self) {
         let existing = match self.current_slot {
-            ModelSlot::Fast => self.fast_model.as_deref(),
-            ModelSlot::Core => self.core_model.as_deref(),
-            ModelSlot::Audit => self.audit_model.as_deref(),
+            ModelSlot::Exec => self.exec_model.as_deref(),
+            ModelSlot::Eval => self.eval_model.as_deref(),
         };
         if let Some(name) = existing {
             if let Some(idx) = self.models.iter().position(|m| m.name == name) {
@@ -156,17 +146,15 @@ impl WizardState {
 
     fn selected_model_for_slot(&self, slot: ModelSlot) -> &Option<String> {
         match slot {
-            ModelSlot::Fast => &self.fast_model,
-            ModelSlot::Core => &self.core_model,
-            ModelSlot::Audit => &self.audit_model,
+            ModelSlot::Exec => &self.exec_model,
+            ModelSlot::Eval => &self.eval_model,
         }
     }
 
     fn set_model_for_slot(&mut self, slot: ModelSlot, name: String) {
         match slot {
-            ModelSlot::Fast => self.fast_model = Some(name),
-            ModelSlot::Core => self.core_model = Some(name),
-            ModelSlot::Audit => self.audit_model = Some(name),
+            ModelSlot::Exec => self.exec_model = Some(name),
+            ModelSlot::Eval => self.eval_model = Some(name),
         }
     }
 
@@ -183,9 +171,8 @@ impl WizardState {
     fn into_config(self, base: &Config) -> Config {
         Config {
             ollama_endpoint: self.url,
-            fast_model: self.fast_model.unwrap_or_default(),
-            core_model: self.core_model.unwrap_or_default(),
-            audit_model: self.audit_model.unwrap_or_default(),
+            exec_model: self.exec_model.unwrap_or_default(),
+            eval_model: self.eval_model.unwrap_or_default(),
             context_window_limit: CONTEXT_OPTIONS[self.context_index],
             ..base.clone()
         }
@@ -273,7 +260,7 @@ fn try_connect(state: &mut WizardState) {
                 state.models = models;
                 state.selected_index = 0;
                 state.scroll_offset = 0;
-                state.current_slot = ModelSlot::Fast;
+                state.current_slot = ModelSlot::Exec;
                 state.jump_to_existing_model();
             }
             state.step = WizardStep::ContextSelect;
@@ -430,14 +417,14 @@ fn handle_confirm(state: &mut WizardState, modifiers: KeyModifiers, code: KeyCod
     match (modifiers, code) {
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => Action::Quit,
         (KeyModifiers::NONE, KeyCode::Enter) => {
-            // Ensure at least core_model is set
-            if state.core_model.is_none() && !state.models.is_empty() {
-                state.core_model = Some(state.models[0].name.clone());
+            // Ensure at least exec_model is set
+            if state.exec_model.is_none() && !state.models.is_empty() {
+                state.exec_model = Some(state.models[0].name.clone());
             }
             Action::Save
         }
         (KeyModifiers::NONE, KeyCode::Esc) => {
-            state.current_slot = ModelSlot::Fast;
+            state.current_slot = ModelSlot::Exec;
             state.selected_index = 0;
             state.scroll_offset = 0;
             state.jump_to_existing_model();
@@ -705,7 +692,7 @@ fn draw_model_select(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme,
         "Selected:",
         Style::default().add_modifier(Modifier::BOLD),
     ))];
-    for slot in &[ModelSlot::Fast, ModelSlot::Core, ModelSlot::Audit] {
+    for slot in &[ModelSlot::Exec, ModelSlot::Eval] {
         if let Some(ref name) = *state.selected_model_for_slot(*slot) {
             let marker = if *slot == state.current_slot {
                 ">"
@@ -763,13 +750,12 @@ fn draw_confirm(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme, area
     ];
 
     for (slot, model) in &[
-        (ModelSlot::Fast, &state.fast_model),
-        (ModelSlot::Core, &state.core_model),
-        (ModelSlot::Audit, &state.audit_model),
+        (ModelSlot::Exec, &state.exec_model),
+        (ModelSlot::Eval, &state.eval_model),
     ] {
         let model_display = model
             .as_deref()
-            .unwrap_or("(not set — will use core model)");
+            .unwrap_or("(not set — will use exec model)");
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {:>12}: ", slot.label()),
@@ -795,16 +781,14 @@ mod tests {
 
     #[test]
     fn model_slot_order() {
-        assert_eq!(ModelSlot::Fast.next(), Some(ModelSlot::Core));
-        assert_eq!(ModelSlot::Core.next(), Some(ModelSlot::Audit));
-        assert_eq!(ModelSlot::Audit.next(), None);
+        assert_eq!(ModelSlot::Exec.next(), Some(ModelSlot::Eval));
+        assert_eq!(ModelSlot::Eval.next(), None);
     }
 
     #[test]
     fn model_slot_labels() {
-        assert!(ModelSlot::Fast.label().contains("Fast"));
-        assert!(ModelSlot::Core.label().contains("Core"));
-        assert!(ModelSlot::Audit.label().contains("Audit"));
+        assert!(ModelSlot::Exec.label().contains("Exec"));
+        assert!(ModelSlot::Eval.label().contains("Eval"));
     }
 
     #[test]
@@ -813,26 +797,23 @@ mod tests {
         let state = WizardState::new(&config);
         assert_eq!(state.step, WizardStep::UrlInput);
         assert_eq!(state.url, "http://127.0.0.1:11434");
-        assert_eq!(state.current_slot, ModelSlot::Fast);
-        assert!(state.fast_model.is_none());
-        assert!(state.core_model.is_none());
-        assert!(state.audit_model.is_none());
+        assert_eq!(state.current_slot, ModelSlot::Exec);
+        assert!(state.exec_model.is_none());
+        assert!(state.eval_model.is_none());
     }
 
     #[test]
     fn wizard_state_presets_from_config() {
         let config = Config {
             ollama_endpoint: "http://custom:9999".into(),
-            fast_model: "qwen3:4b".into(),
-            core_model: "qwen3:8b".into(),
-            audit_model: "qwen3:14b".into(),
+            exec_model: "qwen3:8b".into(),
+            eval_model: "qwen3:14b".into(),
             ..Config::default()
         };
         let state = WizardState::new(&config);
         assert_eq!(state.url, "http://custom:9999");
-        assert_eq!(state.fast_model.as_deref(), Some("qwen3:4b"));
-        assert_eq!(state.core_model.as_deref(), Some("qwen3:8b"));
-        assert_eq!(state.audit_model.as_deref(), Some("qwen3:14b"));
+        assert_eq!(state.exec_model.as_deref(), Some("qwen3:8b"));
+        assert_eq!(state.eval_model.as_deref(), Some("qwen3:14b"));
     }
 
     #[test]
@@ -855,12 +836,10 @@ mod tests {
     fn set_model_for_slot() {
         let config = Config::default();
         let mut state = WizardState::new(&config);
-        state.set_model_for_slot(ModelSlot::Fast, "qwen3:4b".into());
-        assert_eq!(state.fast_model.as_deref(), Some("qwen3:4b"));
-        state.set_model_for_slot(ModelSlot::Core, "qwen3:8b".into());
-        assert_eq!(state.core_model.as_deref(), Some("qwen3:8b"));
-        state.set_model_for_slot(ModelSlot::Audit, "qwen3:14b".into());
-        assert_eq!(state.audit_model.as_deref(), Some("qwen3:14b"));
+        state.set_model_for_slot(ModelSlot::Exec, "qwen3:8b".into());
+        assert_eq!(state.exec_model.as_deref(), Some("qwen3:8b"));
+        state.set_model_for_slot(ModelSlot::Eval, "qwen3:14b".into());
+        assert_eq!(state.eval_model.as_deref(), Some("qwen3:14b"));
     }
 
     #[test]
@@ -868,15 +847,13 @@ mod tests {
         let config = Config::default();
         let mut state = WizardState::new(&config);
         state.url = "http://ollama:1234".into();
-        state.fast_model = Some("qwen3:4b".into());
-        state.core_model = Some("qwen3:8b".into());
-        state.audit_model = Some("qwen3:14b".into());
+        state.exec_model = Some("qwen3:8b".into());
+        state.eval_model = Some("qwen3:14b".into());
         state.context_index = 3; // 512k
         let result = state.into_config(&config);
         assert_eq!(result.ollama_endpoint, "http://ollama:1234");
-        assert_eq!(result.fast_model, "qwen3:4b");
-        assert_eq!(result.core_model, "qwen3:8b");
-        assert_eq!(result.audit_model, "qwen3:14b");
+        assert_eq!(result.exec_model, "qwen3:8b");
+        assert_eq!(result.eval_model, "qwen3:14b");
         assert_eq!(result.context_window_limit, 524288);
         // Other fields preserved from base config
         assert_eq!(result.default_mode, "edit");

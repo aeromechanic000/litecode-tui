@@ -29,7 +29,7 @@ src/
 │                        maybe_compact (truncation), compact_with_summary (LLM-powered)
 ├── prompt.rs            PromptBuilder: layered system prompt construction
 │                        (identity, mode, skills, project context, volatile tail)
-├── wizard.rs            First-run setup wizard (Ollama URL, 3-tier model selection)
+├── wizard.rs            First-run setup wizard (Ollama URL, 2-tier model selection)
 │
 ├── ui/
 │   ├── mod.rs           TUI rendering: status bar (with ctx:% indicator), chat panel,
@@ -103,7 +103,7 @@ src/
 ├── logger.rs            File logging init (tracing-appender)
 ├── lsp.rs               LSP client: pyright, typescript-language-server, rust-analyzer
 ├── recap.rs             Turn recap generation for substantial auto changes
-├── router.rs            Request→model-tier routing (Fast/Core/Audit) by input analysis
+├── router.rs            Request→model-tier routing (Exec/Eval) by input analysis
 ├── snapshot.rs          Git-based file snapshots (pre/post turn, undo/restore)
 ├── working_set.rs       WorkingSet: frecency-tracked file touch log for prompt context
 │
@@ -162,14 +162,14 @@ The agent loop uses `std::sync::mpsc` channels with background threads. Two exec
 
 ### 1. Plan-then-Execute (`spawn_plan_then_execute` → `spawn_execution_with_plan`)
 Used for Edit/Plan mode and non-code Auto requests:
-1. Fast model generates a numbered plan
+1. Exec model generates a numbered plan
 2. Plan displayed for approval (Edit) or auto-executed (Auto/Plan)
 3. Each step streamed via `/api/generate` with KV cache context handle
 4. Steps carry the context handle forward between iterations
 
 ### 2. Tool-Use Agent Loop (`spawn_agent_loop`)
 Used for Auto mode code requests:
-1. Core model runs with tool definitions (read_file, write_file, edit_file, run_command, search_files)
+1. Exec model runs with tool definitions (read_file, write_file, edit_file, run_command, search_files)
 2. LLM outputs tool calls → parsed by `tools_parser.rs` → executed via `tools/`
 3. Tool results fed back to LLM → repeat until `done`
 4. Events (ToolStart, ToolResult, TextChunk, Done) sent through PipelineResult channel
@@ -223,13 +223,12 @@ Enter key
 
 ---
 
-## Three-Tier Model Pipeline
+## Two-Tier Model Pipeline
 
 | Tier | Size | Role | Config Field |
 |------|------|------|-------------|
-| Fast | 3-5B | Quick tasks — routing, search, planning | `fast_model` |
-| Core | 6-7B | Main work — coding, file generation, agent loop | `core_model` |
-| Audit | 7-14B | Review — check results, quality assurance | `audit_model` |
+| Exec | 6-14B | Main work — coding, planning, file generation, agent loop | `exec_model` |
+| Eval | 14B+ | Review — check results, quality assurance | `eval_model` |
 
 Prompts adapt to model size via `agent::prompts::system_prompt_for_size()`: short/directive for small, standard+examples for medium, full/nuanced for large.
 
@@ -301,9 +300,8 @@ Sessions stored as JSON at `~/.litepilot/sessions/{uuid}.json` with atomic write
 ollama_endpoint = "http://127.0.0.1:11434"
 connect_timeout = 15
 context_window_limit = 262144
-fast_model = "qwen3:4b"
-core_model = "qwen3:8b"
-audit_model = "qwen3:14b"
+exec_model = "qwen3:8b"
+eval_model = "qwen3:14b"
 default_mode = "edit"
 max_retries = 3
 enable_free_web_search = true

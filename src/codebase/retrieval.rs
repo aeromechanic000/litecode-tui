@@ -152,7 +152,7 @@ pub async fn retrieve(
 ) -> LoadedTemplates {
     let templates = codebase.templates();
 
-    if templates.is_empty() || config.core_model.is_empty() {
+    if templates.is_empty() || config.exec_model.is_empty() {
         return LoadedTemplates {
             refs: Vec::new(),
             total_tokens: 0,
@@ -160,7 +160,7 @@ pub async fn retrieve(
         };
     }
 
-    let context_window = estimate_context_window(&config.core_model) as usize;
+    let context_window = estimate_context_window(&config.exec_model) as usize;
 
     // Calculate template budget: context window minus fixed overhead
     let request_tokens = estimate_tokens(user_request);
@@ -184,7 +184,7 @@ pub async fn retrieve(
     let catalog = build_catalog(templates);
     let indices = match select(
         client,
-        &config.core_model,
+        &config.exec_model,
         &catalog,
         user_request,
         project_context,
@@ -228,7 +228,7 @@ pub async fn retrieve(
 
 /// Two-stage retrieval with semantic reranking for higher precision.
 /// Stage 1: broad candidate selection via LLM (top `broad_select`).
-/// Stage 2: fast_model reranks candidates by code-aware semantic relevance.
+/// Stage 2: exec_model reranks candidates by code-aware semantic relevance.
 /// Falls back to `retrieve()` if reranking fails.
 #[allow(dead_code)]
 pub async fn retrieve_with_reranking(
@@ -240,7 +240,7 @@ pub async fn retrieve_with_reranking(
 ) -> LoadedTemplates {
     let templates = codebase.templates();
 
-    if templates.is_empty() || config.core_model.is_empty() {
+    if templates.is_empty() || config.exec_model.is_empty() {
         return LoadedTemplates {
             refs: Vec::new(),
             total_tokens: 0,
@@ -248,7 +248,7 @@ pub async fn retrieve_with_reranking(
         };
     }
 
-    let context_window = estimate_context_window(&config.core_model) as usize;
+    let context_window = estimate_context_window(&config.exec_model) as usize;
     let request_tokens = estimate_tokens(user_request);
     let context_tokens = estimate_tokens(project_context);
     let fixed_overhead = 2500;
@@ -271,7 +271,7 @@ pub async fn retrieve_with_reranking(
     let catalog = build_catalog(templates);
     let broad_indices = match select(
         client,
-        &config.core_model,
+        &config.exec_model,
         &catalog,
         user_request,
         project_context,
@@ -305,7 +305,7 @@ pub async fn retrieve_with_reranking(
         };
     }
 
-    // Stage 2: Rerank with fast_model
+    // Stage 2: Rerank with exec_model
     let reranked = match rerank(
         client,
         config,
@@ -333,7 +333,7 @@ pub async fn retrieve_with_reranking(
     }
 }
 
-/// Rerank candidate template indices using fast_model.
+/// Rerank candidate template indices using exec_model.
 /// Sends code snippets (first 500 chars each) and asks model to order by relevance.
 async fn rerank(
     client: &OllamaClient,
@@ -343,8 +343,8 @@ async fn rerank(
     user_request: &str,
     project_context: &str,
 ) -> Result<Vec<usize>> {
-    let fast_model = config.effective_fast_model();
-    if fast_model.is_empty() {
+    let exec_model = &config.exec_model;
+    if exec_model.is_empty() {
         return Ok(indices.to_vec());
     }
 
@@ -379,7 +379,7 @@ async fn rerank(
         ChatMessage::user(prompt),
     ];
 
-    let response = client.chat(fast_model, messages, true).await?;
+    let response = client.chat(exec_model, messages, true).await?;
     let reranked = parse_rerank_response(&response.content, indices.len());
 
     if reranked.is_empty() {

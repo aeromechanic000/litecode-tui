@@ -255,7 +255,7 @@ fn draw_compact_status(f: &mut Frame, app: &AppState, ui: &UiState, area: Rect) 
         theme.warning
     };
 
-    let core_model = &app.config.core_model;
+    let core_model = &app.config.exec_model;
     let context_window = crate::ollama::model::estimate_context_window(core_model);
     let usage_pct = app.context_manager.context_usage_percent(context_window);
     let usage_color = if usage_pct >= 100.0 {

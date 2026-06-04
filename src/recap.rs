@@ -8,7 +8,7 @@ a user and a coding agent, summarize what was accomplished in ONE short sentence
 Focus on: files created/modified, errors fixed, features implemented.
 Output ONLY the summary sentence, nothing else."#;
 
-/// Generate a one-line recap of recent conversation messages using fast_model.
+/// Generate a one-line recap of recent conversation messages using exec_model.
 pub async fn generate_recap(
     client: &OllamaClient,
     messages: &[ConversationMessage],
@@ -39,7 +39,7 @@ pub async fn generate_recap(
         )),
     ];
 
-    let model = config.effective_fast_model();
+    let model = &config.exec_model;
     let response = client.chat(model, chat_messages, false).await?;
     Ok(response.content.trim().to_string())
 }

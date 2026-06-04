@@ -76,13 +76,13 @@ pub fn needs_summarization(
     total_tokens > threshold
 }
 
-/// Perform summarization using the fast model.
+/// Perform summarization using the exec model.
 ///
 /// Splits history into: pinned (always kept) + recent N (verbatim) + older (summarized).
 /// Returns the summary string and statistics.
 pub async fn summarize(
     client: &OllamaClient,
-    fast_model: &str,
+    exec_model: &str,
     history: &[ConversationMessage],
     config: &SummarizerConfig,
 ) -> Result<SummaryResult> {
@@ -117,7 +117,7 @@ pub async fn summarize(
         ChatMessage::user(&summarize_prompt),
     ];
 
-    let response = client.chat(fast_model, messages, false).await?;
+    let response = client.chat(exec_model, messages, false).await?;
     let summary = response.content;
 
     let summary_tokens = estimate_tokens(&summary);

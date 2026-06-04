@@ -39,9 +39,8 @@ impl Default for ThemeColors {
 pub struct Config {
     pub ollama_endpoint: String,
     pub connect_timeout: u64,
-    pub fast_model: String,
-    pub core_model: String,
-    pub audit_model: String,
+    pub exec_model: String,
+    pub eval_model: String,
     pub default_mode: String,
     pub auto_mode_only_workspace: bool,
     pub enable_auto_syntax_check: bool,
@@ -51,7 +50,6 @@ pub struct Config {
     pub auto_switch_network_region: bool,
     pub enable_recap: bool,
     pub enable_away_summary: bool,
-    pub auto_model_routing: bool,
     pub search_cache_valid_days: u64,
     pub max_search_context_tokens: usize,
     pub max_template_context_tokens: usize,
@@ -70,9 +68,8 @@ impl Default for Config {
         Self {
             ollama_endpoint: DEFAULT_ENDPOINT.to_string(),
             connect_timeout: 15,
-            fast_model: String::new(),
-            core_model: String::new(),
-            audit_model: String::new(),
+            exec_model: String::new(),
+            eval_model: String::new(),
             default_mode: "edit".to_string(),
             auto_mode_only_workspace: true,
             enable_auto_syntax_check: true,
@@ -82,7 +79,6 @@ impl Default for Config {
             auto_switch_network_region: true,
             enable_recap: true,
             enable_away_summary: true,
-            auto_model_routing: false,
             search_cache_valid_days: 30,
             max_search_context_tokens: 2048,
             max_template_context_tokens: 2048,
@@ -226,25 +222,17 @@ impl Config {
         Ok(Self::config_dir()?.join("crashes"))
     }
 
-    /// Returns true when the config needs first-run setup (core model not configured).
+    /// Returns true when the config needs first-run setup (exec model not configured).
     #[allow(dead_code)]
     pub fn needs_setup(&self) -> bool {
-        self.core_model.is_empty()
+        self.exec_model.is_empty()
     }
 
-    pub fn effective_fast_model(&self) -> &str {
-        if self.fast_model.is_empty() {
-            &self.core_model
+    pub fn effective_eval_model(&self) -> &str {
+        if self.eval_model.is_empty() {
+            &self.exec_model
         } else {
-            &self.fast_model
-        }
-    }
-
-    pub fn effective_audit_model(&self) -> &str {
-        if self.audit_model.is_empty() {
-            &self.core_model
-        } else {
-            &self.audit_model
+            &self.eval_model
         }
     }
 }
@@ -257,9 +245,8 @@ mod tests {
     fn valid_config() -> Config {
         Config {
             ollama_endpoint: "http://localhost:11434".into(),
-            fast_model: "qwen3:4b".into(),
-            core_model: "qwen3:8b".into(),
-            audit_model: "qwen3:14b".into(),
+            exec_model: "qwen3:8b".into(),
+            eval_model: "qwen3:14b".into(),
             theme: ThemeColors::default(),
             ..Default::default()
         }
@@ -271,8 +258,7 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.ollama_endpoint, parsed.ollama_endpoint);
-        assert_eq!(config.fast_model, parsed.fast_model);
-        assert_eq!(config.core_model, parsed.core_model);
+        assert_eq!(config.exec_model, parsed.exec_model);
     }
 
     #[test]
@@ -324,7 +310,7 @@ mod tests {
         config.save(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(config.ollama_endpoint, loaded.ollama_endpoint);
-        assert_eq!(config.fast_model, loaded.fast_model);
+        assert_eq!(config.exec_model, loaded.exec_model);
     }
 
     #[test]
@@ -334,15 +320,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_models_fall_back_to_core() {
+    fn empty_eval_falls_back_to_exec() {
         let config = Config {
-            fast_model: String::new(),
-            audit_model: String::new(),
-            core_model: "qwen3:8b".into(),
+            eval_model: String::new(),
+            exec_model: "qwen3:8b".into(),
             ..Default::default()
         };
-        assert_eq!(config.effective_fast_model(), "qwen3:8b");
-        assert_eq!(config.effective_audit_model(), "qwen3:8b");
+        assert_eq!(config.effective_eval_model(), "qwen3:8b");
     }
 
     #[test]
@@ -365,23 +349,21 @@ mod tests {
         fn proptest_roundtrip(
             endpoint in "http://[a-z]{1,10}\\.local:\\d{1,5}",
             timeout in 1u64..300,
-            fast in "[a-z]{1,10}:\\d{0,2}b",
-            core in "[a-z]{1,10}:\\d{0,2}b",
-            audit in "[a-z]{1,10}:\\d{0,2}b",
+            exec in "[a-z]{1,10}:\\d{0,2}b",
+            eval in "[a-z]{1,10}:\\d{0,2}b",
         ) {
             let config = Config {
                 ollama_endpoint: endpoint.clone(),
                 connect_timeout: timeout,
-                fast_model: fast.clone(),
-                core_model: core.clone(),
-                audit_model: audit.clone(),
+                exec_model: exec.clone(),
+                eval_model: eval.clone(),
                 ..Default::default()
             };
             let toml_str = toml::to_string_pretty(&config).unwrap();
             let parsed: Config = toml::from_str(&toml_str).unwrap();
             assert_eq!(config.ollama_endpoint, parsed.ollama_endpoint);
             assert_eq!(config.connect_timeout, parsed.connect_timeout);
-            assert_eq!(config.fast_model, parsed.fast_model);
+            assert_eq!(config.exec_model, parsed.exec_model);
         }
     }
 }

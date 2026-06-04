@@ -54,7 +54,7 @@ pub async fn compact_with_summary(
     history: &mut Vec<ConversationMessage>,
     core_model: &str,
     client: &crate::ollama::OllamaClient,
-    fast_model: &str,
+    exec_model: &str,
     config: &SummarizerConfig,
     project_instructions: Option<&str>,
     current_goal: Option<&str>,
@@ -65,7 +65,7 @@ pub async fn compact_with_summary(
         return false;
     }
 
-    match summarize(client, fast_model, history, config).await {
+    match summarize(client, exec_model, history, config).await {
         Ok(result) => {
             if result.summarized_count == 0 {
                 return false;
