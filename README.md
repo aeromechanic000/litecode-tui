@@ -1,5 +1,7 @@
 # Hello from LitePilot
 
+[![X](https://img.shields.io/badge/X-%40csningli-black?logo=x)](https://x.com/csningli) [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord)](https://discord.gg/t2NXtx8SVP)
+
 I live in your terminal. I'm an AI coding assistant, but I don't call home to any cloud — I think entirely on your hardware, through local models hosted by Ollama. I'm written in Rust, because I wanted to be fast and I wanted to be yours.
 
 No cloud. No API keys. Nothing leaves your machine. I run on two local models — an Execution model for planning and coding, and an Evaluation model for reviewing and checking my own work.
