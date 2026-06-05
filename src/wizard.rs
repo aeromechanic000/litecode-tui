@@ -18,6 +18,7 @@ pub enum WizardStep {
     Connecting,
     ContextSelect,
     ModelSelect,
+    ResidencySelect,
     Confirm,
 }
 
@@ -54,6 +55,19 @@ const CONTEXT_OPTIONS: [u64; 5] = [65536, 131072, 262144, 524288, 1048576];
 const CONTEXT_LABELS: [&str; 5] = ["64k", "128k", "256k", "512k", "1M"];
 const DEFAULT_CONTEXT_INDEX: usize = 2; // 256k
 
+const RESIDENCY_OPTIONS: [&str; 3] = ["none", "exec", "both"];
+const RESIDENCY_LABELS: [&str; 3] = [
+    "None (default)",
+    "Exec model only",
+    "Exec + Eval models",
+];
+const RESIDENCY_DESCRIPTIONS: [&str; 3] = [
+    "Models loaded/unloaded normally by Ollama",
+    "Keep exec model pinned in VRAM (keep_alive=-1)",
+    "Keep both exec and eval models pinned in VRAM",
+];
+const DEFAULT_RESIDENCY_INDEX: usize = 0; // none
+
 struct WizardState {
     step: WizardStep,
     url: String,
@@ -67,6 +81,7 @@ struct WizardState {
     eval_model: Option<String>,
     error_msg: Option<String>,
     context_index: usize,
+    residency_index: usize,
 }
 
 impl WizardState {
@@ -89,6 +104,7 @@ impl WizardState {
             eval_model: None,
             error_msg: None,
             context_index: DEFAULT_CONTEXT_INDEX,
+            residency_index: DEFAULT_RESIDENCY_INDEX,
         };
         // Pre-fill from existing config if present
         if !existing_config.exec_model.is_empty() {
@@ -103,6 +119,13 @@ impl WizardState {
             .position(|&v| v == existing_config.context_window_limit)
         {
             state.context_index = idx;
+        }
+        // Pre-fill residency from config
+        if let Some(idx) = RESIDENCY_OPTIONS
+            .iter()
+            .position(|&v| *v == existing_config.model_residency)
+        {
+            state.residency_index = idx;
         }
         state
     }
@@ -164,7 +187,8 @@ impl WizardState {
             WizardStep::Connecting => 2,
             WizardStep::ContextSelect => 3,
             WizardStep::ModelSelect => 4,
-            WizardStep::Confirm => 5,
+            WizardStep::ResidencySelect => 5,
+            WizardStep::Confirm => 6,
         }
     }
 
@@ -174,6 +198,7 @@ impl WizardState {
             exec_model: self.exec_model.unwrap_or_default(),
             eval_model: self.eval_model.unwrap_or_default(),
             context_window_limit: CONTEXT_OPTIONS[self.context_index],
+            model_residency: RESIDENCY_OPTIONS[self.residency_index].to_string(),
             ..base.clone()
         }
     }
@@ -228,6 +253,7 @@ fn handle_key(state: &mut WizardState, modifiers: KeyModifiers, code: KeyCode) -
         WizardStep::Connecting => Action::Continue,
         WizardStep::ContextSelect => handle_context_select(state, modifiers, code),
         WizardStep::ModelSelect => handle_model_select(state, modifiers, code),
+        WizardStep::ResidencySelect => handle_residency_select(state, modifiers, code),
         WizardStep::Confirm => handle_confirm(state, modifiers, code),
     }
 }
@@ -397,6 +423,53 @@ fn handle_model_select(state: &mut WizardState, modifiers: KeyModifiers, code: K
     }
 }
 
+fn handle_residency_select(
+    state: &mut WizardState,
+    modifiers: KeyModifiers,
+    code: KeyCode,
+) -> Action {
+    match (modifiers, code) {
+        (KeyModifiers::CONTROL, KeyCode::Char('c')) => Action::Quit,
+        (KeyModifiers::NONE, KeyCode::Up) => {
+            if state.residency_index > 0 {
+                state.residency_index -= 1;
+            }
+            Action::Continue
+        }
+        (KeyModifiers::NONE, KeyCode::Down) => {
+            if state.residency_index < RESIDENCY_OPTIONS.len() - 1 {
+                state.residency_index += 1;
+            }
+            Action::Continue
+        }
+        (KeyModifiers::NONE, KeyCode::Left) => {
+            if state.residency_index > 0 {
+                state.residency_index -= 1;
+            }
+            Action::Continue
+        }
+        (KeyModifiers::NONE, KeyCode::Right) => {
+            if state.residency_index < RESIDENCY_OPTIONS.len() - 1 {
+                state.residency_index += 1;
+            }
+            Action::Continue
+        }
+        (KeyModifiers::NONE, KeyCode::Enter) => {
+            state.step = WizardStep::Confirm;
+            Action::Continue
+        }
+        (KeyModifiers::NONE, KeyCode::Esc) => {
+            state.current_slot = ModelSlot::Exec;
+            state.selected_index = 0;
+            state.scroll_offset = 0;
+            state.jump_to_existing_model();
+            state.step = WizardStep::ModelSelect;
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
 fn advance_slot(state: &mut WizardState) -> Action {
     match state.current_slot.next() {
         Some(next) => {
@@ -407,7 +480,7 @@ fn advance_slot(state: &mut WizardState) -> Action {
             Action::Continue
         }
         None => {
-            state.step = WizardStep::Confirm;
+            state.step = WizardStep::ResidencySelect;
             Action::Continue
         }
     }
@@ -424,11 +497,7 @@ fn handle_confirm(state: &mut WizardState, modifiers: KeyModifiers, code: KeyCod
             Action::Save
         }
         (KeyModifiers::NONE, KeyCode::Esc) => {
-            state.current_slot = ModelSlot::Exec;
-            state.selected_index = 0;
-            state.scroll_offset = 0;
-            state.jump_to_existing_model();
-            state.step = WizardStep::ContextSelect;
+            state.step = WizardStep::ResidencySelect;
             Action::Continue
         }
         _ => Action::Continue,
@@ -449,7 +518,7 @@ fn draw_wizard(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme) {
     let y = (size.height.saturating_sub(content_height)) / 2;
     let area = Rect::new(x, y, content_width, content_height);
 
-    let step_label = format!("Step {}/5", state.step_number());
+    let step_label = format!("Step {}/6", state.step_number());
     let title = format!(" LitePilot Setup — {} ", step_label);
 
     let container = Block::default()
@@ -476,6 +545,7 @@ fn draw_wizard(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme) {
         WizardStep::Connecting => draw_connecting(f, state, theme, inner),
         WizardStep::ContextSelect => draw_context_select(f, state, theme, inner),
         WizardStep::ModelSelect => draw_model_select(f, state, theme, inner),
+        WizardStep::ResidencySelect => draw_residency_select(f, state, theme, inner),
         WizardStep::Confirm => draw_confirm(f, state, theme, inner),
     }
 }
@@ -719,6 +789,71 @@ fn draw_model_select(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme,
     f.render_widget(help, Rect::new(area.x, help_y, area.width, 1));
 }
 
+fn draw_residency_select(
+    f: &mut ratatui::Frame,
+    state: &WizardState,
+    theme: &Theme,
+    area: Rect,
+) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "Model Residency",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Pin models in Ollama's VRAM so they stay loaded between requests."),
+        Line::from("Reduces latency but uses more GPU memory."),
+        Line::from(""),
+        Line::from("Select an option:"),
+    ];
+    let text_height = lines.len() as u16;
+    let content = Paragraph::new(lines).style(Style::default());
+    f.render_widget(content, area);
+
+    // Draw option pills in a column
+    let pill_y = area.y + text_height + 1;
+    for (i, (label, desc)) in RESIDENCY_LABELS
+        .iter()
+        .zip(RESIDENCY_DESCRIPTIONS.iter())
+        .enumerate()
+    {
+        let is_selected = i == state.residency_index;
+        let y = pill_y + (i as u16) * 2;
+
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.accent)
+        };
+
+        let indicator = if is_selected { " > " } else { "   " };
+        let pill = Paragraph::new(format!("{} {}", indicator, label)).style(style);
+        f.render_widget(pill, Rect::new(area.x, y, area.width, 1));
+
+        // Description on the next line
+        let desc_style = if is_selected {
+            Style::default().fg(theme.primary)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let desc_para = Paragraph::new(format!("     {}", desc)).style(desc_style);
+        f.render_widget(desc_para, Rect::new(area.x, y + 1, area.width, 1));
+    }
+
+    // Help bar
+    let help_y = area.y + area.height - 1;
+    let help = Paragraph::new(
+        "\u{2191}\u{2193}/\u{2190}\u{2192}: select  |  Enter: continue  |  Esc: back to models",
+    )
+    .style(Style::default().fg(theme.accent));
+    f.render_widget(help, Rect::new(area.x, help_y, area.width, 1));
+}
+
 fn draw_confirm(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme, area: Rect) {
     let context_label = CONTEXT_LABELS[state.context_index];
     let mut lines = vec![
@@ -766,8 +901,24 @@ fn draw_confirm(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme, area
     }
 
     lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Residency:  ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "{} — {}",
+                RESIDENCY_LABELS[state.residency_index],
+                RESIDENCY_DESCRIPTIONS[state.residency_index]
+            ),
+            Style::default().fg(theme.primary),
+        ),
+    ]));
+
+    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter: confirm and start  |  Esc: re-select models",
+        "Enter: confirm and start  |  Esc: re-select options",
         Style::default(),
     )));
 
@@ -850,13 +1001,25 @@ mod tests {
         state.exec_model = Some("qwen3:8b".into());
         state.eval_model = Some("qwen3:14b".into());
         state.context_index = 3; // 512k
+        state.residency_index = 1; // exec
         let result = state.into_config(&config);
         assert_eq!(result.ollama_endpoint, "http://ollama:1234");
         assert_eq!(result.exec_model, "qwen3:8b");
         assert_eq!(result.eval_model, "qwen3:14b");
         assert_eq!(result.context_window_limit, 524288);
+        assert_eq!(result.model_residency, "exec");
         // Other fields preserved from base config
         assert_eq!(result.default_mode, "edit");
+    }
+
+    #[test]
+    fn residency_presets_from_config() {
+        let config = Config {
+            model_residency: "both".into(),
+            ..Config::default()
+        };
+        let state = WizardState::new(&config);
+        assert_eq!(state.residency_index, 2);
     }
 
     #[test]
@@ -870,7 +1033,9 @@ mod tests {
         assert_eq!(state.step_number(), 3);
         state.step = WizardStep::ModelSelect;
         assert_eq!(state.step_number(), 4);
-        state.step = WizardStep::Confirm;
+        state.step = WizardStep::ResidencySelect;
         assert_eq!(state.step_number(), 5);
+        state.step = WizardStep::Confirm;
+        assert_eq!(state.step_number(), 6);
     }
 }

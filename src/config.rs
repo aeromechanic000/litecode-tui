@@ -60,6 +60,8 @@ pub struct Config {
     #[serde(default = "default_max_file_lines")]
     pub max_file_lines: usize,
     #[serde(default)]
+    pub model_residency: String,
+    #[serde(default)]
     pub theme: ThemeColors,
 }
 
@@ -86,6 +88,7 @@ impl Default for Config {
             max_retries: 3,
             context_window_limit: 262144,
             max_file_lines: 60,
+            model_residency: "none".to_string(),
             theme: ThemeColors::default(),
         }
     }
@@ -200,6 +203,10 @@ impl Config {
         if !valid_modes.contains(&self.default_mode.as_str()) {
             anyhow::bail!("default_mode must be one of: plan, edit, auto");
         }
+        let valid_residency = ["none", "exec", "both"];
+        if !valid_residency.contains(&self.model_residency.as_str()) {
+            anyhow::bail!("model_residency must be one of: none, exec, both");
+        }
         Ok(())
     }
 
@@ -234,6 +241,16 @@ impl Config {
         } else {
             &self.eval_model
         }
+    }
+
+    /// Whether the exec model should be kept resident in Ollama.
+    pub fn keep_exec_resident(&self) -> bool {
+        self.model_residency == "exec" || self.model_residency == "both"
+    }
+
+    /// Whether the eval model should be kept resident in Ollama.
+    pub fn keep_eval_resident(&self) -> bool {
+        self.model_residency == "both" && !self.eval_model.is_empty()
     }
 }
 
@@ -300,6 +317,42 @@ mod tests {
         let mut config = valid_config();
         config.default_mode = "invalid".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_residency_rejected() {
+        let mut config = valid_config();
+        config.model_residency = "invalid".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn valid_residency_options() {
+        for opt in &["none", "exec", "both"] {
+            let mut config = valid_config();
+            config.model_residency = opt.to_string();
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn residency_helper_methods() {
+        let mut config = valid_config();
+        config.model_residency = "none".to_string();
+        assert!(!config.keep_exec_resident());
+        assert!(!config.keep_eval_resident());
+
+        config.model_residency = "exec".to_string();
+        assert!(config.keep_exec_resident());
+        assert!(!config.keep_eval_resident());
+
+        config.model_residency = "both".to_string();
+        assert!(config.keep_exec_resident());
+        assert!(config.keep_eval_resident());
+
+        // "both" but no eval model set → keep_eval_resident is false
+        config.eval_model = String::new();
+        assert!(!config.keep_eval_resident());
     }
 
     #[test]

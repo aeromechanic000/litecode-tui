@@ -303,6 +303,41 @@ impl OllamaClient {
             }
         }
     }
+
+    /// Warm up and pin a model in Ollama's VRAM/RAM using `keep_alive=-1`.
+    /// Sends a minimal generate request that causes Ollama to load the model
+    /// and keep it resident indefinitely (until explicitly unloaded or server restart).
+    pub async fn warmup_model(&self, model: &str) -> Result<()> {
+        let url = format!("{}/api/generate", self.endpoint);
+        let body = serde_json::json!({
+            "model": model,
+            "prompt": "warmup init",
+            "keep_alive": -1,
+            "stream": false
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Warming up model '{}' at {}", model, self.endpoint))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Warmup failed for model '{}': {} — {}",
+                model,
+                status,
+                text
+            );
+        }
+
+        tracing::info!("model '{}' warmed up and pinned (keep_alive=-1)", model);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

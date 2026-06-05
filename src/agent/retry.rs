@@ -350,6 +350,8 @@ pub enum PipelineResult {
     DiagnosticReady {
         result: crate::agent::diagnostics::DiagnosticResult,
     },
+    /// Eval model review of execution results
+    EvalReady { evaluation: String },
 }
 
 #[cfg(test)]

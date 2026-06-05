@@ -304,6 +304,63 @@ fn run_app(
     // Channel for receiving LLM results from background threads
     let (result_tx, result_rx) = mpsc::channel::<agent::retry::PipelineResult>();
 
+    // Warm up models for residency if configured
+    if app_state.config.keep_exec_resident() || app_state.config.keep_eval_resident() {
+        let warmup_config = app_state.config.clone();
+        let warmup_tx = result_tx.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("warmup runtime error: {}", e);
+                    return;
+                }
+            };
+            let client = match ollama::OllamaClient::new(&warmup_config) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("warmup client error: {}", e);
+                    return;
+                }
+            };
+
+            let mut warmed = Vec::new();
+            if warmup_config.keep_exec_resident() && !warmup_config.exec_model.is_empty() {
+                let model = warmup_config.exec_model.clone();
+                let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
+                    evaluation: format!("[Residency] Warming up exec model: {}...", model),
+                });
+                match rt.block_on(client.warmup_model(&model)) {
+                    Ok(()) => warmed.push(model.clone()),
+                    Err(e) => {
+                        let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
+                            evaluation: format!("[Residency] Failed to warm up exec model '{}': {}", model, e),
+                        });
+                    }
+                }
+            }
+            if warmup_config.keep_eval_resident() {
+                let model = warmup_config.eval_model.clone();
+                let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
+                    evaluation: format!("[Residency] Warming up eval model: {}...", model),
+                });
+                match rt.block_on(client.warmup_model(&model)) {
+                    Ok(()) => warmed.push(model.clone()),
+                    Err(e) => {
+                        let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
+                            evaluation: format!("[Residency] Failed to warm up eval model '{}': {}", model, e),
+                        });
+                    }
+                }
+            }
+            if !warmed.is_empty() {
+                let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
+                    evaluation: format!("[Residency] Models pinned: {}", warmed.join(", ")),
+                });
+            }
+        });
+    }
+
     loop {
         // Flush pending output above the viewport via insert_before()
         flush_pending_output(terminal, &mut ui_state)?;
@@ -557,6 +614,18 @@ fn run_app(
                             }
                         }
                     }
+                    // Post-execution eval review using eval model
+                    if mode != AppMode::Plan
+                        && !content.is_empty()
+                        && app_state.config.effective_eval_model() != app_state.config.exec_model
+                    {
+                        spawn_eval_review(
+                            &app_state,
+                            &ui_state.last_user_input,
+                            &content,
+                            result_tx.clone(),
+                        );
+                    }
                     ui_state.add_output(OutputLine::Separator);
                 }
                 agent::retry::PipelineResult::StreamMeta {
@@ -728,6 +797,10 @@ fn run_app(
                     } else if diag.files_checked > 0 {
                         tracing::info!("diagnostics passed for {} files", diag.files_checked);
                     }
+                }
+                agent::retry::PipelineResult::EvalReady { evaluation } => {
+                    tracing::info!("eval review: {} bytes", evaluation.len());
+                    ui_state.add_output(OutputLine::System(evaluation));
                 }
             }
 
@@ -2559,6 +2632,99 @@ fn spawn_agent_loop(
 
         if let Err(e) = result {
             tracing::error!("agent loop failed: {}", e);
+        }
+    });
+}
+
+/// Spawn a background eval review using the eval model.
+/// After execution completes, the eval model reviews whether the implementation
+/// fulfills the user's original request.
+fn spawn_eval_review(
+    app_state: &AppState,
+    user_request: &str,
+    exec_output: &str,
+    tx: mpsc::Sender<agent::retry::PipelineResult>,
+) {
+    let eval_model = app_state.config.effective_eval_model().to_string();
+    let exec_model = app_state.config.exec_model.clone();
+    if eval_model == exec_model || eval_model.is_empty() {
+        return;
+    }
+
+    let endpoint = app_state.config.ollama_endpoint.clone();
+    let connect_timeout = app_state.config.connect_timeout;
+    let context_window_limit = app_state.config.context_window_limit;
+    let user_request = user_request.to_string();
+    let exec_output = exec_output.to_string();
+
+    tracing::info!(
+        "spawning eval review: eval_model={}, exec_output={} bytes",
+        eval_model,
+        exec_output.len()
+    );
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!("eval review runtime error: {}", e);
+                return;
+            }
+        };
+
+        let bg_config = config::Config {
+            ollama_endpoint: endpoint,
+            connect_timeout,
+            context_window_limit,
+            ..config::Config::default()
+        };
+        let client = match ollama::OllamaClient::new(&bg_config) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("eval review client error: {}", e);
+                return;
+            }
+        };
+
+        // Truncate exec output if too long for eval context
+        let max_output_chars = 8000;
+        let truncated_output = if exec_output.len() > max_output_chars {
+            format!(
+                "{}\n\n[...truncated, {} chars omitted]",
+                &exec_output[..max_output_chars],
+                exec_output.len() - max_output_chars
+            )
+        } else {
+            exec_output.clone()
+        };
+
+        let messages = vec![
+            ollama::chat::ChatMessage::system(
+                "You are a code review evaluator. Your job is to assess whether \
+                 an implementation fulfills the user's original request. \
+                 Be concise. Start with PASS or FAIL, then list any issues or \
+                 missing parts. Keep your review under 500 words."
+            ),
+            ollama::chat::ChatMessage::user(format!(
+                "User request:\n{}\n\nImplementation output:\n{}\n\n\
+                 Does this implementation fulfill the user's request? \
+                 Start with PASS or FAIL.",
+                user_request, truncated_output
+            )),
+        ];
+
+        match rt.block_on(client.chat(&eval_model, messages, false)) {
+            Ok(resp) => {
+                let _ = tx.send(agent::retry::PipelineResult::EvalReady {
+                    evaluation: format!("[Eval: {}]\n{}", eval_model, resp.content),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("eval review failed: {}", e);
+                let _ = tx.send(agent::retry::PipelineResult::EvalReady {
+                    evaluation: format!("[Eval] Review skipped: {}", e),
+                });
+            }
         }
     });
 }
