@@ -87,6 +87,7 @@ pub struct AppState {
     pub working_set: WorkingSet,
     pub current_session: Session,
     pub awaiting_destructive_confirm: bool,
+    pub awaiting_other_input: bool,
     pub snapshot_manager: crate::snapshot::SnapshotManager,
     pub event_sink: crate::hooks::JsonlSink,
     pub context_manager: crate::ollama::ContextManager,
@@ -147,6 +148,7 @@ impl AppState {
             working_set: WorkingSet::new(),
             current_session: Session::new(),
             awaiting_destructive_confirm: false,
+            awaiting_other_input: false,
             snapshot_manager: crate::snapshot::SnapshotManager::new(&workspace, &config_dir),
             context_manager: crate::ollama::ContextManager::new(),
             event_sink: crate::hooks::JsonlSink::open(

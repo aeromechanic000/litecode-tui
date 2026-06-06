@@ -223,8 +223,8 @@ pub fn draw(f: &mut Frame, app: &AppState, ui: &mut UiState) {
 
     draw_activity_row(f, ui, rows[0]);
     draw_compact_status(f, app, ui, rows[1]);
-    draw_input_row(f, ui, rows[2]);
-    set_input_cursor(f, ui, rows[2]);
+    draw_input_row(f, app, ui, rows[2]);
+    set_input_cursor(f, app, ui, rows[2]);
 }
 
 fn split_rows(area: Rect, count: u16) -> Vec<Rect> {
@@ -334,9 +334,15 @@ fn draw_activity_row(f: &mut Frame, ui: &mut UiState, area: Rect) {
 }
 
 /// Row 2: input prompt.
-fn draw_input_row(f: &mut Frame, ui: &UiState, area: Rect) {
+fn draw_input_row(f: &mut Frame, app: &AppState, ui: &UiState, area: Rect) {
     let theme = &ui.theme;
-    let text_width = area.width.saturating_sub(3) as usize;
+    let prefix = if app.awaiting_other_input {
+        "Other: "
+    } else {
+        " > "
+    };
+    let prefix_len = prefix.chars().count();
+    let text_width = area.width.saturating_sub(prefix_len as u16) as usize;
 
     // Truncate input display to fit
     let display_text = if ui.input_text.chars().count() > text_width {
@@ -349,7 +355,7 @@ fn draw_input_row(f: &mut Frame, ui: &UiState, area: Rect) {
 
     let line = Line::from(vec![
         Span::styled(
-            " > ",
+            prefix,
             Style::default()
                 .fg(theme.primary)
                 .add_modifier(Modifier::BOLD),
@@ -364,8 +370,14 @@ fn draw_input_row(f: &mut Frame, ui: &UiState, area: Rect) {
 }
 
 /// Position the terminal cursor in the input row.
-fn set_input_cursor(f: &mut Frame, ui: &UiState, area: Rect) {
-    let text_width = area.width.saturating_sub(3) as usize;
+fn set_input_cursor(f: &mut Frame, app: &AppState, ui: &UiState, area: Rect) {
+    let prefix = if app.awaiting_other_input {
+        "Other: "
+    } else {
+        " > "
+    };
+    let prefix_len = prefix.chars().count() as u16;
+    let text_width = area.width.saturating_sub(prefix_len) as usize;
     if text_width == 0 {
         return;
     }
@@ -380,7 +392,7 @@ fn set_input_cursor(f: &mut Frame, ui: &UiState, area: Rect) {
         chars_before
     };
 
-    let x = area.x + 3 + display_offset.min(text_width) as u16;
+    let x = area.x + prefix_len + display_offset.min(text_width) as u16;
     let y = area.y;
 
     f.set_cursor_position((x, y));

@@ -718,7 +718,7 @@ fn run_app(
                             app_state.pending_plan = Some(plan);
                             app_state.is_processing = false;
                             ui_state.add_output(OutputLine::System(
-                                "Enter: execute plan | Esc: cancel".into(),
+                                "Enter: execute plan | Esc: cancel | o: other".into(),
                             ));
                         }
                     }
@@ -872,7 +872,7 @@ fn run_app(
                                     ));
                                 } else {
                                     ui_state.add_output(OutputLine::System(format!(
-                                        "Apply next? ({} remaining) y/n/a:",
+                                        "Apply next? ({} remaining) Press y/n/a/o (y=yes, n=no, a=apply all, o=other):",
                                         app_state.pending_confirmations.len()
                                     )));
                                 }
@@ -908,7 +908,7 @@ fn run_app(
                                     ));
                                 } else {
                                     ui_state.add_output(OutputLine::System(format!(
-                                        "Apply next? ({} remaining) y/n/a:",
+                                        "Apply next? ({} remaining) Press y/n/a/o (y=yes, n=no, a=apply all, o=other):",
                                         app_state.pending_confirmations.len()
                                     )));
                                 }
@@ -941,8 +941,35 @@ fn run_app(
                                 )));
                                 continue;
                             }
+                            KeyCode::Char('o') => {
+                                // Other: user provides custom feedback
+                                tracing::info!(
+                                    "user chose Other for file review ({} pending cancelled)",
+                                    app_state.pending_confirmations.len()
+                                );
+                                app_state.clear_pending();
+                                app_state.awaiting_confirmation = false;
+                                app_state.awaiting_other_input = true;
+                                ui_state.add_output(OutputLine::System(
+                                    "Other: (type your response and press Enter)".into(),
+                                ));
+                                continue;
+                            }
                             _ => {} // Fall through to normal key handling
                         }
+                    }
+
+                    // Plan approval: 'o' for Other feedback
+                    if app_state.pending_plan.is_some()
+                        && key.modifiers == KeyModifiers::NONE
+                        && key.code == KeyCode::Char('o')
+                    {
+                        app_state.pending_plan = None;
+                        app_state.awaiting_other_input = true;
+                        ui_state.add_output(OutputLine::System(
+                            "Other: (type your response and press Enter)".into(),
+                        ));
+                        continue;
                     }
 
                     match (key.modifiers, key.code) {
@@ -996,6 +1023,37 @@ fn run_app(
                         }
                         // Enter: submit input or approve pending plan
                         (KeyModifiers::NONE, KeyCode::Enter) => {
+                            // Other input: submit user feedback
+                            if app_state.awaiting_other_input {
+                                let input = ui_state.take_input();
+                                if !input.is_empty() {
+                                    app_state.awaiting_other_input = false;
+                                    tracing::info!("user Other input: {}", input.trim());
+                                    ui_state.add_output(OutputLine::User(input.clone()));
+                                    app_state.conversation_history.push(
+                                        app::ConversationMessage {
+                                            role: "user".into(),
+                                            content: input.clone(),
+                                            tokens: 0,
+                                        },
+                                    );
+                                    ui_state.start_thinking();
+                                    spawn_request_for_mode(
+                                        &mut app_state,
+                                        &ollama_client,
+                                        &input,
+                                        result_tx.clone(),
+                                    );
+                                    app_state.is_processing = true;
+                                } else {
+                                    ui_state.add_output(OutputLine::System(
+                                        "Cancelled.".into(),
+                                    ));
+                                    app_state.awaiting_other_input = false;
+                                }
+                                continue;
+                            }
+
                             // Plan approval: empty input + pending plan = approve
                             if ui_state.input_text.is_empty() {
                                 if let Some(plan) = app_state.pending_plan.take() {
@@ -1336,7 +1394,7 @@ fn run_app(
                                             if queued > 0 {
                                                 app_state.awaiting_confirmation = true;
                                                 ui_state.add_output(OutputLine::System(format!(
-                                                "Review {} file(s). Press y/n/a (y=yes, n=no, a=apply all):",
+                                                "Review {} file(s). Press y/n/a/o (y=yes, n=no, a=apply all, o=other):",
                                                 queued
                                             )));
                                             }
@@ -1496,9 +1554,14 @@ fn run_app(
                         (KeyModifiers::NONE, KeyCode::Backspace) => {
                             ui_state.backspace();
                         }
-                        // Escape: cancel pending plan
+                        // Escape: cancel pending plan or other input
                         (KeyModifiers::NONE, KeyCode::Esc) => {
-                            if app_state.pending_plan.take().is_some() {
+                            if app_state.awaiting_other_input {
+                                app_state.awaiting_other_input = false;
+                                ui_state.input_text.clear();
+                                ui_state.input_cursor = 0;
+                                ui_state.add_output(OutputLine::System("Cancelled.".into()));
+                            } else if app_state.pending_plan.take().is_some() {
                                 ui_state.add_output(OutputLine::System("Plan cancelled.".into()));
                             }
                         }
