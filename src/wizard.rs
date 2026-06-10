@@ -322,13 +322,23 @@ fn handle_url_input(state: &mut WizardState, modifiers: KeyModifiers, code: KeyC
         }
         (KeyModifiers::NONE, KeyCode::Left) => {
             if state.input_cursor > 0 {
-                state.input_cursor -= 1;
+                let prev = state.input_text[..state.input_cursor]
+                    .chars()
+                    .last()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+                state.input_cursor -= prev;
             }
             Action::Continue
         }
         (KeyModifiers::NONE, KeyCode::Right) => {
             if state.input_cursor < state.input_text.len() {
-                state.input_cursor += 1;
+                let next = state.input_text[state.input_cursor..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+                state.input_cursor += next;
             }
             Action::Continue
         }
@@ -584,9 +594,14 @@ fn draw_url_input(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme, ar
     // Input field — positioned right after the text lines
     let input_y = area.y + text_line_count;
     let input_area = Rect::new(area.x, input_y, area.width, 3);
-    let input_display = format!(" {}_", &state.input_text);
+    let input_display = format!(" {}", &state.input_text);
     let input = Paragraph::new(input_display).style(Style::default().add_modifier(Modifier::BOLD));
     f.render_widget(input, input_area);
+
+    // Position the terminal cursor at the actual editing position
+    let chars_before = state.input_text[..state.input_cursor].chars().count();
+    let cursor_x = area.x + 1 + chars_before.min(input_area.width as usize - 2) as u16;
+    f.set_cursor_position((cursor_x, input_y));
 
     // Help bar
     let help_y = area.y + area.height - 1;
@@ -707,9 +722,14 @@ fn draw_model_select(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme,
 
         // Input
         let input_y = list_y + list_height.saturating_sub(3);
-        let input = Paragraph::new(format!(" {}_", state.input_text))
+        let input_w = area.width;
+        let input = Paragraph::new(format!(" {}", state.input_text))
             .style(Style::default().add_modifier(Modifier::BOLD));
-        f.render_widget(input, Rect::new(area.x, input_y, area.width, 1));
+        f.render_widget(input, Rect::new(area.x, input_y, input_w, 1));
+
+        let chars_before = state.input_text[..state.input_cursor].chars().count();
+        let cursor_x = area.x + 1 + chars_before.min(input_w as usize - 2) as u16;
+        f.set_cursor_position((cursor_x, input_y));
     } else {
         // Model list
         let visible_end = std::cmp::min(state.scroll_offset + max_visible, state.models.len());

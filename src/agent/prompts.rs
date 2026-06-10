@@ -150,7 +150,7 @@ JSON format (preferred):
 Text format (fallback):
 Call: tool_name(param="value")
 
-Available tools: read_file, write_file, edit_file, list_dir, exec_shell, web_search
+Available tools: read_file, write_file, edit_file, list_dir, exec_shell, web_search, web_reader
 
 Examples:
 <tool_call name="read_file">{"path": "src/main.rs"}</tool_call}

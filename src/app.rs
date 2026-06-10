@@ -127,6 +127,8 @@ impl AppState {
         let instructions = crate::prompt::ProjectInstructions::discover(&workspace, &config_dir);
         prompt_builder.set_project_context(instructions);
 
+        let input_history = Self::load_input_history();
+
         Self {
             mode,
             config: config.clone(),
@@ -135,7 +137,7 @@ impl AppState {
             think_enabled: true,
             pending_confirmations: Vec::new(),
             awaiting_confirmation: false,
-            input_history: Vec::new(),
+            input_history,
             history_index: 0,
             skills,
             is_processing: false,
@@ -169,6 +171,46 @@ impl AppState {
 
     pub fn push_pending(&mut self, action: PendingAction) {
         self.pending_confirmations.push(action);
+    }
+
+    const MAX_HISTORY: usize = 500;
+    const HISTORY_FILE: &str = "input_history.json";
+
+    fn history_path() -> Option<PathBuf> {
+        Config::config_dir().ok().map(|d| d.join(Self::HISTORY_FILE))
+    }
+
+    fn load_input_history() -> Vec<String> {
+        let path = match Self::history_path() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        serde_json::from_str(&data).unwrap_or_else(|_| Vec::new())
+    }
+
+    pub fn save_input_history(&self) {
+        let path = match Self::history_path() {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(data) = serde_json::to_string(&self.input_history) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+
+    pub fn record_input(&mut self, input: String) {
+        if !input.is_empty() {
+            self.input_history.push(input);
+            if self.input_history.len() > Self::MAX_HISTORY {
+                self.input_history.drain(..self.input_history.len() - Self::MAX_HISTORY);
+            }
+            self.history_index = 0;
+            self.save_input_history();
+        }
     }
 
     #[allow(dead_code)]

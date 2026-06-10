@@ -1,6 +1,7 @@
 pub mod file_ops;
 pub mod search;
 pub mod shell;
+pub mod web_reader;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,7 @@ impl ToolRegistry {
         reg.register(Box::new(file_ops::ListDir::new(sandbox)));
         reg.register(Box::new(shell::ExecShell::new()));
         reg.register(Box::new(search::WebSearch::from_config(config)));
+        reg.register(Box::new(web_reader::WebReader::from_config(config)));
         reg
     }
 

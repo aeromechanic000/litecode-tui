@@ -718,7 +718,7 @@ fn run_app(
                             app_state.pending_plan = Some(plan);
                             app_state.is_processing = false;
                             ui_state.add_output(OutputLine::System(
-                                "Enter: execute plan | Esc: cancel | o: other".into(),
+                                "Execute? y/n/o (y=yes, n=no, o=other):".into(),
                             ));
                         }
                     }
@@ -872,7 +872,7 @@ fn run_app(
                                     ));
                                 } else {
                                     ui_state.add_output(OutputLine::System(format!(
-                                        "Apply next? ({} remaining) Press y/n/a/o (y=yes, n=no, a=apply all, o=other):",
+                                        "Apply next? ({} remaining) y/n/a/o (y=yes, n=no, a=apply all, o=other):",
                                         app_state.pending_confirmations.len()
                                     )));
                                 }
@@ -908,7 +908,7 @@ fn run_app(
                                     ));
                                 } else {
                                     ui_state.add_output(OutputLine::System(format!(
-                                        "Apply next? ({} remaining) Press y/n/a/o (y=yes, n=no, a=apply all, o=other):",
+                                        "Apply next? ({} remaining) y/n/a/o (y=yes, n=no, a=apply all, o=other):",
                                         app_state.pending_confirmations.len()
                                     )));
                                 }
@@ -956,6 +956,35 @@ fn run_app(
                                 continue;
                             }
                             _ => {} // Fall through to normal key handling
+                        }
+                    }
+
+                    // Plan approval: 'y' to execute, 'n' to cancel
+                    if app_state.pending_plan.is_some()
+                        && key.modifiers == KeyModifiers::NONE
+                    {
+                        match key.code {
+                            KeyCode::Char('y') => {
+                                if let Some(plan) = app_state.pending_plan.take() {
+                                    ui_state.add_output(OutputLine::System("Executing plan...".into()));
+                                    ui_state.start_thinking();
+                                    app_state.is_processing = true;
+                                    spawn_execution_with_plan(
+                                        &app_state,
+                                        &ui_state.last_user_input,
+                                        &plan,
+                                        result_tx.clone(),
+                                    );
+                                }
+                                continue;
+                            }
+                            KeyCode::Char('n') => {
+                                if app_state.pending_plan.take().is_some() {
+                                    ui_state.add_output(OutputLine::System("Plan cancelled.".into()));
+                                }
+                                continue;
+                            }
+                            _ => {} // fall through to 'o' handler and normal input
                         }
                     }
 
@@ -1054,27 +1083,9 @@ fn run_app(
                                 continue;
                             }
 
-                            // Plan approval: empty input + pending plan = approve
-                            if ui_state.input_text.is_empty() {
-                                if let Some(plan) = app_state.pending_plan.take() {
-                                    ui_state
-                                        .add_output(OutputLine::System("Executing plan...".into()));
-                                    ui_state.start_thinking();
-                                    app_state.is_processing = true;
-                                    spawn_execution_with_plan(
-                                        &app_state,
-                                        &ui_state.last_user_input,
-                                        &plan,
-                                        result_tx.clone(),
-                                    );
-                                    continue;
-                                }
-                            }
-
                             let input = ui_state.take_input();
                             if !input.is_empty() {
-                                app_state.input_history.push(input.clone());
-                                app_state.history_index = 0;
+                                app_state.record_input(input.clone());
                                 tracing::info!("user input: {}", input.trim());
                                 tracing::debug!(
                                     "conversation history: {} messages, queue: {}",
@@ -1394,7 +1405,7 @@ fn run_app(
                                             if queued > 0 {
                                                 app_state.awaiting_confirmation = true;
                                                 ui_state.add_output(OutputLine::System(format!(
-                                                "Review {} file(s). Press y/n/a/o (y=yes, n=no, a=apply all, o=other):",
+                                                "Review {} file(s). y/n/a/o (y=yes, n=no, a=apply all, o=other):",
                                                 queued
                                             )));
                                             }
@@ -1554,15 +1565,13 @@ fn run_app(
                         (KeyModifiers::NONE, KeyCode::Backspace) => {
                             ui_state.backspace();
                         }
-                        // Escape: cancel pending plan or other input
+                        // Escape: cancel other input
                         (KeyModifiers::NONE, KeyCode::Esc) => {
                             if app_state.awaiting_other_input {
                                 app_state.awaiting_other_input = false;
                                 ui_state.input_text.clear();
                                 ui_state.input_cursor = 0;
                                 ui_state.add_output(OutputLine::System("Cancelled.".into()));
-                            } else if app_state.pending_plan.take().is_some() {
-                                ui_state.add_output(OutputLine::System("Plan cancelled.".into()));
                             }
                         }
                         // Page Up/Down: no virtual scrolling (terminal native scrollback)
@@ -1618,7 +1627,8 @@ fn flush_pending_output(
     }
     let lines = std::mem::take(&mut ui_state.pending_inline);
     let theme = &ui_state.theme;
-    let line_count = ui::inline::estimate_line_count(&lines, 80);
+    let width = terminal.size()?.width;
+    let line_count = ui::inline::estimate_line_count(&lines, width);
 
     terminal.insert_before(line_count, |buf| {
         ui::inline::render_output_lines(buf, &lines, &theme);
@@ -2822,20 +2832,18 @@ fn spawn_request_for_mode(
     app_state.prompt_builder.set_current_goal(input);
 
     let is_code = looks_like_code_request(input);
+    let needs_tools = looks_like_tool_request(input);
+    let use_agent = needs_tools || (app_state.mode == AppMode::Auto && is_code);
     tracing::info!(
-        "request routing: mode={}, is_code_request={}, pipeline={}",
+        "request routing: mode={}, is_code_request={}, needs_tools={}, pipeline={}",
         app_state.mode,
         is_code,
-        if app_state.mode == AppMode::Auto && is_code {
-            "agent_loop"
-        } else {
-            "plan_then_execute"
-        }
+        needs_tools,
+        if use_agent { "agent_loop" } else { "plan_then_execute" }
     );
     tracing::debug!("input for routing: {:?}", input);
 
-    if app_state.mode == AppMode::Auto && is_code {
-        // Use agent loop with tools for Auto mode code requests
+    if use_agent {
         spawn_agent_loop(app_state, input, tx);
     } else {
         spawn_plan_then_execute(app_state, client, input, tx);
@@ -3613,7 +3621,7 @@ fn enter_file_confirmation(
     if queued > 0 {
         app_state.awaiting_confirmation = true;
         ui_state.add_output(OutputLine::System(format!(
-            "Apply {} file(s)? y/n/a (y=yes, n=no, a=apply all):",
+            "Apply {} file(s)? y/n/a/o (y=yes, n=no, a=apply all, o=other):",
             queued
         )));
     }
@@ -3809,4 +3817,35 @@ fn looks_like_code_request(input: &str) -> bool {
         "file",
     ];
     code_keywords.iter().any(|k| lower.contains(k))
+}
+
+/// Detect requests that need tool access (web fetching, URL reading, searching).
+/// These require the agent loop which has tool definitions — plan-then-execute
+/// can't call tools.
+fn looks_like_tool_request(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    // URL patterns
+    if lower.contains("http://") || lower.contains("https://") {
+        return true;
+    }
+    let tool_keywords = [
+        "fetch url",
+        "fetch content",
+        "read url",
+        "open url",
+        "access url",
+        "visit url",
+        "go to url",
+        "fetch the page",
+        "read the page",
+        "web page",
+        "webpage",
+        "read from",
+        "fetch from",
+        "search the web",
+        "search online",
+        "look up online",
+        "search for",
+    ];
+    tool_keywords.iter().any(|k| lower.contains(k))
 }

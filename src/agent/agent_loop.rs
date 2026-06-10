@@ -16,6 +16,7 @@ const TOOL_NAME_HINTS: &[&str] = &[
     "list_dir",
     "exec_shell",
     "web_search",
+    "web_reader",
 ];
 
 /// Configuration for the agent loop.

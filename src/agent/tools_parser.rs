@@ -236,13 +236,21 @@ fn uuid_short() -> String {
 /// Valid, complete tool calls are preserved. Only applies to text shown to the user
 /// — the parser still sees the raw input for tool dispatch.
 pub fn sanitize_output(text: &str) -> String {
-    // Redact incomplete <tool_call ...> tags (no closing </tool_call)
-    let incomplete_re = regex::Regex::new(
-        r#"<tool_call\s+name="[^"]*"(?:\s+call_id="[^"]*")?\s*>(?:(?!</tool_call).)*$"#
+    // Redact incomplete <tool_call ...> tags (no closing </tool_call).
+    // We can't use lookahead in Rust's regex crate, so instead match the opening
+    // tag and then verify the absence of a closing tag manually.
+    let mut result = text.to_string();
+    let opening_re = regex::Regex::new(
+        r#"<tool_call\s+name="[^"]*"(?:\s+call_id="[^"]*")?\s*>"#
     ).unwrap();
-    let mut result = incomplete_re
-        .replace_all(text, "[invalid tool call]")
-        .to_string();
+    for mat in opening_re.find_iter(text).collect::<Vec<_>>().into_iter().rev() {
+        let after = &text[mat.end()..];
+        // If there's no closing tag after this opening tag, it's incomplete
+        if !after.contains("</tool_call") {
+            result.replace_range(mat.start()..text.len(), "[invalid tool call]");
+            break; // only need to handle the last (trailing) incomplete one
+        }
+    }
 
     // Redact lone opening <tool_call tags without any attributes
     let lone_tag_re = regex::Regex::new(r#"<tool_call[^>]*>"#).unwrap();
