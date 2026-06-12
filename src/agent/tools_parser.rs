@@ -54,6 +54,9 @@ const KNOWN_TOOLS: &[&str] = &[
     "list_dir",
     "exec_shell",
     "web_search",
+    "web_reader",
+    "search_files",
+    "run_command",
 ];
 
 /// Result of parsing tool calls from LLM response.

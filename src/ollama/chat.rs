@@ -72,7 +72,8 @@ impl OllamaClient {
         self.chat_with_tools(model, messages, &[]).await
     }
 
-    /// Chat with optional tool definitions for agent loop.
+    /// Chat with optional tool definitions for agent loop (non-streaming).
+    #[allow(dead_code)]
     pub async fn chat_with_tools(
         &self,
         model: &str,
@@ -139,6 +140,137 @@ impl OllamaClient {
 
         Ok(ChatResponse {
             content,
+            model: resp_model,
+        })
+    }
+
+    /// Streaming variant of `chat_with_tools` that emits text chunks as they arrive.
+    ///
+    /// Calls `on_chunk` for each text fragment received from the streaming `/api/chat`
+    /// endpoint. Returns the full assembled response once the stream completes.
+    pub async fn chat_with_tools_streaming(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        tools: &[serde_json::Value],
+        mut on_chunk: impl FnMut(&str),
+    ) -> Result<ChatResponse> {
+        let url = format!("{}/api/chat", self.endpoint);
+        let body = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: true,
+            think: false,
+            options: ChatOptions {
+                num_ctx: self.num_ctx,
+                num_predict: -1,
+            },
+            tools: tools.to_vec(),
+        };
+
+        // Use a client without overall timeout for streaming
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("Creating streaming HTTP client for chat")?;
+
+        let resp = http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "Ollama at {} did not respond (is it running?) for model '{}'",
+                    url, model
+                )
+            })?;
+
+        if resp.status() == StatusCode::NOT_FOUND {
+            anyhow::bail!(
+                "Ollama returned 404 for model '{}' — it may have been removed, try re-pulling",
+                model
+            );
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Ollama returned error {} for model '{}': {}",
+                status,
+                model,
+                text
+            );
+        }
+
+        // Process the NDJSON stream
+        let mut stream = resp.bytes_stream();
+        let mut full_content = String::new();
+        let mut buffer = String::new();
+        let mut resp_model = model.to_string();
+        let read_timeout = std::time::Duration::from_secs(300);
+
+        loop {
+            let chunk_opt = match tokio::time::timeout(read_timeout, stream.next()).await {
+                Ok(opt) => opt,
+                Err(_) => {
+                    anyhow::bail!("Chat stream timed out (no data for 300s)");
+                }
+            };
+
+            let bytes = match chunk_opt {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => {
+                    tracing::warn!("chat stream read error: {}", e);
+                    break;
+                }
+                None => break,
+            };
+
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer = buffer[pos + 1..].to_string();
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                match serde_json::from_str::<serde_json::Value>(&line) {
+                    Ok(val) => {
+                        if let Some(m) = val.get("model").and_then(|m| m.as_str()) {
+                            resp_model = m.to_string();
+                        }
+
+                        let chunk_text = val
+                            .get("message")
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+
+                        if !chunk_text.is_empty() {
+                            on_chunk(chunk_text);
+                            full_content.push_str(chunk_text);
+                        }
+
+                        let done = val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+                        if done {
+                            return Ok(ChatResponse {
+                                content: full_content,
+                                model: resp_model,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("JSON parse error in chat stream: {} in line: {}", e, line);
+                    }
+                }
+            }
+        }
+
+        Ok(ChatResponse {
+            content: full_content,
             model: resp_model,
         })
     }

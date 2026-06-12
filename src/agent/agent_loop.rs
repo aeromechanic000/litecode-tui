@@ -45,7 +45,6 @@ pub enum AgentEvent {
     ToolResult {
         result: ToolResult,
     },
-    #[allow(dead_code)]
     TextChunk {
         content: String,
     },
@@ -95,9 +94,14 @@ pub async fn run_agent_loop(
             vec![]
         };
 
-        // Call LLM
+        // Call LLM (streaming — emits TextChunk events as text arrives)
+        let sink = &mut event_sink;
         let response = match client
-            .chat_with_tools(model, messages.clone(), &tool_defs)
+            .chat_with_tools_streaming(model, messages.clone(), &tool_defs, |chunk| {
+                sink(AgentEvent::TextChunk {
+                    content: chunk.to_string(),
+                });
+            })
             .await
         {
             Ok(r) => r,
