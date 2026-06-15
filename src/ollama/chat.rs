@@ -31,11 +31,69 @@ struct ChatOptions {
     num_predict: i32,
 }
 
+/// A tool call Ollama emitted in the native `message.tool_calls` array.
+///
+/// When `/api/chat` is given a `tools` field, models that support native function
+/// calling populate `message.tool_calls` instead of writing tool calls into
+/// `message.content`. Without reading this, those calls are silently dropped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NativeToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     pub content: String,
+    /// Tool calls Ollama returned via `message.tool_calls`. Empty when the model
+    /// emitted text-format tool calls inside `content` instead.
+    pub tool_calls: Vec<NativeToolCall>,
     #[allow(dead_code)]
     pub model: String,
+}
+
+/// Extract native tool calls from an Ollama `message` JSON object.
+///
+/// Each entry of `message.tool_calls` has the shape `{"function": {"name", "arguments"}}`.
+/// In streaming, `arguments` may arrive as a partial JSON string across chunks; we
+/// take the latest non-empty value per index, attempting to parse partials.
+fn extract_tool_calls_from_message(msg: &serde_json::Value) -> Vec<NativeToolCall> {
+    let mut accum: Vec<NativeToolCall> = Vec::new();
+    let arr = match msg.get("tool_calls").and_then(|t| t.as_array()) {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    for (idx, tc) in arr.iter().enumerate() {
+        let func = match tc.get("function") {
+            Some(f) => f,
+            None => continue,
+        };
+        let name = func
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+        let arguments = match func.get("arguments") {
+            Some(serde_json::Value::String(s)) => {
+                serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+            }
+            Some(other) => other.clone(),
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        };
+        while accum.len() <= idx {
+            accum.push(NativeToolCall {
+                name: String::new(),
+                arguments: serde_json::Value::Object(serde_json::Map::new()),
+            });
+        }
+        if !name.is_empty() {
+            accum[idx].name = name;
+        }
+        if !arguments.is_null() {
+            accum[idx].arguments = arguments;
+        }
+    }
+    accum.into_iter().filter(|tc| !tc.name.is_empty()).collect()
 }
 
 impl ChatMessage {
@@ -126,12 +184,13 @@ impl OllamaClient {
         }
 
         let raw: serde_json::Value = resp.json().await?;
-        let content = raw
-            .get("message")
-            .and_then(|m| m.get("content"))
+        let msg = raw.get("message").cloned().unwrap_or(serde_json::Value::Null);
+        let content = msg
+            .get("content")
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string();
+        let tool_calls = extract_tool_calls_from_message(&msg);
         let resp_model = raw
             .get("model")
             .and_then(|m| m.as_str())
@@ -140,6 +199,7 @@ impl OllamaClient {
 
         Ok(ChatResponse {
             content,
+            tool_calls,
             model: resp_model,
         })
     }
@@ -206,6 +266,7 @@ impl OllamaClient {
         // Process the NDJSON stream
         let mut stream = resp.bytes_stream();
         let mut full_content = String::new();
+        let mut tool_calls: Vec<NativeToolCall> = Vec::new();
         let mut buffer = String::new();
         let mut resp_model = model.to_string();
         let read_timeout = std::time::Duration::from_secs(300);
@@ -243,8 +304,9 @@ impl OllamaClient {
                             resp_model = m.to_string();
                         }
 
-                        let chunk_text = val
-                            .get("message")
+                        let message = val.get("message");
+
+                        let chunk_text = message
                             .and_then(|m| m.get("content"))
                             .and_then(|c| c.as_str())
                             .unwrap_or("");
@@ -254,10 +316,32 @@ impl OllamaClient {
                             full_content.push_str(chunk_text);
                         }
 
+                        // Merge native tool_calls across chunks (index-based).
+                        if let Some(msg) = message {
+                            let chunk_tcs = extract_tool_calls_from_message(msg);
+                            // Reconcile by index: latest non-empty wins per slot.
+                            for (idx, tc) in chunk_tcs.into_iter().enumerate() {
+                                while tool_calls.len() <= idx {
+                                    tool_calls.push(NativeToolCall {
+                                        name: String::new(),
+                                        arguments: serde_json::Value::Object(
+                                            serde_json::Map::new(),
+                                        ),
+                                    });
+                                }
+                                tool_calls[idx] = tc;
+                            }
+                        }
+
                         let done = val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
                         if done {
+                            let tool_calls = tool_calls
+                                .into_iter()
+                                .filter(|tc| !tc.name.is_empty())
+                                .collect();
                             return Ok(ChatResponse {
                                 content: full_content,
+                                tool_calls,
                                 model: resp_model,
                             });
                         }
@@ -269,8 +353,13 @@ impl OllamaClient {
             }
         }
 
+        let tool_calls = tool_calls
+            .into_iter()
+            .filter(|tc| !tc.name.is_empty())
+            .collect();
         Ok(ChatResponse {
             content: full_content,
+            tool_calls,
             model: resp_model,
         })
     }
@@ -565,5 +654,93 @@ mod tests {
             .chat("nonexistent", vec![ChatMessage::user("hi")], true)
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_tool_calls_complete_object() {
+        let msg: serde_json::Value = serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "web_reader",
+                        "arguments": {"url": "https://example.com", "max_length": 1000}
+                    }
+                }
+            ]
+        });
+        let calls = extract_tool_calls_from_message(&msg);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_reader");
+        assert_eq!(
+            calls[0].arguments["url"].as_str().unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(calls[0].arguments["max_length"].as_i64().unwrap(), 1000);
+    }
+
+    #[test]
+    fn extract_tool_calls_empty_when_absent() {
+        let msg: serde_json::Value =
+            serde_json::json!({"role": "assistant", "content": "hello"});
+        assert!(extract_tool_calls_from_message(&msg).is_empty());
+    }
+
+    #[test]
+    fn extract_tool_calls_partial_string_arguments() {
+        // Some stream chunks deliver arguments as a JSON string fragment.
+        let msg: serde_json::Value = serde_json::json!({
+            "tool_calls": [
+                {"function": {"name": "write_file", "arguments": "{\"path\":\"a.txt\"}"}}
+            ]
+        });
+        let calls = extract_tool_calls_from_message(&msg);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["path"].as_str().unwrap(), "a.txt");
+    }
+
+    #[test]
+    fn extract_tool_calls_multiple() {
+        let msg: serde_json::Value = serde_json::json!({
+            "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": "a"}}},
+                {"function": {"name": "read_file", "arguments": {"path": "b"}}}
+            ]
+        });
+        let calls = extract_tool_calls_from_message(&msg);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["path"].as_str().unwrap(), "a");
+        assert_eq!(calls[1].arguments["path"].as_str().unwrap(), "b");
+    }
+
+    #[test]
+    fn extract_tool_calls_skips_unnamed() {
+        let msg: serde_json::Value = serde_json::json!({
+            "tool_calls": [
+                {"function": {"name": "", "arguments": {}}},
+                {"function": {"name": "list_dir", "arguments": {"path": "."}}}
+            ]
+        });
+        let calls = extract_tool_calls_from_message(&msg);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_dir");
+    }
+
+    #[test]
+    fn native_tool_call_to_tool_call_round_trip() {
+        let tc = NativeToolCall {
+            name: "exec_shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        };
+        let tool_call = crate::agent::tools_parser::ToolCall {
+            name: tc.name.clone(),
+            call_id: "native-0".into(),
+            parameters: tc.arguments.clone(),
+        };
+        assert_eq!(tool_call.name, "exec_shell");
+        assert_eq!(tool_call.call_id, "native-0");
+        assert_eq!(tool_call.parameters["command"].as_str().unwrap(), "ls");
     }
 }

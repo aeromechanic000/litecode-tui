@@ -115,8 +115,29 @@ pub async fn run_agent_loop(
 
         let content = response.content;
 
-        // Parse tool calls from response with diagnostics
-        let parse_result = if config.enable_tools {
+        // Native tool_calls (from message.tool_calls) take precedence over text-format
+        // parsing — models like qwen3.5 emit them this way when given a `tools` field,
+        // leaving `content` empty. Without this branch, those calls were silently dropped.
+        let native_calls: Vec<crate::agent::tools_parser::ToolCall> = response
+            .tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, tc)| crate::agent::tools_parser::ToolCall {
+                name: tc.name.clone(),
+                call_id: format!("native-{}", i),
+                parameters: tc.arguments.clone(),
+            })
+            .collect();
+
+        let parse_result = if !native_calls.is_empty() {
+            crate::agent::tools_parser::ParseResult {
+                calls: native_calls,
+                diagnostics: crate::agent::tools_parser::ParseDiagnostics {
+                    hints_found: vec![],
+                    failure_reasons: vec![],
+                },
+            }
+        } else if config.enable_tools {
             parse_tool_calls_with_diagnostics(&content)
         } else {
             crate::agent::tools_parser::ParseResult {
