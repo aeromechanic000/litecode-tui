@@ -1799,11 +1799,19 @@ fn spawn_plan_then_execute(
     let plan_mode = app_state.mode == AppMode::Plan;
     let workspace = app_state.workspace.clone();
 
+    // Build tool descriptions once on the main thread (cheap: just registers handlers).
+    // The planner only sees prose names/descriptions — no native tool-calling. It emits
+    // text steps that reference tools; the executor (spawn_execution_with_plan) does the
+    // actual dispatch.
+    let tools_description = tools::ToolRegistry::new(workspace.clone(), &app_state.config)
+        .descriptions_text();
+
     tracing::info!(
-        "spawn_plan_then_execute: model={}, history_msgs={}, workspace={}",
+        "spawn_plan_then_execute: model={}, history_msgs={}, workspace={}, tools_chars={}",
         exec_model,
         app_state.conversation_history.len(),
-        workspace.display()
+        workspace.display(),
+        tools_description.chars().count()
     );
 
     std::thread::spawn(move || {
@@ -1863,9 +1871,10 @@ fn spawn_plan_then_execute(
             input
         );
         let messages = vec![
-            ollama::chat::ChatMessage::system(apply_prompt_limits(
+            ollama::chat::ChatMessage::system(apply_plan_prompt(
                 agent::prompts::QUICK_PLAN_SYSTEM,
                 max_file_lines,
+                &tools_description,
             )),
             ollama::chat::ChatMessage::user(&user_msg),
         ];
@@ -1915,10 +1924,14 @@ fn spawn_execution_with_plan(
     let history = app_state.conversation_history.clone();
     let workspace = app_state.workspace.clone();
     let context_window_limit = app_state.config.context_window_limit;
-    let web_search_enabled = app_state.web_search_enabled;
-    let max_search_tokens = app_state.config.max_search_context_tokens;
     let now = current_datetime();
     let context_handle = app_state.context_manager.context_handle_for_model(&model).cloned();
+
+    // Tool registry for per-step tool dispatch. Built once outside the step loop and
+    // shared across all steps in this execution. The LLM emits text-format
+    // `<tool_call>` blocks mid-step; `stream_step_with_tools` parses and dispatches.
+    let config = app_state.config.clone();
+    let tool_registry = tools::ToolRegistry::new(workspace.clone(), &config);
 
     // Build system prompt via PromptBuilder (already updated before calling this function)
     let coding_system = app_state.prompt_builder.build();
@@ -2009,7 +2022,7 @@ fn spawn_execution_with_plan(
             };
             let total_tokens = estimate_prompt_tokens(Some(&system_prompt), &prompt);
 
-            let step = stream_single_step_generate(
+            let step = stream_step_with_tools(
                 &rt,
                 http,
                 &endpoint,
@@ -2018,6 +2031,7 @@ fn spawn_execution_with_plan(
                 prompt,
                 context_handle,
                 context_window_limit,
+                &tool_registry,
                 &tx,
             );
             let _ = tx.send(agent::retry::PipelineResult::StreamDone {
@@ -2062,62 +2076,10 @@ fn spawn_execution_with_plan(
                 description: step_desc.clone(),
             });
 
-            // Handle [SEARCH] steps by running actual web search
-            if step_desc.starts_with("[SEARCH]") {
-                let search_query = step_desc
-                    .trim_start_matches("[SEARCH]")
-                    .trim()
-                    .trim_start_matches(|c: char| c == '-' || c == ' ')
-                    .to_string();
-                if web_search_enabled && !search_query.is_empty() {
-                    tracing::info!("plan step [SEARCH]: running web search for {:?}", search_query);
-                    let search_ctx = rt.block_on(run_web_search(&search_query, max_search_tokens));
-                    if !search_ctx.is_empty() {
-                        let preview: String = search_ctx.chars().take(300).collect();
-                        tracing::info!(
-                            "search returned {} bytes for step {}",
-                            search_ctx.len(),
-                            step_num
-                        );
-                        step_results.push(format!(
-                            "[Search results for '{}']\n{}",
-                            search_query,
-                            search_ctx
-                        ));
-                        all_content.push_str(&format!(
-                            "[Search results for '{}']\n{}\n",
-                            search_query, search_ctx
-                        ));
-                        let _ = tx.send(agent::retry::PipelineResult::StreamChunk {
-                            content: format!(
-                                "\nSearch results for '{}':\n{}\n",
-                                search_query,
-                                preview
-                            ),
-                        });
-                        continue;
-                    } else {
-                        step_results.push(format!(
-                            "[No search results found for '{}']",
-                            search_query
-                        ));
-                        all_content.push_str(&format!(
-                            "[No search results found for '{}']\n",
-                            search_query
-                        ));
-                        continue;
-                    }
-                } else {
-                    // No web search available — skip and note it
-                    step_results
-                        .push(format!("[Search skipped (web search disabled): '{}']", search_query));
-                    all_content.push_str(&format!(
-                        "[Search skipped: '{}']\n",
-                        search_query
-                    ));
-                    continue;
-                }
-            }
+            // Note: `[SEARCH]` plan steps were previously special-cased to invoke
+            // run_web_search directly. That behavior is now subsumed by the executor's
+            // tool loop: the LLM emits a `<tool_call name="web_search">` block mid-step
+            // and `stream_step_with_tools` dispatches it via the ToolRegistry.
 
             let prev_summary = if step_results.is_empty() {
                 String::new()
@@ -2163,7 +2125,7 @@ fn spawn_execution_with_plan(
                 format!("{}\nuser: {}", history_prompt, user_msg)
             };
 
-            let step_result = stream_single_step_generate(
+            let step_result = stream_step_with_tools(
                 &rt,
                 http.clone(),
                 &endpoint,
@@ -2172,6 +2134,7 @@ fn spawn_execution_with_plan(
                 prompt,
                 current_context.clone(),
                 context_window_limit,
+                &tool_registry,
                 &tx,
             );
 
@@ -2237,6 +2200,7 @@ fn spawn_execution_with_plan(
 const MAX_TRUNCATION_CONTINUATIONS: usize = 3;
 
 /// Result of a single streaming step, including KV cache metadata.
+#[derive(Clone)]
 struct StepResult {
     content: String,
     context_handle: Option<Vec<i64>>,
@@ -2363,6 +2327,234 @@ fn stream_single_step_generate(
         prompt_eval_count: final_prompt_eval_count,
         eval_count: final_eval_count,
     }
+}
+
+/// Maximum number of tool-call rounds within a single plan step. Each round is one
+/// `/api/generate` call (which itself may chain up to `MAX_TRUNCATION_CONTINUATIONS`
+/// sub-calls for length-truncated responses). Five rounds covers a reasonable
+/// fetch→inspect→decide sequence without risking runaway loops.
+const MAX_TOOL_ROUNDS_PER_STEP: usize = 5;
+
+/// Maximum retries when the LLM emits something that *looks* like a tool call but
+/// fails to parse (e.g. missing closing tag, malformed JSON). Mirrors agent loop.
+const MAX_TOOL_CORRECTION_RETRIES: usize = 2;
+
+/// Execute one plan step with optional tool calls. Repeatedly calls
+/// `stream_single_step_generate` (the `/api/generate` primitive that owns truncation
+/// continuation and KV-cache context-handle threading). After each round, parses the
+/// assistant output for text-format `<tool_call>` blocks. If found, dispatches them via
+/// the `ToolRegistry`, appends `<tool_result>` blocks to the prompt, and re-calls with
+/// the same context handle so Ollama prefix-matches the cached KV tensors and only
+/// evaluates the delta. Terminates when the LLM emits no tool calls (and no failed
+/// attempts), or when the round / retry / signature-repeat caps are hit.
+///
+/// The low-level primitive `stream_single_step_generate` stays unchanged — this
+/// wrapper orchestrates tool round-trips on top of it.
+#[allow(clippy::too_many_arguments)]
+fn stream_step_with_tools(
+    rt: &tokio::runtime::Runtime,
+    http: reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    system_prompt: Option<String>,
+    initial_prompt: String,
+    context_handle: Option<Vec<i64>>,
+    num_ctx: u64,
+    tools: &tools::ToolRegistry,
+    tx: &mpsc::Sender<agent::retry::PipelineResult>,
+) -> StepResult {
+    let mut current_prompt = initial_prompt;
+    let mut current_context = context_handle;
+    let mut last_step_result: Option<StepResult> = None;
+    let mut correction_retries = 0usize;
+    let mut prev_signature = String::new();
+
+    for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
+        let step_result = stream_single_step_generate(
+            rt,
+            http.clone(),
+            endpoint,
+            model,
+            system_prompt.clone(),
+            current_prompt.clone(),
+            current_context.clone(),
+            num_ctx,
+            tx,
+        );
+
+        // Surface transport-level errors immediately (content starts with "ERROR:").
+        if step_result.content.starts_with("ERROR:") {
+            return step_result;
+        }
+
+        let content = step_result.content.clone();
+        let parse_result =
+            crate::agent::tools_parser::parse_tool_calls_with_diagnostics(&content);
+
+        // No parseable tool calls — decide whether to retry or finalize.
+        if parse_result.calls.is_empty() {
+            if parse_result.is_failed_attempt() && correction_retries < MAX_TOOL_CORRECTION_RETRIES
+            {
+                correction_retries += 1;
+                tracing::warn!(
+                    "stream_step_with_tools round {}: malformed tool call, retrying ({}/{}) — diagnostics: {}",
+                    round,
+                    correction_retries,
+                    MAX_TOOL_CORRECTION_RETRIES,
+                    parse_result.diagnostics.format_for_correction()
+                );
+                // Re-prompt for correction without changing context_handle. The cached
+                // prefix still matches; only the appended text is new.
+                current_prompt = format!(
+                    "{}\n\nuser: Your previous tool call could not be parsed. {}. \
+                     Emit a valid <tool_call name=\"...\" call_id=\"...\">{{...}}</tool_call> block, \
+                     or finish the step without a tool call.",
+                    content,
+                    parse_result.diagnostics.format_for_correction()
+                );
+                continue;
+            }
+            // No tool calls and not a recoverable failed attempt — step complete.
+            tracing::info!(
+                "stream_step_with_tools round {}: no tool calls, step complete (chars={})",
+                round,
+                content.chars().count()
+            );
+            return step_result;
+        }
+
+        // Valid tool calls — reset retry counter, check for infinite loop.
+        correction_retries = 0;
+        let tool_calls = parse_result.calls;
+        let current_sig = tool_calls
+            .iter()
+            .map(|c| format!("{}:{}", c.name, c.parameters))
+            .collect::<Vec<_>>()
+            .join("|");
+        if current_sig == prev_signature {
+            tracing::warn!(
+                "stream_step_with_tools round {}: repeating tool signature, finalizing step",
+                round
+            );
+            return step_result;
+        }
+        prev_signature = current_sig;
+
+        // Preserve this round's metadata in case we exhaust MAX_TOOL_ROUNDS_PER_STEP.
+        last_step_result = Some(step_result.clone());
+        current_context = step_result.context_handle.clone();
+
+        // Dispatch each tool call.
+        let mut tool_result_blocks: Vec<String> = Vec::new();
+        for call in &tool_calls {
+            tracing::info!(
+                "stream_step_with_tools round {}: dispatching tool={} params={:?}",
+                round,
+                call.name,
+                call.parameters
+            );
+            // Validate name.
+            if !tools.has_tool(&call.name) {
+                let err = tools::ToolResult::err(
+                    &call.name,
+                    &call.call_id,
+                    format!(
+                        "Unknown tool '{}'. Available tools: {}",
+                        call.name,
+                        tools.list_names().join(", ")
+                    ),
+                );
+                let _ = tx.send(agent::retry::PipelineResult::ToolStart {
+                    tool_name: call.name.clone(),
+                    call_id: call.call_id.clone(),
+                });
+                let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
+                    result: err.clone(),
+                });
+                tool_result_blocks.push(format_tool_result_block(&err));
+                continue;
+            }
+            // Validate required params.
+            if let Ok(validation) = tools.validate_params(&call.name, &call.parameters) {
+                if !validation.is_empty() {
+                    let err = tools::ToolResult::err(&call.name, &call.call_id, validation);
+                    let _ = tx.send(agent::retry::PipelineResult::ToolStart {
+                        tool_name: call.name.clone(),
+                        call_id: call.call_id.clone(),
+                    });
+                    let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
+                        result: err.clone(),
+                    });
+                    tool_result_blocks.push(format_tool_result_block(&err));
+                    continue;
+                }
+            }
+            // Dispatch.
+            let _ = tx.send(agent::retry::PipelineResult::ToolStart {
+                tool_name: call.name.clone(),
+                call_id: call.call_id.clone(),
+            });
+            let result = tools
+                .get(&call.name)
+                .unwrap()
+                .execute(call.parameters.clone(), call.call_id.clone())
+                .unwrap_or_else(|e| {
+                    tools::ToolResult::err(&call.name, &call.call_id, format!("{}", e))
+                });
+            tracing::info!(
+                "stream_step_with_tools round {}: tool {} result success={} output_chars={}",
+                round,
+                call.name,
+                result.success,
+                result.output.chars().count()
+            );
+            let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
+                result: result.clone(),
+            });
+            tool_result_blocks.push(format_tool_result_block(&result));
+        }
+
+        // Build next-round prompt: append verbatim assistant output + tool_result blocks
+        // + continuation instruction. Ollama prefix-matches the cached KV tensors against
+        // the prior (prompt + assistant output) and evaluates only the tool_result delta.
+        let mut appended = String::new();
+        appended.push('\n');
+        appended.push_str(&content);
+        for block in &tool_result_blocks {
+            appended.push_str(block);
+        }
+        appended.push_str(
+            "\nuser: Continue the step using the tool results above. Emit another <tool_call> block if more tools are needed, otherwise finish the step.\n",
+        );
+        current_prompt = format!("{}{}", current_prompt, appended);
+    }
+
+    tracing::warn!(
+        "stream_step_with_tools: hit MAX_TOOL_ROUNDS_PER_STEP={}, returning last step result",
+        MAX_TOOL_ROUNDS_PER_STEP
+    );
+    last_step_result.unwrap_or(StepResult {
+        content: String::new(),
+        context_handle: current_context,
+        prompt_eval_count: None,
+        eval_count: None,
+    })
+}
+
+/// Format a `ToolResult` as a `<tool_result>` block for inclusion in the next `/api/generate`
+/// prompt. The JSON payload shape mirrors what the agent loop uses; the closing-tag
+/// escape handles the rare case where fetched HTML/Markdown contains the literal sequence.
+fn format_tool_result_block(result: &tools::ToolResult) -> String {
+    let escaped_output = result.output.replace("</tool_result>", "</tool_result_");
+    let payload = if result.success {
+        serde_json::json!({ "success": true, "output": escaped_output })
+    } else {
+        serde_json::json!({ "success": false, "output": escaped_output, "error": "tool execution failed" })
+    };
+    format!(
+        "\n<tool_result tool=\"{}\" call_id=\"{}\">{}</tool_result>",
+        result.tool_name, result.call_id, payload
+    )
 }
 
 /// Build a flat prompt string from conversation history for `/api/generate`.
@@ -2600,115 +2792,6 @@ fn render_retry_result(ui_state: &mut ui::UiState, result: agent::retry::RetryRe
     }
 }
 
-/// Route request based on current mode:
-///  - Auto + code keywords → full auto pipeline (plan→implement→audit)
-///  - Edit/Auto (non-code) → plan-then-execute (plan step, then streaming execution)
-///  - Plan mode → plan-then-execute (plan shown as analysis, no approval)
-///
-/// Spawn the tool-use agent loop on a background thread.
-/// The agent loop calls LLM with tool definitions, parses tool calls,
-/// executes tools, feeds results back, and repeats until done.
-fn spawn_agent_loop(
-    app_state: &AppState,
-    input: &str,
-    tx: mpsc::Sender<agent::retry::PipelineResult>,
-) {
-    let model = app_state.config.exec_model.clone();
-    if model.is_empty() {
-        let _ = tx.send(agent::retry::PipelineResult::Retry(
-            agent::retry::RetryResult::Failed {
-                last_error: "No core model configured.".into(),
-                attempts: 0,
-            },
-        ));
-        return;
-    }
-
-    let endpoint = app_state.config.ollama_endpoint.clone();
-    let connect_timeout = app_state.config.connect_timeout;
-    let context_window_limit = app_state.config.context_window_limit;
-    let workspace = app_state.workspace.clone();
-    let tool_config = app_state.config.clone();
-    let input = input.to_string();
-    let system_prompt = app_state.prompt_builder.build();
-    let config = agent::agent_loop::AgentLoopConfig::default();
-
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = tx.send(agent::retry::PipelineResult::Retry(
-                    agent::retry::RetryResult::Failed {
-                        last_error: format!("Runtime error: {}", e),
-                        attempts: 0,
-                    },
-                ));
-                return;
-            }
-        };
-
-        let bg_config = config::Config {
-            ollama_endpoint: endpoint,
-            connect_timeout,
-            context_window_limit,
-            ..config::Config::default()
-        };
-        let client = match ollama::OllamaClient::new(&bg_config) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(agent::retry::PipelineResult::Retry(
-                    agent::retry::RetryResult::Failed {
-                        last_error: format!("Client error: {}", e),
-                        attempts: 0,
-                    },
-                ));
-                return;
-            }
-        };
-
-        let tools = tools::ToolRegistry::new(workspace, &tool_config);
-
-        let tx_clone = tx.clone();
-        let result = rt.block_on(agent::agent_loop::run_agent_loop(
-            &client,
-            &model,
-            &tools,
-            &system_prompt,
-            &input,
-            &config,
-            |event| match event {
-                agent::agent_loop::AgentEvent::ToolStart { tool_name, call_id } => {
-                    let _ = tx_clone
-                        .send(agent::retry::PipelineResult::ToolStart { tool_name, call_id });
-                }
-                agent::agent_loop::AgentEvent::ToolResult { result } => {
-                    let _ = tx_clone.send(agent::retry::PipelineResult::ToolResultReady { result });
-                }
-                agent::agent_loop::AgentEvent::TextChunk { content } => {
-                    let _ = tx_clone.send(agent::retry::PipelineResult::StreamChunk { content });
-                }
-                agent::agent_loop::AgentEvent::Done { content, steps } => {
-                    tracing::info!("agent loop done: {} steps, {} bytes", steps, content.len());
-                    let _ = tx_clone.send(agent::retry::PipelineResult::StreamDone { content });
-                }
-                agent::agent_loop::AgentEvent::Error { message } => {
-                    tracing::error!("agent loop error: {}", message);
-                    let _ = tx_clone.send(agent::retry::PipelineResult::Retry(
-                        agent::retry::RetryResult::Failed {
-                            last_error: message,
-                            attempts: 0,
-                        },
-                    ));
-                }
-            },
-        ));
-
-        if let Err(e) = result {
-            tracing::error!("agent loop failed: {}", e);
-        }
-    });
-}
-
 /// Spawn a background eval review using the eval model.
 /// After execution completes, the eval model reviews whether the implementation
 /// fulfills the user's original request.
@@ -2831,23 +2914,18 @@ fn spawn_request_for_mode(
     // Set the current goal from user input — re-injected at prompt edges for small models
     app_state.prompt_builder.set_current_goal(input);
 
-    let is_code = looks_like_code_request(input);
-    let needs_tools = looks_like_tool_request(input);
-    let use_agent = needs_tools || (app_state.mode == AppMode::Auto && is_code);
     tracing::info!(
-        "request routing: mode={}, is_code_request={}, needs_tools={}, pipeline={}",
+        "request routing: mode={}, pipeline=plan_then_execute (single-path architecture)",
         app_state.mode,
-        is_code,
-        needs_tools,
-        if use_agent { "agent_loop" } else { "plan_then_execute" }
     );
     tracing::debug!("input for routing: {:?}", input);
 
-    if use_agent {
-        spawn_agent_loop(app_state, input, tx);
-    } else {
-        spawn_plan_then_execute(app_state, client, input, tx);
-    }
+    // Single execution pipeline: plan-then-execute handles every request, including
+    // tool-using ones. The planner sees tool descriptions in its prompt; the executor
+    // parses text-format <tool_call> blocks and dispatches via ToolRegistry. Auto/Plan/
+    // Edit modes all flow through here, with mode-specific behavior enforced inside
+    // spawn_plan_then_execute / spawn_execution_with_plan.
+    spawn_plan_then_execute(app_state, client, input, tx);
 }
 
 /// Spawn the full plan→implement→audit pipeline on a background thread.
@@ -3078,6 +3156,14 @@ fn maybe_trigger_summarization(
 
 fn apply_prompt_limits(prompt: &str, max_file_lines: usize) -> String {
     prompt.replace("{MAX_LINES}", &max_file_lines.to_string())
+}
+
+/// Substitute `{MAX_LINES}` and `{TOOLS}` placeholders in a planner system prompt.
+/// `{TOOLS}` is the prose listing of available tools (name + description per line)
+/// from `ToolRegistry::descriptions_text()`. Kept as a sibling to
+/// `apply_prompt_limits` so callers that don't need tool interpolation are unaffected.
+fn apply_plan_prompt(prompt: &str, max_file_lines: usize, tools_description: &str) -> String {
+    apply_prompt_limits(prompt, max_file_lines).replace("{TOOLS}", tools_description)
 }
 
 fn handle_run_command(app_state: &mut AppState, ui_state: &mut ui::UiState, cmd: &str) {
@@ -3795,57 +3881,69 @@ fn run_lsp_diagnostics(
     }
 }
 
-fn looks_like_code_request(input: &str) -> bool {
-    let lower = input.to_lowercase();
-    let code_keywords = [
-        "implement",
-        "create",
-        "write",
-        "build",
-        "add",
-        "refactor",
-        "generate",
-        "fix",
-        "modify",
-        "change",
-        "update",
-        "make a",
-        "code",
-        "function",
-        "class",
-        "module",
-        "file",
-    ];
-    code_keywords.iter().any(|k| lower.contains(k))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase A: `apply_plan_prompt` must substitute both `{MAX_LINES}` and `{TOOLS}`
+    /// into the planner system prompt. The planner uses text-only tool awareness —
+    /// it sees prose descriptions but never gets a native `tools=` field.
+    #[test]
+    fn apply_plan_prompt_substitutes_both_placeholders() {
+        let template = "Lines: {MAX_LINES}\nTools:\n{TOOLS}\nEnd.";
+        let tools_desc = "- web_reader: fetch a URL\n- read_file: read a file";
+        let rendered = apply_plan_prompt(template, 200, tools_desc);
+        assert!(!rendered.contains("{MAX_LINES}"), "MAX_LINES not substituted");
+        assert!(!rendered.contains("{TOOLS}"), "TOOLS not substituted");
+        assert!(rendered.contains("Lines: 200"));
+        assert!(rendered.contains("- web_reader: fetch a URL"));
+        assert!(rendered.contains("- read_file: read a file"));
+        assert!(rendered.ends_with("End."));
+    }
+
+    /// Phase A: tool descriptions come from a real ToolRegistry, so the planner
+    /// sees every registered tool (file ops, web_reader, web_search, exec_shell).
+    #[test]
+    fn plan_prompt_tools_block_lists_all_registered_tools() {
+        let reg = tools::ToolRegistry::new(
+            std::path::PathBuf::from("."),
+            &config::Config::default(),
+        );
+        let desc = reg.descriptions_text();
+        // Every tool registered in ToolRegistry::new should be visible.
+        for name in ["read_file", "write_file", "edit_file", "list_dir", "exec_shell"] {
+            assert!(
+                desc.contains(&format!("- {}: ", name)),
+                "tool {} missing from descriptions_text: {}",
+                name,
+                desc
+            );
+        }
+    }
+
+    /// Phase D: routing helpers are gone. This test exists to fail loudly if anyone
+    /// reintroduces mode-dependent branching into `spawn_request_for_mode` without
+    /// updating the single-path architecture contract.
+    #[test]
+    fn no_agent_loop_routing_remnants() {
+        // The two classifier helpers that used to drive agent-loop routing must not
+        // be defined anywhere in the source. The check uses `"fn looks_like"` (without
+        // the rest of the name) so this test's own source doesn't match itself.
+        let main_rs = std::fs::read_to_string("src/main.rs").expect("read main.rs");
+        let offending: Vec<&str> = main_rs
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("fn looks_like_")
+                    || trimmed.starts_with("fn spawn_agent_loop")
+                    || trimmed.starts_with("pub fn spawn_agent_loop")
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "single-path architecture violation — these functions must stay removed: {:#?}",
+            offending
+        );
+    }
 }
 
-/// Detect requests that need tool access (web fetching, URL reading, searching).
-/// These require the agent loop which has tool definitions — plan-then-execute
-/// can't call tools.
-fn looks_like_tool_request(input: &str) -> bool {
-    let lower = input.to_lowercase();
-    // URL patterns
-    if lower.contains("http://") || lower.contains("https://") {
-        return true;
-    }
-    let tool_keywords = [
-        "fetch url",
-        "fetch content",
-        "read url",
-        "open url",
-        "access url",
-        "visit url",
-        "go to url",
-        "fetch the page",
-        "read the page",
-        "web page",
-        "webpage",
-        "read from",
-        "fetch from",
-        "search the web",
-        "search online",
-        "look up online",
-        "search for",
-    ];
-    tool_keywords.iter().any(|k| lower.contains(k))
-}

@@ -47,8 +47,8 @@ src/
 │                        context window estimation, parameter count heuristics
 │
 ├── agent/
-│   ├── mod.rs           Agent pipeline: plan→edit→auto flow, file change parsing
-│   ├── agent_loop.rs    Tool-use agent loop: LLM ↔ tool dispatch cycle
+│   ├── mod.rs           Agent module root: submodules (auto_run, diagnostics, editor,
+│   │                    planner, prompts, retry, summarizer, syntax, tools_parser)
 │   ├── tools_parser.rs  Parse text/JSON tool calls from LLM output + sanitize_output()
 │   │                    scrubs forged tool call markers from display
 │   ├── planner.rs       Plan mode: builds prompt context for read-only analysis
@@ -156,23 +156,58 @@ Tracks: `context_handle`, `total_prompt_tokens`, `last_prompt_eval_count`, `last
 
 ---
 
-## Agent Loop Architecture
+## Execution Pipeline Architecture
 
-The agent loop uses `std::sync::mpsc` channels with background threads. Two execution paths exist:
+There is **one** execution pipeline: plan-then-execute (`spawn_plan_then_execute` →
+`spawn_execution_with_plan`). Every free-text request flows through it, regardless of
+mode (Plan / Edit / Auto) or whether tools are needed.
 
-### 1. Plan-then-Execute (`spawn_plan_then_execute` → `spawn_execution_with_plan`)
-Used for Edit/Plan mode and non-code Auto requests:
-1. Exec model generates a numbered plan
-2. Plan displayed for approval (Edit) or auto-executed (Auto/Plan)
-3. Each step streamed via `/api/generate` with KV cache context handle
-4. Steps carry the context handle forward between iterations
+### Tool awareness via prompt engineering on `/api/generate`
 
-### 2. Tool-Use Agent Loop (`spawn_agent_loop`)
-Used for Auto mode code requests:
-1. Exec model runs with tool definitions (read_file, write_file, edit_file, run_command, search_files)
-2. LLM outputs tool calls → parsed by `tools_parser.rs` → executed via `tools/`
-3. Tool results fed back to LLM → repeat until `done`
-4. Events (ToolStart, ToolResult, TextChunk, Done) sent through PipelineResult channel
+Tool calls are enabled without native `/api/chat` tool-calling. Both phases are
+tool-aware through prompt text:
+
+- **Planner**: `QUICK_PLAN_SYSTEM` interpolates a `{TOOLS}` block — a prose listing of
+  tool names + descriptions from `ToolRegistry::descriptions_text()`. The planner does
+  not call tools; it emits text steps that reference them (e.g. "Use web_reader to
+  fetch https://…"). See `apply_plan_prompt()` in `src/main.rs`.
+
+- **Executor**: `base_identity_prompt()` (`src/prompt.rs`) teaches the LLM to emit
+  text-format `<tool_call name="…" call_id="…">{…}</tool_call>` blocks. The wrapper
+  `stream_step_with_tools` (`src/main.rs`) wraps the unchanged `/api/generate`
+  primitive (`stream_single_step_generate`), parsing each step's output via
+  `parse_tool_calls_with_diagnostics` and dispatching through `ToolRegistry`.
+
+### Per-step tool loop
+
+For each plan step, `stream_step_with_tools` runs up to `MAX_TOOL_ROUNDS_PER_STEP = 5`
+rounds. Each round:
+
+1. Call `stream_single_step_generate` (which itself owns truncation continuation and
+   KV-cache context-handle threading).
+2. Parse the assistant output for `<tool_call>` blocks.
+3. If no calls and not a failed-attempt → step done, return content.
+4. If no calls but `is_failed_attempt()` and `correction_retries < 2` → append a
+   correction prompt, retry the same round.
+5. If calls found → validate name and params per call → emit `PipelineResult::ToolStart`
+   → dispatch via `ToolRegistry::execute` → emit `PipelineResult::ToolResultReady`.
+6. Build the next-round prompt by appending the verbatim assistant output, one
+   `<tool_result tool="…" call_id="…">{…}</tool_result>` block per call, and a
+   `user: Continue the step…` instruction.
+7. Pass the previous round's `StepResult.context_handle` as input. Ollama prefix-matches
+   the cached KV tensors and only evaluates the delta.
+
+Termination caps: `MAX_TOOL_ROUNDS_PER_STEP = 5`, `MAX_TOOL_CORRECTION_RETRIES = 2`,
+plus signature-repeat detection (same tool name + params as previous round).
+
+### Pipeline flow
+
+1. Exec model generates a numbered plan via `OllamaClient::chat` (with `{TOOLS}` in
+   the system prompt — no `tools=` field).
+2. Plan displayed for approval (Edit mode) or auto-executed (Plan / Auto mode).
+3. Each step streamed via `/api/generate` with KV cache context handle.
+4. Steps carry the context handle forward between iterations.
+5. Within a step, tool rounds chain the context handle forward for cache reuse.
 
 ---
 
@@ -210,7 +245,7 @@ Enter key
      ├─ /run <cmd>             → sandboxed execution
      ├─ /skill_name args       → spawn_skill_request()
      └─ free text              → record in history → spawn_request_for_mode()
-                                  → spawn_plan_then_execute() or spawn_agent_loop()
+                                  → spawn_plan_then_execute()  (single pipeline)
   → OutputLine::User(msg) added immediately
   → app_state.is_processing = true
   → background thread → /api/generate with context handle
@@ -227,7 +262,7 @@ Enter key
 
 | Tier | Size | Role | Config Field |
 |------|------|------|-------------|
-| Exec | 6-14B | Main work — coding, planning, file generation, agent loop | `exec_model` |
+| Exec | 6-14B | Main work — planning, file generation, per-step tool dispatch | `exec_model` |
 | Eval | 14B+ | Review — check results, quality assurance | `eval_model` |
 
 Prompts adapt to model size via `agent::prompts::system_prompt_for_size()`: short/directive for small, standard+examples for medium, full/nuanced for large.

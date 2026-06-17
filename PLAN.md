@@ -817,3 +817,80 @@ the foundation (accurate token counts) that other improvements build on.
 M14.5 validates that the existing KV cache system actually works as intended.
 M14.2–M14.4 improve the agent loop reliability and performance.
 M14.6 and M14.8 are quality-of-life improvements for later.
+
+---
+
+## Phase 15 — Single-Pipeline Architecture with Prompt-Driven Tool Calls (v3.1)
+
+Reference: `/Users/nil/.claude/plans/sharded-cooking-dahl.md`
+
+The project's design intent is a **single execution pipeline**: plan-then-execute, always. Tool calls are enabled via prompt engineering on `/api/generate` (text-format `<tool_call>` blocks the existing parser already understands), preserving KV-cache context-handle reuse. The current "two execution paths" documented in CLAUDE.md and the `looks_like_tool_request` routing short-circuit violate this intent and silently skip plan approval for any web/tool request.
+
+---
+
+### M15.1 Collapse to Single Pipeline + Prompt-Driven Tool Calls — P0 TODO
+
+**Problem:** Commit `f772df5` added `looks_like_tool_request()` routing (`src/main.rs:3842`) that bypasses `spawn_plan_then_execute` for any input containing `http://`, `https://`, or phrases like "fetch url" / "search for". The bypass routes to `spawn_agent_loop`, which has no approval gate — so plan approval is silently lost for any web/tool request. Root cause: the plan-then-execute path was never tool-aware, so the only path to tool use was a parallel agent loop. Three wiring gaps:
+1. The planner LLM call hardcodes `tools=&[]` via `OllamaClient::chat()` (`src/ollama/chat.rs:124–131`) — planner cannot see tools exist.
+2. Step execution uses `/api/generate` (`src/main.rs:2269`), whose `GenerateRequest` has no `tools` field — by design, kept as-is.
+3. The step loop has no tool-call parser, dispatcher, or result-append-and-re-call round-trip. Only a `[SEARCH]` string-prefix hack at `src/main.rs:2066`.
+
+**Target:** One pipeline (plan-then-execute) handles every free-text request. Planner sees tool descriptions via prompt text only (no native tool-calling). Executor parses text-format `<tool_call>` blocks emitted by the LLM, dispatches via `ToolRegistry`, feeds results back for another round — all on `/api/generate` so the KV-cache context handle chains across rounds. Agent loop (`spawn_agent_loop` + `run_agent_loop`) and `looks_like_tool_request` removed entirely.
+
+**Tasks:**
+
+*Phase A — Planner prompt learns tools (text only)*
+- [ ] A1. Add `ToolRegistry::descriptions_text() -> String` in `src/tools/mod.rs` (formats `ToolDef.description` prose list)
+- [ ] A2. Update `QUICK_PLAN_SYSTEM` (`src/agent/prompts.rs:3`): interpolate `{TOOLS}` block, drop `[SEARCH]` rule at line 10
+- [ ] A3. Extend `apply_prompt_limits` (`src/main.rs:3096`) or add sibling helper to substitute both `{MAX_LINES}` and `{TOOLS}`
+- [ ] A4. In `spawn_plan_then_execute` (`src/main.rs:1779`): build `ToolRegistry::new(workspace, &config)`, substitute `{TOOLS}` into planner system prompt; planner call stays as `OllamaClient::chat(...)` (no `tools=` field)
+
+*Phase B — Executor runs tool loop per step on `/api/generate`*
+- [ ] B1. Extend `base_identity_prompt()` (`src/prompt.rs:234`) with `<tool_call>` syntax spec (lift wording from `TOOL_CORRECTION_PROMPT` at `src/agent/prompts.rs:145`)
+- [ ] B2. Add `MAX_TOOL_ROUNDS_PER_STEP: usize = 5` constant and `stream_step_with_tools(...)` wrapper in `src/main.rs` adjacent to `stream_single_step_generate` (line 2248)
+- [ ] B3. Per-round logic: call `stream_single_step_generate` unchanged → parse output via `parse_tool_calls_with_diagnostics` → terminate on no-calls-AND-not-failed-attempt, signature-repeat, or `MAX_CORRECTION_RETRIES=2` exhaustion
+- [ ] B4. Per-call dispatch: validate name (`tools.has_tool`) + params (`tools.validate_params`) → emit `PipelineResult::ToolStart` → `tools.execute(...)` → emit `PipelineResult::ToolResultReady`; emit `ToolResult::err(...)` on validation failure
+- [ ] B5. Build next-round prompt: append verbatim assistant output + `<tool_result tool="..." call_id="...">{...}</tool_result>` per call + `user: Continue the step using the tool results above.` line
+- [ ] B6. Thread context handle across rounds (each round passes previous round's `StepResult.context_handle`)
+- [ ] B7. Swap call sites at `src/main.rs:2012` (no-parseable-steps branch) and `src/main.rs:2166` (main step loop) to use `stream_step_with_tools`; build one `ToolRegistry` outside step loop
+
+*Phase C — Remove `[SEARCH]` hack*
+- [ ] C1. Delete `[SEARCH]` branch at `src/main.rs:2066–2120`
+- [ ] C2. Remove `[SEARCH]` example from `QUICK_PLAN_SYSTEM` (line 23) — replace with tool-reference style
+
+*Phase D — Remove agent loop; route all to plan-then-execute*
+- [ ] D1. Replace body of `spawn_request_for_mode` (`src/main.rs:2822`) with unconditional `spawn_plan_then_execute(...)`
+- [ ] D2. Delete `spawn_agent_loop` (`src/main.rs:2611–2820`)
+- [ ] D3. Delete `src/agent/agent_loop.rs` and remove `pub mod agent_loop;` from `src/agent/mod.rs`
+- [ ] D4. Delete `looks_like_tool_request` (`src/main.rs:3842`) and `looks_like_code_request` (`src/main.rs:3815`) — no remaining callers
+- [ ] D5. Remove `AgentLoopConfig` struct and orphaned imports
+
+*Phase E — Documentation*
+- [ ] E1. Rewrite "Agent Loop Architecture" section in `CLAUDE.md:159–175` to single-path
+- [ ] E2. Update event-processing diagram at `CLAUDE.md:212–213` — drop `or spawn_agent_loop()` branch
+- [ ] E3. Update "Two-Tier Model Pipeline" section if it references Auto-mode agent routing
+
+**Files:** `src/tools/mod.rs`, `src/agent/prompts.rs`, `src/main.rs`, `src/prompt.rs`, `src/agent/agent_loop.rs` (delete), `src/agent/mod.rs`, `CLAUDE.md`
+
+**Verification:**
+- `cargo build` clean
+- `cargo test` — existing 160+ tests pass; add routing test asserting all inputs route to `spawn_plan_then_execute`
+- `cargo test -- --ignored` — live-Ollama integration tests
+- `grep -rn "spawn_agent_loop\|run_agent_loop" src/ tests/` returns nothing
+- Manual end-to-end in Edit mode: "fetch https://example.com and summarize" → plan with `web_reader` reference → approval gate fires → tool dispatched mid-step → result fed back → final summary streams; status bar `ctx:%` stays high across rounds (cache preserved)
+- Manual failure path: bad tool name → `ToolResult::err(...)` → LLM corrects on next round or terminates at `MAX_CORRECTION_RETRIES`
+- Cache regression: multi-turn coding session (no tools) still shows ~90%+ KV cache hit
+
+---
+
+### M15.2 Implementation Order
+
+```
+A1–A4 (planner tool-aware)         foundation — no behavior change yet
+  → B1–B7 (per-step tool loop)     core feature — enables tool calls in plan-execute
+  → C1–C2 (remove [SEARCH] hack)   cleanup — subsumed by general mechanism
+  → D1–D5 (remove agent loop)      architecture collapse — single pipeline
+  → E1–E3 (update CLAUDE.md)       documentation sync
+```
+
+Phase A is safe to land first (planner sees tools but executor can't act on them yet — no regression). Phase B is the enabling change. Phases C and D are pure removal once B is verified working. Phase E is documentation.

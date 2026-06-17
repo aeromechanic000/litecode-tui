@@ -1,4 +1,3 @@
-pub mod agent_loop;
 pub mod auto_run;
 pub mod diagnostics;
 pub mod editor;

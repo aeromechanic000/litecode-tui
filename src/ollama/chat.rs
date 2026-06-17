@@ -47,6 +47,7 @@ pub struct ChatResponse {
     pub content: String,
     /// Tool calls Ollama returned via `message.tool_calls`. Empty when the model
     /// emitted text-format tool calls inside `content` instead.
+    #[allow(dead_code)]
     pub tool_calls: Vec<NativeToolCall>,
     #[allow(dead_code)]
     pub model: String,
@@ -140,6 +141,21 @@ impl OllamaClient {
     ) -> Result<ChatResponse> {
         let url = format!("{}/api/chat", self.endpoint);
         let _think = messages.iter().any(|m| m.role == "system");
+
+        let msg_summary: Vec<String> = messages
+            .iter()
+            .map(|m| format!("{}:{}c", m.role, m.content.chars().count()))
+            .collect();
+        let total_msg_bytes: usize = messages.iter().map(|m| m.content.len()).sum();
+        tracing::info!(
+            "chat request (non-streaming): model={}, num_ctx={}, tools={}, messages=[{}], total_bytes={}",
+            model,
+            self.num_ctx,
+            tools.len(),
+            msg_summary.join(","),
+            total_msg_bytes
+        );
+
         let body = ChatRequest {
             model: model.to_string(),
             messages,
@@ -152,6 +168,7 @@ impl OllamaClient {
             tools: tools.to_vec(),
         };
 
+        let start = std::time::Instant::now();
         let resp = self
             .http
             .post(&url)
@@ -166,6 +183,13 @@ impl OllamaClient {
                 )
             })?;
 
+        let status = resp.status();
+        tracing::info!(
+            "chat response (non-streaming): status={} latency_ms={}",
+            status,
+            start.elapsed().as_millis()
+        );
+
         if resp.status() == StatusCode::NOT_FOUND {
             anyhow::bail!(
                 "Ollama returned 404 for model '{}' — it may have been removed, try re-pulling",
@@ -173,8 +197,12 @@ impl OllamaClient {
             );
         }
         if !resp.status().is_success() {
-            let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            tracing::error!(
+                "chat http error (non-streaming): status={} body={:.500}",
+                status,
+                text
+            );
             anyhow::bail!(
                 "Ollama returned error {} for model '{}': {}",
                 status,
@@ -197,6 +225,22 @@ impl OllamaClient {
             .unwrap_or(model)
             .to_string();
 
+        if content.is_empty() && tool_calls.is_empty() {
+            tracing::warn!(
+                "chat done (non-streaming) with EMPTY response: latency_ms={} raw_snippet={:.300}",
+                start.elapsed().as_millis(),
+                serde_json::to_string(&raw).unwrap_or_default()
+            );
+        } else {
+            tracing::info!(
+                "chat done (non-streaming): content_chars={} tool_calls={} latency_ms={} preview={:?}",
+                content.chars().count(),
+                tool_calls.len(),
+                start.elapsed().as_millis(),
+                content.chars().take(200).collect::<String>()
+            );
+        }
+
         Ok(ChatResponse {
             content,
             tool_calls,
@@ -208,6 +252,7 @@ impl OllamaClient {
     ///
     /// Calls `on_chunk` for each text fragment received from the streaming `/api/chat`
     /// endpoint. Returns the full assembled response once the stream completes.
+    #[allow(dead_code)]
     pub async fn chat_with_tools_streaming(
         &self,
         model: &str,
@@ -216,6 +261,35 @@ impl OllamaClient {
         mut on_chunk: impl FnMut(&str),
     ) -> Result<ChatResponse> {
         let url = format!("{}/api/chat", self.endpoint);
+
+        // Payload summary for log: never dump full prompt body (multi-KB), just structure.
+        let msg_summary: Vec<String> = messages
+            .iter()
+            .map(|m| format!("{}:{}c", m.role, m.content.chars().count()))
+            .collect();
+        let total_msg_bytes: usize = messages.iter().map(|m| m.content.len()).sum();
+        tracing::info!(
+            "chat request: model={}, num_ctx={}, tools={}, messages=[{}], total_bytes={}",
+            model,
+            self.num_ctx,
+            tools.len(),
+            msg_summary.join(","),
+            total_msg_bytes
+        );
+        if tools.is_empty() {
+            tracing::debug!("chat request has NO tools — model can only respond with text");
+        } else {
+            let tool_names: Vec<&str> = tools
+                .iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                })
+                .collect();
+            tracing::debug!("chat request tools: [{}]", tool_names.join(","));
+        }
+
         let body = ChatRequest {
             model: model.to_string(),
             messages,
@@ -234,6 +308,8 @@ impl OllamaClient {
             .build()
             .context("Creating streaming HTTP client for chat")?;
 
+        let request_start = std::time::Instant::now();
+        tracing::debug!("POST {} (stream=true)", url);
         let resp = http
             .post(&url)
             .json(&body)
@@ -246,6 +322,13 @@ impl OllamaClient {
                 )
             })?;
 
+        let status = resp.status();
+        tracing::info!(
+            "chat response: status={} connect_ms={}",
+            status,
+            request_start.elapsed().as_millis()
+        );
+
         if resp.status() == StatusCode::NOT_FOUND {
             anyhow::bail!(
                 "Ollama returned 404 for model '{}' — it may have been removed, try re-pulling",
@@ -253,8 +336,12 @@ impl OllamaClient {
             );
         }
         if !resp.status().is_success() {
-            let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            tracing::error!(
+                "chat http error: status={} body={:.500}",
+                status,
+                text
+            );
             anyhow::bail!(
                 "Ollama returned error {} for model '{}': {}",
                 status,
@@ -271,10 +358,23 @@ impl OllamaClient {
         let mut resp_model = model.to_string();
         let read_timeout = std::time::Duration::from_secs(300);
 
+        // Telemetry for "no data for 300s" / "0 chunks received" debugging.
+        let mut chunk_count: usize = 0;
+        let mut raw_bytes_received: usize = 0;
+        let mut first_chunk_after_ms: Option<u128> = None;
+        let mut first_chunk_logged = false;
+        let mut last_done_reason: Option<String> = None;
+
         loop {
             let chunk_opt = match tokio::time::timeout(read_timeout, stream.next()).await {
                 Ok(opt) => opt,
                 Err(_) => {
+                    tracing::warn!(
+                        "chat stream timed out after 300s with no data (chunks={}, bytes={}, content_bytes={})",
+                        chunk_count,
+                        raw_bytes_received,
+                        full_content.len()
+                    );
                     anyhow::bail!("Chat stream timed out (no data for 300s)");
                 }
             };
@@ -282,11 +382,38 @@ impl OllamaClient {
             let bytes = match chunk_opt {
                 Some(Ok(b)) => b,
                 Some(Err(e)) => {
-                    tracing::warn!("chat stream read error: {}", e);
+                    tracing::warn!(
+                        "chat stream read error: {} (chunks={}, bytes={}, content_bytes={})",
+                        e,
+                        chunk_count,
+                        raw_bytes_received,
+                        full_content.len()
+                    );
                     break;
                 }
-                None => break,
+                None => {
+                    tracing::debug!(
+                        "chat stream ended by remote (chunks={}, bytes={}, content_bytes={})",
+                        chunk_count,
+                        raw_bytes_received,
+                        full_content.len()
+                    );
+                    break;
+                }
             };
+
+            raw_bytes_received += bytes.len();
+            chunk_count += 1;
+            if first_chunk_after_ms.is_none() {
+                first_chunk_after_ms = Some(request_start.elapsed().as_millis());
+            }
+            tracing::debug!(
+                "chat raw chunk #{}: bytes={} cumulative_raw={} cumulative_content={}",
+                chunk_count,
+                bytes.len(),
+                raw_bytes_received,
+                full_content.len()
+            );
 
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -312,6 +439,19 @@ impl OllamaClient {
                             .unwrap_or("");
 
                         if !chunk_text.is_empty() {
+                            if !first_chunk_logged {
+                                first_chunk_logged = true;
+                                tracing::info!(
+                                    "chat first content chunk: latency_ms={} first_chunk_len={}",
+                                    request_start.elapsed().as_millis(),
+                                    chunk_text.chars().count()
+                                );
+                            }
+                            tracing::debug!(
+                                "chat text chunk: len={} cumulative={}",
+                                chunk_text.chars().count(),
+                                full_content.chars().count() + chunk_text.chars().count()
+                            );
                             on_chunk(chunk_text);
                             full_content.push_str(chunk_text);
                         }
@@ -319,6 +459,12 @@ impl OllamaClient {
                         // Merge native tool_calls across chunks (index-based).
                         if let Some(msg) = message {
                             let chunk_tcs = extract_tool_calls_from_message(msg);
+                            if !chunk_tcs.is_empty() {
+                                tracing::debug!(
+                                    "chat chunk has {} native tool_calls",
+                                    chunk_tcs.len()
+                                );
+                            }
                             // Reconcile by index: latest non-empty wins per slot.
                             for (idx, tc) in chunk_tcs.into_iter().enumerate() {
                                 while tool_calls.len() <= idx {
@@ -334,11 +480,37 @@ impl OllamaClient {
                         }
 
                         let done = val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+                        if let Some(reason) =
+                            val.get("done_reason").and_then(|d| d.as_str()).map(|s| s.to_string())
+                        {
+                            last_done_reason = Some(reason);
+                        }
                         if done {
-                            let tool_calls = tool_calls
+                            let tool_calls: Vec<NativeToolCall> = tool_calls
                                 .into_iter()
                                 .filter(|tc| !tc.name.is_empty())
                                 .collect();
+                            let total_ms = request_start.elapsed().as_millis();
+                            if full_content.is_empty() && tool_calls.is_empty() {
+                                tracing::warn!(
+                                    "chat done with EMPTY response: reason={} chunks={} raw_bytes={} total_ms={}",
+                                    last_done_reason.as_deref().unwrap_or("(none)"),
+                                    chunk_count,
+                                    raw_bytes_received,
+                                    total_ms
+                                );
+                            } else {
+                                tracing::info!(
+                                    "chat done: content_chars={} tool_calls={} chunks={} raw_bytes={} total_ms={} reason={} preview={:?}",
+                                    full_content.chars().count(),
+                                    tool_calls.len(),
+                                    chunk_count,
+                                    raw_bytes_received,
+                                    total_ms,
+                                    last_done_reason.as_deref().unwrap_or("(none)"),
+                                    full_content.chars().take(200).collect::<String>()
+                                );
+                            }
                             return Ok(ChatResponse {
                                 content: full_content,
                                 tool_calls,
@@ -347,16 +519,29 @@ impl OllamaClient {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("JSON parse error in chat stream: {} in line: {}", e, line);
+                        tracing::debug!(
+                            "JSON parse error in chat stream: {} in line: {}",
+                            e,
+                            line
+                        );
                     }
                 }
             }
         }
 
-        let tool_calls = tool_calls
+        // Stream ended without `done:true` — log distinctly so this is diagnosable.
+        let tool_calls: Vec<NativeToolCall> = tool_calls
             .into_iter()
             .filter(|tc| !tc.name.is_empty())
             .collect();
+        tracing::warn!(
+            "chat stream ended WITHOUT done=true: content_chars={} tool_calls={} chunks={} raw_bytes={} first_chunk_after_ms={:?}",
+            full_content.chars().count(),
+            tool_calls.len(),
+            chunk_count,
+            raw_bytes_received,
+            first_chunk_after_ms
+        );
         Ok(ChatResponse {
             content: full_content,
             tool_calls,
@@ -426,6 +611,16 @@ impl OllamaClient {
         cancel: watch::Receiver<bool>,
     ) -> impl futures::Stream<Item = Result<GenerateChunk>> {
         let url = format!("{}/api/generate", endpoint);
+
+        tracing::info!(
+            "generate request: model={}, num_ctx={}, prompt_chars={}, system_chars={}, context_handle={}",
+            model,
+            num_ctx,
+            prompt.chars().count(),
+            system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+            if context_handle.is_some() { format!("Some({} tokens)", context_handle.as_ref().unwrap().len()) } else { "None".into() }
+        );
+
         let body = GenerateRequest {
             model: model.clone(),
             prompt,
@@ -439,17 +634,28 @@ impl OllamaClient {
         };
 
         async_stream::stream! {
+            let request_start = std::time::Instant::now();
             let resp = match http.post(&url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    tracing::error!("generate connect failed: {} (latency_ms={})", e, request_start.elapsed().as_millis());
                     yield Err(anyhow::anyhow!("Generate stream connect failed: {}", e));
                     return;
                 }
             };
 
+            let status = resp.status();
+            tracing::info!(
+                "generate response: status={} connect_ms={}",
+                status,
+                request_start.elapsed().as_millis()
+            );
+
             if !resp.status().is_success() {
                 let status = resp.status();
-                yield Err(anyhow::anyhow!("Ollama generate stream error: {}", status));
+                let text = resp.text().await.unwrap_or_default();
+                tracing::error!("generate http error: status={} body={:.500}", status, text);
+                yield Err(anyhow::anyhow!("Ollama generate stream error: {}: {}", status, text));
                 return;
             }
 
@@ -463,10 +669,14 @@ impl OllamaClient {
             const MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(30 * 60);
             let mut error_count: usize = 0;
             const MAX_ERRORS: usize = 5;
+            let mut chunk_count: usize = 0;
+            let mut content_chars: usize = 0;
+            let mut first_content_logged = false;
 
             loop {
                 let cancelled = *cancel.borrow();
                 if cancelled {
+                    tracing::info!("generate cancelled by user (chunks={}, content_chars={})", chunk_count, content_chars);
                     yield Ok(GenerateChunk {
                         response: String::new(),
                         done: true,
@@ -480,6 +690,7 @@ impl OllamaClient {
                 }
 
                 if start.elapsed() > MAX_DURATION {
+                    tracing::error!("generate exceeded 30min cap (chunks={}, content_chars={})", chunk_count, content_chars);
                     yield Err(anyhow::anyhow!(
                         "Generate stream exceeded maximum duration (30 min)"
                     ));
@@ -489,6 +700,10 @@ impl OllamaClient {
                 let chunk_result = match tokio::time::timeout(read_timeout, stream.next()).await {
                     Ok(Some(result)) => result,
                     Ok(None) => {
+                        tracing::warn!(
+                            "generate stream ended without done flag (chunks={}, content_chars={}, total_bytes={})",
+                            chunk_count, content_chars, total_bytes
+                        );
                         yield Ok(GenerateChunk {
                             response: String::new(),
                             done: true,
@@ -501,6 +716,10 @@ impl OllamaClient {
                         return;
                     }
                     Err(_) => {
+                        tracing::warn!(
+                            "generate stream timed out (no data for 300s, chunks={}, content_chars={})",
+                            chunk_count, content_chars
+                        );
                         yield Err(anyhow::anyhow!("Generate stream timed out (no data for 300s)"));
                         return;
                     }
@@ -511,6 +730,7 @@ impl OllamaClient {
                     Err(_) => {
                         error_count += 1;
                         if error_count >= MAX_ERRORS {
+                            tracing::error!("generate too many stream errors ({})", error_count);
                             yield Err(anyhow::anyhow!(
                                 "Too many generate stream errors ({})",
                                 error_count
@@ -522,6 +742,7 @@ impl OllamaClient {
                 };
 
                 total_bytes += bytes.len();
+                chunk_count += 1;
                 if total_bytes > MAX_CONTENT_BYTES {
                     yield Err(anyhow::anyhow!(
                         "Generate stream exceeded maximum content size (10 MB)"
@@ -556,6 +777,23 @@ impl OllamaClient {
                                 .unwrap_or(&model)
                                 .to_string();
 
+                            if !response.is_empty() {
+                                content_chars += response.chars().count();
+                                if !first_content_logged {
+                                    first_content_logged = true;
+                                    tracing::info!(
+                                        "generate first chunk: latency_ms={} len={}",
+                                        request_start.elapsed().as_millis(),
+                                        response.chars().count()
+                                    );
+                                }
+                                tracing::debug!(
+                                    "generate chunk: len={} cumulative_chars={}",
+                                    response.chars().count(),
+                                    content_chars
+                                );
+                            }
+
                             // Extract eval stats (present on final chunk)
                             let context = if done {
                                 val.get("context")
@@ -578,6 +816,27 @@ impl OllamaClient {
                             } else {
                                 None
                             };
+
+                            if done {
+                                if content_chars == 0 {
+                                    tracing::warn!(
+                                        "generate done with EMPTY response: reason={} chunks={} total_bytes={} total_ms={}",
+                                        done_reason.as_deref().unwrap_or("(none)"),
+                                        chunk_count, total_bytes,
+                                        request_start.elapsed().as_millis()
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "generate done: chars={} prompt_eval={:?} eval={:?} reason={} chunks={} total_ms={}",
+                                        content_chars,
+                                        prompt_eval_count,
+                                        eval_count,
+                                        done_reason.as_deref().unwrap_or("(none)"),
+                                        chunk_count,
+                                        request_start.elapsed().as_millis()
+                                    );
+                                }
+                            }
 
                             yield Ok(GenerateChunk {
                                 response,

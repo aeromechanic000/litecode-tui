@@ -131,7 +131,21 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.definition()).collect()
     }
 
+    /// Plain-text listing of tool names + descriptions, one per line. Used to
+    /// teach the planner what tools exist without enabling native tool-calling
+    /// (the planner only emits text steps that reference tools by name).
+    pub fn descriptions_text(&self) -> String {
+        self.definitions()
+            .into_iter()
+            .map(|d| format!("- {}: {}", d.name, d.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Ollama-format tool definitions for the API request.
+    /// Currently exercised only by tests after the agent-loop removal — retained for
+    /// any future caller that wants `/api/chat`-style native tool-calling.
+    #[allow(dead_code)]
     pub fn ollama_tool_definitions(&self) -> Vec<serde_json::Value> {
         self.definitions()
             .into_iter()
@@ -180,6 +194,21 @@ mod tests {
                 name: "echo".into(),
                 description: "Echo tool".into(),
                 parameters: serde_json::json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
+            }
+        }
+    }
+
+    struct NoOpTool;
+
+    impl Tool for NoOpTool {
+        fn execute(&self, _: serde_json::Value, call_id: String) -> Result<ToolResult> {
+            Ok(ToolResult::ok("noop", call_id, ""))
+        }
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "noop".into(),
+                description: "Does nothing".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
             }
         }
     }
@@ -286,5 +315,17 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0]["type"], "function");
         assert_eq!(defs[0]["function"]["name"], "echo");
+    }
+
+    #[test]
+    fn descriptions_text_lists_name_and_description() {
+        let mut reg = empty_registry();
+        reg.register(Box::new(EchoTool));
+        reg.register(Box::new(NoOpTool));
+        let text = reg.descriptions_text();
+        // Each registered tool contributes one line, prefixed with "- " + name.
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("- echo: "));
+        assert!(text.contains("- noop: "));
     }
 }

@@ -7,11 +7,17 @@ Rules:
 - Each step should produce a SHORT output (under {MAX_LINES} lines of code)
 - For file creation: first create a minimal skeleton, then add content in separate steps
 - Each step = ONE action: create one file, modify one section, or run one command
-- If you need current information (versions, APIs, libraries, docs), prefix the step with [SEARCH]
 - All file paths must be RELATIVE to the working directory
 - All commands run in the working directory — never cd elsewhere
 - Be specific about file paths and actions
 - Keep each step to one line
+
+Available tools (you do NOT call these yourself — the executor will, when the step needs them):
+{TOOLS}
+When a step requires a tool, name it explicitly so the executor knows to use it. Examples:
+- "Use web_reader to fetch https://example.com and save the body to fetched.md"
+- "Use web_search to look up the latest stable version of crate `tokio`"
+- "Use read_file to read src/main.rs before editing"
 
 File-as-memory planning:
 - Design each step to write its output to a file immediately — the file becomes the agent's memory for subsequent steps.
@@ -20,7 +26,7 @@ File-as-memory planning:
 
 Output format: numbered steps, one per line:
 1. Step description
-2. [SEARCH] Research latest API for authentication
+2. Use web_search to research the latest authentication API
 3. Create file skeleton
 ..."#;
 

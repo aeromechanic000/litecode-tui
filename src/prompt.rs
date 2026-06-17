@@ -249,6 +249,12 @@ Available tools:
 - exec_shell — run shell commands (git, cargo, npm, etc.)
 
 When the user provides a URL or asks to fetch/read a webpage, ALWAYS use web_reader first.
+
+## Tool calls
+To invoke a tool during a step, emit exactly this format (one block per call):
+<tool_call name="tool_name" call_id="any-unique-id">{"param": "value"}</tool_call>
+The executor runs the tool, appends a <tool_result> block to the conversation, and lets you continue the same step using the result. Emit the block inline in your response wherever the call is needed; you may also include prose around it. After receiving a result, continue the step (more calls, more prose, or the step's final output). Do not invent tool names — only the tools listed above exist.
+
 ### FILE: path/to/file
 ### ACTION: create|modify|delete
 ```

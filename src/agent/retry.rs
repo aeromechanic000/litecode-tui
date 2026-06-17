@@ -207,6 +207,15 @@ pub async fn chat_with_retry(
     max_retries: usize,
     think: bool,
 ) -> RetryResult {
+    tracing::info!(
+        "chat_with_retry start: model={} kind={:?} system_chars={} user_chars={} max_retries={}",
+        model,
+        kind,
+        system_prompt.chars().count(),
+        user_request.chars().count(),
+        max_retries
+    );
+
     let mut attempts: Vec<(String, String)> = Vec::new();
     let mut last_response = String::new();
 
@@ -218,6 +227,12 @@ pub async fn chat_with_retry(
             ]
         } else {
             let correction = build_correction_prompt(user_request, &attempts);
+            tracing::info!(
+                "chat_with_retry attempt {}/{}: retrying with correction prompt ({} chars)",
+                attempt,
+                max_retries,
+                correction.chars().count()
+            );
             vec![
                 ChatMessage::system(system_prompt),
                 ChatMessage::user(&correction),
@@ -242,6 +257,11 @@ pub async fn chat_with_retry(
                         continue;
                     }
                     _ => {
+                        tracing::error!(
+                            "chat_with_retry failed permanently at attempt {}: {}",
+                            attempt,
+                            error_msg
+                        );
                         return RetryResult::Failed {
                             last_error: if attempt > 0 {
                                 format!("Ollama error after {} retries: {}", attempt, error_msg)
@@ -259,17 +279,33 @@ pub async fn chat_with_retry(
 
         match validate_response(&response.content, kind) {
             ValidationResult::Valid(content) => {
+                tracing::info!(
+                    "chat_with_retry success at attempt {}: content_chars={}",
+                    attempt,
+                    content.chars().count()
+                );
                 return RetryResult::Success {
                     content,
                     attempts: attempt,
                 };
             }
             ValidationResult::Invalid { response, reason } => {
+                tracing::warn!(
+                    "chat_with_retry validation failed at attempt {}: reason={} response_chars={}",
+                    attempt,
+                    reason,
+                    response.chars().count()
+                );
                 attempts.push((response, reason));
             }
         }
     }
 
+    tracing::warn!(
+        "chat_with_retry exhausted all {} retries; returning last response ({} chars)",
+        max_retries,
+        last_response.chars().count()
+    );
     // All retries exhausted — return last response anyway with a warning
     RetryResult::Exhausted {
         content: last_response,
