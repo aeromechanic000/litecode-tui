@@ -178,6 +178,12 @@ fn parse_json_calls_inner(text: &str, reasons: &mut Vec<String>) -> Vec<ToolCall
             }
         };
 
+        // Small models often emit {"param": {...}} or {"parameters": {...}}
+        // instead of putting the keys at the top level. Unwrap the common
+        // envelope keys so dispatch can proceed; the prompts also warn against
+        // this, but the fallback keeps a single mistake from failing the step.
+        let parameters = unwrap_param_envelope(parameters);
+
         if !name.is_empty() {
             calls.push(ToolCall {
                 name,
@@ -233,6 +239,27 @@ fn parse_single_text_call(line: &str) -> Option<ToolCall> {
 
 fn uuid_short() -> String {
     uuid::Uuid::new_v4().to_string()[..8].to_string()
+}
+
+/// Hoist `{"param": {...}}` / `{"parameters": {...}}` / `{"args": {...}}` /
+/// `{"input": {...}}` to the inner object. Only fires when the envelope is the
+/// sole key and the inner value is itself an object — leaves legitimate
+/// single-key params (e.g. `{"path": "x"}`) untouched.
+fn unwrap_param_envelope(v: serde_json::Value) -> serde_json::Value {
+    let obj = match v.as_object() {
+        Some(o) if o.len() == 1 => o,
+        _ => return v,
+    };
+    let (key, inner) = obj.iter().next().expect("len == 1 guaranteed");
+    let is_envelope = matches!(
+        key.as_str(),
+        "param" | "parameters" | "args" | "input"
+    );
+    if is_envelope && inner.is_object() {
+        inner.clone()
+    } else {
+        v
+    }
 }
 
 /// Sanitize LLM text output by redacting incomplete or invalid tool call markers.
@@ -377,5 +404,46 @@ Call: write_file(path="b.rs")"#;
         assert_eq!(calls[0].parameters["path"], "main.rs");
         assert_eq!(calls[0].parameters["old_text"], "fn old");
         assert_eq!(calls[0].parameters["new_text"], "fn new");
+    }
+
+    #[test]
+    fn parses_param_envelope_unwrap() {
+        // Model emitted {"param": {...}} — the bug that motivated this fix.
+        let text = r#"<tool_call name="web_reader" call_id="x">{"param": {"url": "https://example.com"}}</tool_call>"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].parameters["url"], "https://example.com");
+        assert!(
+            calls[0].parameters.get("param").is_none(),
+            "param envelope should be unwrapped"
+        );
+    }
+
+    #[test]
+    fn parses_parameters_envelope_unwrap() {
+        // Same shape with the full word "parameters" as the wrapper.
+        let text = r#"<tool_call name="exec_shell" call_id="y">{"parameters": {"command": "cargo test"}}</tool_call>"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].parameters["command"], "cargo test");
+    }
+
+    #[test]
+    fn does_not_unwrap_non_envelope() {
+        // Legitimate single-key params must NOT be hoisted — "path" isn't an envelope key.
+        let text = r#"<tool_call name="read_file" call_id="z">{"path": "src/main.rs"}</tool_call>"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].parameters["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn does_not_unwrap_envelope_with_primitive_value() {
+        // {"param": "url=..."} — value is a string, not an object. Leave alone; the
+        // validate_params error will surface the problem to the model.
+        let text = r#"<tool_call name="web_reader" call_id="w">{"param": "url=https://x.com"}</tool_call>"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].parameters["param"], "url=https://x.com");
     }
 }

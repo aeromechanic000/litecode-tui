@@ -242,18 +242,24 @@ Core principles:
 - Respect the user's preferred coding style and conventions
 - Ask clarifying questions when requirements are ambiguous
 
-Available tools:
-- read_file, write_file, edit_file, list_dir — file operations
-- web_reader — fetch and read webpage content from a URL (HIGHEST PRIORITY for any URL the user provides)
-- web_search — search the web via DuckDuckGo
-- exec_shell — run shell commands (git, cargo, npm, etc.)
-
 When the user provides a URL or asks to fetch/read a webpage, ALWAYS use web_reader first.
+When the user asks to run a build, test, or git operation, use exec_shell.
 
 ## Tool calls
-To invoke a tool during a step, emit exactly this format (one block per call):
-<tool_call name="tool_name" call_id="any-unique-id">{"param": "value"}</tool_call>
-The executor runs the tool, appends a <tool_result> block to the conversation, and lets you continue the same step using the result. Emit the block inline in your response wherever the call is needed; you may also include prose around it. After receiving a result, continue the step (more calls, more prose, or the step's final output). Do not invent tool names — only the tools listed above exist.
+To invoke a tool during a step, emit one block per call. The JSON inside the tag holds the
+tool's parameters at the TOP LEVEL — never wrap them under "param" or "parameters".
+
+Examples:
+<tool_call name="read_file" call_id="1">{"path": "src/main.rs"}</tool_call>
+<tool_call name="write_file" call_id="2">{"path": "src/new.rs", "content": "fn main() {}"}</tool_call>
+<tool_call name="edit_file" call_id="3">{"path": "src/main.rs", "old_text": "fn old", "new_text": "fn new"}</tool_call>
+<tool_call name="web_reader" call_id="4">{"url": "https://example.com"}</tool_call>
+<tool_call name="exec_shell" call_id="5">{"command": "cargo test"}</tool_call>
+
+The "Available Tools" section below lists every tool and its required parameters. After a
+call, the executor appends a <tool_result> block and you may continue the same step (more
+calls, more prose, or the step's final output). Emit blocks inline wherever the call is
+needed. Do not invent tool names — only the tools listed below exist.
 
 ### FILE: path/to/file
 ### ACTION: create|modify|delete
@@ -315,6 +321,26 @@ Always validate changes before applying (syntax checks, tests)."#
             PromptPriority::High,
             "skills",
             format!("## Available Skills\n{}\n\nInvoke with /skill_name. When relevant, apply the skill's specialized approach.", list),
+        ));
+    }
+
+    /// Update the per-tool schema layer. Emits one line per tool with its
+    /// required and optional parameters so the executor knows the exact
+    /// top-level JSON keys each tool expects. Sorted by tool name for
+    /// byte-stable output across turns (KV-cache friendly).
+    pub fn set_tools(&mut self, tools: &crate::tools::ToolRegistry) {
+        self.static_layers.retain(|l| l.name != "tools");
+        let schema = tools.schema_text();
+        if schema.is_empty() {
+            return;
+        }
+        self.static_layers.push(PromptLayer::new(
+            PromptPriority::High,
+            "tools",
+            format!(
+                "## Available Tools\n{}\n\nCall parameters go directly in the JSON object inside <tool_call>...</tool_call>. Never wrap them under \"param\" or \"parameters\".",
+                schema
+            ),
         ));
     }
 
@@ -648,5 +674,47 @@ mod tests {
         let prompt = builder.build();
         assert!(!prompt.contains("Current Objective"));
         assert!(!prompt.contains("Completed"));
+    }
+
+    #[test]
+    fn base_identity_no_param_template() {
+        // Regression guard: the misleading {"param": "value"} template must never
+        // come back. It taught small models to wrap params under "param".
+        let builder = PromptBuilder::new(&Config::default());
+        let prompt = builder.build();
+        assert!(
+            !prompt.contains(r#"{"param": "value"}"#),
+            "base_identity_prompt must not contain the misleading template"
+        );
+    }
+
+    #[test]
+    fn tools_layer_injected() {
+        let mut builder = PromptBuilder::new(&Config::default());
+        let workspace = std::path::PathBuf::from(".");
+        let registry = crate::tools::ToolRegistry::new(workspace, &Config::default());
+        builder.set_tools(&registry);
+        let prompt = builder.build();
+        assert!(prompt.contains("## Available Tools"));
+        // The real registry always contains web_reader — the bug source.
+        assert!(prompt.contains("web_reader"));
+        // Schema line for web_reader must mention url as required.
+        assert!(
+            prompt.contains("required=[url]"),
+            "expected web_reader required=[url], got: {}",
+            prompt
+        );
+    }
+
+    #[test]
+    fn tools_layer_does_not_rely_on_skills_layer() {
+        // Tools layer should be independent of skills — both can coexist.
+        let mut builder = PromptBuilder::new(&Config::default());
+        let workspace = std::path::PathBuf::from(".");
+        let registry = crate::tools::ToolRegistry::new(workspace, &Config::default());
+        builder.set_tools(&registry);
+        builder.set_skills(&SkillRegistry::empty());
+        let prompt = builder.build();
+        assert!(prompt.contains("## Available Tools"));
     }
 }

@@ -122,6 +122,8 @@ impl AppState {
         let mut prompt_builder = PromptBuilder::new(&config);
         prompt_builder.set_mode(mode);
         prompt_builder.set_skills(&skills);
+        let tool_registry = crate::tools::ToolRegistry::new(workspace.clone(), &config);
+        prompt_builder.set_tools(&tool_registry);
 
         let config_dir = Config::effective_dir(&workspace);
         let instructions = crate::prompt::ProjectInstructions::discover(&workspace, &config_dir);

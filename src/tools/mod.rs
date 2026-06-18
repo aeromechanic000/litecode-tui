@@ -120,15 +120,29 @@ impl ToolRegistry {
         if missing.is_empty() {
             Ok(String::new())
         } else {
+            // Echo back the bad payload and the expected keys so the model can
+            // see its own mistake (e.g. params nested under "param") instead of
+            // getting a generic "missing" error it can't reason about.
+            let expected: Vec<String> = schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|obj| obj.keys().cloned().collect())
+                .unwrap_or_default();
             Ok(format!(
-                "Missing required parameters: {}",
-                missing.join(", ")
+                "Missing required parameters: {}. You sent: {}. Expected top-level keys: {}. \
+                 Parameters must sit at the top level of the JSON object inside <tool_call>, \
+                 not nested under 'param' or 'parameters'.",
+                missing.join(", "),
+                params,
+                expected.join(", ")
             ))
         }
     }
 
     pub fn definitions(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|t| t.definition()).collect()
+        let mut defs: Vec<_> = self.tools.values().map(|t| t.definition()).collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        defs
     }
 
     /// Plain-text listing of tool names + descriptions, one per line. Used to
@@ -138,6 +152,19 @@ impl ToolRegistry {
         self.definitions()
             .into_iter()
             .map(|d| format!("- {}: {}", d.name, d.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Per-tool parameter schema, one line per tool. Sorts by name so the byte
+    /// output is stable across turns (KV-cache friendly). Each line lists the
+    /// tool name, its parameters with required/optional markers and defaults,
+    /// and the short description. Used to teach the executor exactly which
+    /// top-level keys each tool expects.
+    pub fn schema_text(&self) -> String {
+        self.definitions()
+            .into_iter()
+            .map(|d| format_tool_schema(&d))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -170,6 +197,48 @@ impl Default for ToolRegistry {
             &crate::config::Config::default(),
         )
     }
+}
+
+/// Render a single tool definition as one schema line for `schema_text()`.
+/// Format: `- {name}: required=[a, b], optional=[c]. {description}`
+/// Tools with no parameters omit the param list. Sorted order is the caller's job.
+fn format_tool_schema(def: &ToolDef) -> String {
+    let required: Vec<String> = def
+        .parameters
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let all_props: Vec<String> = def
+        .parameters
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let optional: Vec<&str> = all_props
+        .iter()
+        .filter(|p| !required.iter().any(|r| r == *p))
+        .map(String::as_str)
+        .collect();
+
+    let header = match (required.is_empty(), optional.is_empty()) {
+        (true, true) => format!("- {}", def.name),
+        (false, true) => format!("- {}: required=[{}]", def.name, required.join(", ")),
+        (true, false) => format!("- {}: optional=[{}]", def.name, optional.join(", ")),
+        (false, false) => format!(
+            "- {}: required=[{}], optional=[{}]",
+            def.name,
+            required.join(", "),
+            optional.join(", ")
+        ),
+    };
+    format!("{}. {}", header, def.description)
 }
 
 #[cfg(test)]
@@ -296,6 +365,86 @@ mod tests {
             .validate_params("req_tool", &serde_json::json!({"path": "a.rs"}))
             .unwrap();
         assert!(result.contains("content"));
+    }
+
+    struct MixedTool;
+
+    impl Tool for MixedTool {
+        fn execute(&self, _: serde_json::Value, call_id: String) -> Result<ToolResult> {
+            Ok(ToolResult::ok("mixed", call_id, ""))
+        }
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "mixed".into(),
+                description: "Has both required and optional params".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" },
+                        "max_length": { "type": "integer" }
+                    },
+                    "required": ["url"]
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn schema_text_lists_required_and_optional_params() {
+        let mut reg = empty_registry();
+        reg.register(Box::new(MixedTool));
+        let text = reg.schema_text();
+        assert!(
+            text.contains("required=[url]"),
+            "expected required marker, got: {}",
+            text
+        );
+        assert!(
+            text.contains("optional=[max_length]"),
+            "expected optional marker, got: {}",
+            text
+        );
+        assert!(text.contains("mixed"), "expected tool name, got: {}", text);
+    }
+
+    #[test]
+    fn schema_text_sorted_by_name() {
+        let mut reg = empty_registry();
+        // Register in reverse alphabetical order
+        reg.register(Box::new(RequiredTool)); // "req_tool"
+        reg.register(Box::new(EchoTool)); // "echo"
+        reg.register(Box::new(NoOpTool)); // "noop"
+        let text = reg.schema_text();
+        // Match the line prefix `- {name}` so the lookup is robust to header format.
+        let echo_pos = text.find("- echo").expect("echo missing");
+        let noop_pos = text.find("- noop").expect("noop missing");
+        let req_pos = text.find("- req_tool").expect("req_tool missing");
+        assert!(echo_pos < noop_pos, "echo should come before noop");
+        assert!(noop_pos < req_pos, "noop should come before req_tool");
+    }
+
+    #[test]
+    fn validate_params_echoes_bad_payload() {
+        let mut reg = empty_registry();
+        reg.register(Box::new(MixedTool));
+        // Model wrapped params under "param" — the bug we just fixed.
+        let bad = serde_json::json!({"param": {"url": "https://x.com"}});
+        let result = reg.validate_params("mixed", &bad).unwrap();
+        assert!(
+            result.contains("\"param\""),
+            "error should echo the bad payload, got: {}",
+            result
+        );
+        assert!(
+            result.contains("url"),
+            "error should name the missing required key, got: {}",
+            result
+        );
+        assert!(
+            result.contains("top level"),
+            "error should explain the top-level rule, got: {}",
+            result
+        );
     }
 
     #[test]

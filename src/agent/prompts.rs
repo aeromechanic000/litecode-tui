@@ -148,10 +148,10 @@ If no templates are relevant, output: none"#;
 /// Correction prompt injected when tool call parsing fails.
 /// Shows the model the correct format to help small models recover.
 #[allow(dead_code)]
-pub const TOOL_CORRECTION_PROMPT: &str = r#"Your tool call was not understood. Use one of these formats:
+pub const TOOL_CORRECTION_PROMPT: &str = r#"Your tool call was not understood. The JSON object inside the <tool_call> tag must hold the parameters directly at the top level — never wrap them under "param" or "parameters".
 
 JSON format (preferred):
-<tool_call name="tool_name">{"param": "value"}</tool_call}
+<tool_call name="tool_name" call_id="any-id">{"actual_param": "value"}</tool_call>
 
 Text format (fallback):
 Call: tool_name(param="value")
@@ -159,9 +159,10 @@ Call: tool_name(param="value")
 Available tools: read_file, write_file, edit_file, list_dir, exec_shell, web_search, web_reader
 
 Examples:
-<tool_call name="read_file">{"path": "src/main.rs"}</tool_call}
-<tool_call name="write_file">{"path": "src/new.rs", "content": "fn main() {}"}</tool_call}
-<tool_call name="exec_shell">{"command": "cargo test"}</tool_call}
+<tool_call name="read_file" call_id="1">{"path": "src/main.rs"}</tool_call>
+<tool_call name="write_file" call_id="2">{"path": "src/new.rs", "content": "fn main() {}"}</tool_call>
+<tool_call name="web_reader" call_id="3">{"url": "https://example.com"}</tool_call>
+<tool_call name="exec_shell" call_id="4">{"command": "cargo test"}</tool_call>
 Call: read_file(path="src/main.rs")
 
 Please try again with the correct format."#;
@@ -175,8 +176,10 @@ Before trying again, think step by step:
 2. What is going wrong with the formatting?
 3. How should you fix it?
 
-Then output your tool call using the correct format:
-<tool_call name="tool_name">{"param": "value"}</tool_call}
+Then output your tool call using the correct format. The parameters must sit at the top level
+of the JSON object inside the tag, not nested under "param":
+<tool_call name="read_file" call_id="1">{"path": "src/main.rs"}</tool_call>
+<tool_call name="web_reader" call_id="2">{"url": "https://example.com"}</tool_call>
 
 Take a breath and be precise with brackets, quotes, and commas."#;
 
