@@ -15,6 +15,10 @@ pub struct ParseDiagnostics {
     pub hints_found: Vec<String>,
     /// Description of what was tried and why it failed.
     pub failure_reasons: Vec<String>,
+    /// Number of `<tool_call name="...">` openers with no matching `</tool_call>`
+    /// before the next opener or end of text. Non-zero means the response is
+    /// malformed in a way the parser silently dropped — callers should retry.
+    pub orphan_opens: usize,
 }
 
 impl ParseDiagnostics {
@@ -77,6 +81,14 @@ impl ParseResult {
     pub fn is_failed_attempt(&self) -> bool {
         self.calls.is_empty() && self.diagnostics.has_hints()
     }
+
+    /// True if the response contained `<tool_call>` openers with no matching
+    /// close before the next opener. Independent of `is_failed_attempt`: even
+    /// if some calls parsed, orphan openers signal the model's output was
+    /// malformed and the round should be retried.
+    pub fn has_orphan_opens(&self) -> bool {
+        self.diagnostics.orphan_opens > 0
+    }
 }
 
 /// Parse tool calls from LLM response text with diagnostic info.
@@ -96,14 +108,29 @@ pub fn parse_tool_calls_with_diagnostics(text: &str) -> ParseResult {
         }
     }
 
+    // Detect orphan openers before any other failure-path reason. We want this
+    // signal to reach callers even when some valid calls also parsed — without
+    // it, a single bad opener followed by a valid call would be silently
+    // dropped and the pipeline would never trigger a correction retry.
+    let orphan_ranges = find_orphan_ranges(text);
+    if !orphan_ranges.is_empty() {
+        reasons.push(format!(
+            "Found {} <tool_call> opening tag(s) without a matching </tool_call> close \
+             before the next opener or end of response. Every opener must be followed by \
+             its JSON params and a </tool_call> close before any prose or next opener.",
+            orphan_ranges.len()
+        ));
+    }
+
     // Try JSON-format tool calls first
     let json_calls = parse_json_calls_inner(text, &mut reasons);
 
     let calls = if !json_calls.is_empty() {
         json_calls
     } else {
-        // If JSON found tags but no valid calls, record why
-        if text.contains("<tool_call") {
+        // If JSON found tags but no valid calls, record why. Skip when orphan
+        // detection already explained the failure to avoid duplicate reasons.
+        if text.contains("<tool_call") && orphan_ranges.is_empty() {
             reasons.push(
                 "Found <tool_call tag but could not parse the full structure. Check: closing tag, name attribute, valid JSON params.".into()
             );
@@ -127,6 +154,7 @@ pub fn parse_tool_calls_with_diagnostics(text: &str) -> ParseResult {
         diagnostics: ParseDiagnostics {
             hints_found: hints,
             failure_reasons: reasons,
+            orphan_opens: orphan_ranges.len(),
         },
     }
 }
@@ -164,7 +192,7 @@ fn parse_json_calls_inner(text: &str, reasons: &mut Vec<String>) -> Vec<ToolCall
             Ok(v) if v.is_object() => v,
             Ok(_) => {
                 reasons.push(format!(
-                    "Parameters for '{}' are not a JSON object: {}",
+                    "Parameters for '{}' is not a JSON object: {}",
                     name, params_str
                 ));
                 serde_json::json!({})
@@ -262,24 +290,53 @@ fn unwrap_param_envelope(v: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Find every `<tool_call name="...">` opener that lacks a matching
+/// `</tool_call>` close before the next opener (or end of text). Returns the
+/// `(start, end)` byte ranges an orphan occupies: `start` is the opener's
+/// start, `end` is the next opener's start or `text.len()` for trailing
+/// orphans. Used both by the sanitizer (to redact) and the parser (to count).
+///
+/// Tool calls never nest, so this pairs each opener with the next available
+/// close that sits before the following opener. An opener with no close in
+/// that window is malformed — the previous implementation only checked for
+/// any `</tool_call>` later in the text, which fooled it when a *different*
+/// call's close tag existed downstream (e.g. an unclosed `web_reader`
+/// immediately followed by a valid `write_file`).
+fn find_orphan_ranges(text: &str) -> Vec<(usize, usize)> {
+    let opening_re = regex::Regex::new(
+        r#"<tool_call\s+name="[^"]*"(?:\s+call_id="[^"]*")?\s*>"#,
+    )
+    .unwrap();
+    let close_re = regex::Regex::new(r#"</tool_call"#).unwrap();
+
+    let openings: Vec<_> = opening_re.find_iter(text).collect();
+    let closes: Vec<_> = close_re.find_iter(text).collect();
+
+    let mut ranges = Vec::new();
+    for (i, open) in openings.iter().enumerate() {
+        let open_end = open.end();
+        let next_open_start = openings.get(i + 1).map(|o| o.start());
+        let has_matching_close = closes.iter().any(|c| {
+            c.start() >= open_end && next_open_start.map_or(true, |nop| c.start() < nop)
+        });
+        if !has_matching_close {
+            let redact_end = next_open_start.unwrap_or(text.len());
+            ranges.push((open.start(), redact_end));
+        }
+    }
+    ranges
+}
+
 /// Sanitize LLM text output by redacting incomplete or invalid tool call markers.
 /// Valid, complete tool calls are preserved. Only applies to text shown to the user
 /// — the parser still sees the raw input for tool dispatch.
 pub fn sanitize_output(text: &str) -> String {
-    // Redact incomplete <tool_call ...> tags (no closing </tool_call).
-    // We can't use lookahead in Rust's regex crate, so instead match the opening
-    // tag and then verify the absence of a closing tag manually.
+    // Redact orphan openers (no matching close before next opener / end).
+    // Each orphan's range runs from its own start to the next opener's start
+    // (or end of text), so subsequent valid tool calls are preserved.
     let mut result = text.to_string();
-    let opening_re = regex::Regex::new(
-        r#"<tool_call\s+name="[^"]*"(?:\s+call_id="[^"]*")?\s*>"#
-    ).unwrap();
-    for mat in opening_re.find_iter(text).collect::<Vec<_>>().into_iter().rev() {
-        let after = &text[mat.end()..];
-        // If there's no closing tag after this opening tag, it's incomplete
-        if !after.contains("</tool_call") {
-            result.replace_range(mat.start()..text.len(), "[invalid tool call]");
-            break; // only need to handle the last (trailing) incomplete one
-        }
+    for (start, end) in find_orphan_ranges(text).into_iter().rev() {
+        result.replace_range(start..end, "[invalid tool call]");
     }
 
     // Redact lone opening <tool_call tags without any attributes
@@ -445,5 +502,100 @@ Call: write_file(path="b.rs")"#;
         let calls = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].parameters["param"], "url=https://x.com");
+    }
+
+    // --- Orphan opener detection (parser-side) ---
+
+    #[test]
+    fn trailing_orphan_opener_is_flagged() {
+        // Opener with no close at all — orphan.
+        let text = r#"<tool_call name="web_reader" call_id="4">{"url": "https://example.com"}"#;
+        let result = parse_tool_calls_with_diagnostics(text);
+        assert_eq!(result.diagnostics.orphan_opens, 1);
+        assert!(result.has_orphan_opens());
+        assert!(result.calls.is_empty());
+    }
+
+    #[test]
+    fn orphan_opener_followed_by_valid_call_still_flagged() {
+        // The exact shape from the bug report: unclosed web_reader opener
+        // followed by prose, then a properly-closed write_file. Previously the
+        // parser silently dropped the orphan and only saw write_file.
+        let text = r#"<tool_call name="web_reader" call_id="4">{"url": "https://example.com"}I'll guess.
+<tool_call name="write_file" call_id="5">{"path": "out.md"}</tool_call>"#;
+        let result = parse_tool_calls_with_diagnostics(text);
+        assert_eq!(result.diagnostics.orphan_opens, 1);
+        // write_file still parses — orphan detection is additive, not a replacement.
+        assert_eq!(result.calls.len(), 1);
+        assert_eq!(result.calls[0].name, "write_file");
+    }
+
+    #[test]
+    fn no_orphans_when_all_calls_close() {
+        let text = r#"<tool_call name="read_file" call_id="a">{"path": "x"}</tool_call>
+<tool_call name="list_dir" call_id="b">{"path": "y"}</tool_call>"#;
+        let result = parse_tool_calls_with_diagnostics(text);
+        assert_eq!(result.diagnostics.orphan_opens, 0);
+        assert!(!result.has_orphan_opens());
+        assert_eq!(result.calls.len(), 2);
+    }
+
+    #[test]
+    fn trailing_orphan_after_valid_call() {
+        // Valid call followed by an opener that never closes — orphan.
+        let text = r#"<tool_call name="read_file" call_id="a">{"path": "x"}</tool_call>
+<tool_call name="web_reader" call_id="b">{"url": "https://x.com"}"#;
+        let result = parse_tool_calls_with_diagnostics(text);
+        assert_eq!(result.diagnostics.orphan_opens, 1);
+        assert_eq!(result.calls.len(), 1);
+    }
+
+    #[test]
+    fn multiple_orphans_all_counted() {
+        // Two orphans, one valid in between.
+        let text = r#"<tool_call name="a">{"x": 1}
+<tool_call name="b">{"y": 2}</tool_call>
+<tool_call name="c">{"z": 3}"#;
+        let result = parse_tool_calls_with_diagnostics(text);
+        assert_eq!(result.diagnostics.orphan_opens, 2);
+    }
+
+    // --- Sanitizer (display-side) ---
+
+    #[test]
+    fn sanitize_trailing_orphan_redacted() {
+        let text = r#"<tool_call name="web_reader" call_id="4">{"url": "https://example.com"}prose"#;
+        let sanitized = sanitize_output(text);
+        assert!(sanitized.contains("[invalid tool call]"));
+        assert!(!sanitized.contains("<tool_call name=\"web_reader\""));
+    }
+
+    #[test]
+    fn sanitize_orphan_then_valid_preserves_valid() {
+        // The bug case: unclosed web_reader followed by a valid write_file.
+        // The orphan's prose should be redacted but write_file must survive.
+        let text = r#"<tool_call name="web_reader" call_id="4">{"url": "https://example.com"}I'll guess.
+<tool_call name="write_file" call_id="5">{"path": "out.md"}</tool_call>"#;
+        let sanitized = sanitize_output(text);
+        assert!(sanitized.contains("[invalid tool call]"));
+        assert!(sanitized.contains("<tool_call name=\"write_file\""));
+        assert!(sanitized.contains("</tool_call"));
+        // The orphan's opening tag must not appear in the display.
+        assert!(!sanitized.contains("<tool_call name=\"web_reader\""));
+    }
+
+    #[test]
+    fn sanitize_no_orphans_preserves_all() {
+        let text = r#"<tool_call name="read_file" call_id="a">{"path": "x"}</tool_call>"#;
+        let sanitized = sanitize_output(text);
+        assert_eq!(sanitized, text);
+    }
+
+    #[test]
+    fn sanitize_lone_tag_still_redacted() {
+        // Opener without name attribute — pre-existing behavior.
+        let text = r#"Some text <tool_call> oops"#;
+        let sanitized = sanitize_output(text);
+        assert!(sanitized.contains("[invalid tool call]"));
     }
 }

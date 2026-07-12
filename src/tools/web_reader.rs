@@ -44,7 +44,7 @@ impl Tool for WebReader {
             Err(e) => Ok(ToolResult::err(
                 "web_reader",
                 call_id,
-                format!("Failed to fetch {}: {}", url, e),
+                format!("Failed to fetch {}: {}", url, format_error_chain(&e)),
             )),
         }
     }
@@ -63,6 +63,23 @@ impl Tool for WebReader {
             }),
         }
     }
+}
+
+/// Format an anyhow error with its full causal chain, joined by ` → ` and
+/// with exact duplicates removed. reqwest's top-level error message ("error
+/// sending request for url") is unhelpful on its own — the actionable cause
+/// (DNS lookup failure, TCP connect refused, TLS handshake error, HTTP/2
+/// protocol error) is buried one or two levels down. Surfacing the chain lets
+/// the model pick a sensible fallback (retry vs switch host vs switch tool).
+fn format_error_chain(e: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in e.chain() {
+        let s = cause.to_string();
+        if !parts.contains(&s) {
+            parts.push(s);
+        }
+    }
+    parts.join(" → ")
 }
 
 async fn fetch_page(url: &str, max_length: usize) -> Result<String> {
@@ -162,6 +179,53 @@ mod tests {
         let def = tool.definition();
         assert_eq!(def.name, "web_reader");
         assert!(!def.description.is_empty());
+    }
+
+    #[test]
+    fn format_error_chain_walks_sources() {
+        // Simulate reqwest's chain shape: top-level wraps a middle layer wraps
+        // the root cause. Without chain-walking, only the top message would be
+        // surfaced, hiding the actionable detail.
+        let root = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Connection refused (os error 61)");
+        let mid = anyhow::Error::new(root).context("tcp connect error");
+        let top = mid.context("error sending request for url (https://example.com)");
+        let formatted = format_error_chain(&top);
+        assert!(
+            formatted.contains("error sending request"),
+            "expected top-level message in chain, got: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains("Connection refused"),
+            "expected root cause in chain, got: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains("tcp connect"),
+            "expected intermediate cause in chain, got: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains(" → "),
+            "expected arrow separator in chain, got: {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_error_chain_dedupes_repeats() {
+        // When two layers produce identical messages, only show one — keeps
+        // the tool_result compact for the model.
+        let root = std::io::Error::new(std::io::ErrorKind::Other, "dns error");
+        let mid = anyhow::Error::new(root).context("dns error");
+        let top = mid.context("error sending request");
+        let formatted = format_error_chain(&top);
+        assert_eq!(
+            formatted.matches("dns error").count(),
+            1,
+            "expected dedup of repeated cause, got: {}",
+            formatted
+        );
     }
 
     #[test]

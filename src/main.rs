@@ -2391,6 +2391,33 @@ fn stream_step_with_tools(
         let parse_result =
             crate::agent::tools_parser::parse_tool_calls_with_diagnostics(&content);
 
+        // Orphan `<tool_call>` openers (no matching close before the next
+        // opener) signal the model's output is malformed — and unlike a plain
+        // failed attempt, this can happen even when some valid calls parsed.
+        // Retry the whole round so the model re-emits cleanly, dropping any
+        // partially-parsed calls from this round. The cached prefix still
+        // matches; only the appended correction text is new.
+        if parse_result.has_orphan_opens() && correction_retries < MAX_TOOL_CORRECTION_RETRIES {
+            correction_retries += 1;
+            tracing::warn!(
+                "stream_step_with_tools round {}: response had {} orphan <tool_call> opener(s), retrying ({}/{}) — diagnostics: {}",
+                round,
+                parse_result.diagnostics.orphan_opens,
+                correction_retries,
+                MAX_TOOL_CORRECTION_RETRIES,
+                parse_result.diagnostics.format_for_correction()
+            );
+            current_prompt = format!(
+                "{}\n\nuser: Your previous response contained an unclosed <tool_call> block \
+                 (opening tag without a matching </tool_call> close before the next opener). \
+                 {}. Re-emit any tools you intended to call with proper closing tags, or \
+                 finish the step without a tool call.",
+                content,
+                parse_result.diagnostics.format_for_correction()
+            );
+            continue;
+        }
+
         // No parseable tool calls — decide whether to retry or finalize.
         if parse_result.calls.is_empty() {
             if parse_result.is_failed_attempt() && correction_retries < MAX_TOOL_CORRECTION_RETRIES
