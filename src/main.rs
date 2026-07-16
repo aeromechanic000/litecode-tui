@@ -1662,6 +1662,7 @@ fn spawn_llm_request(
     let endpoint = app_state.config.ollama_endpoint.clone();
     let connect_timeout = app_state.config.connect_timeout;
     let context_window_limit = app_state.config.context_window_limit;
+    let enable_thinking = app_state.config.enable_thinking;
     let input = input.to_string();
     let web_search_enabled = app_state.web_search_enabled;
     let max_search_tokens = app_state.config.max_search_context_tokens;
@@ -1749,6 +1750,7 @@ fn spawn_llm_request(
             final_prompt,
             context_handle,
             context_window_limit,
+            enable_thinking,
             &tx,
         );
 
@@ -1924,6 +1926,7 @@ fn spawn_execution_with_plan(
     let history = app_state.conversation_history.clone();
     let workspace = app_state.workspace.clone();
     let context_window_limit = app_state.config.context_window_limit;
+    let enable_thinking = app_state.config.enable_thinking;
     let now = current_datetime();
     let context_handle = app_state.context_manager.context_handle_for_model(&model).cloned();
 
@@ -2031,6 +2034,7 @@ fn spawn_execution_with_plan(
                 prompt,
                 context_handle,
                 context_window_limit,
+                enable_thinking,
                 &tool_registry,
                 &tx,
             );
@@ -2134,6 +2138,7 @@ fn spawn_execution_with_plan(
                 prompt,
                 current_context.clone(),
                 context_window_limit,
+                enable_thinking,
                 &tool_registry,
                 &tx,
             );
@@ -2206,6 +2211,10 @@ struct StepResult {
     context_handle: Option<Vec<i64>>,
     prompt_eval_count: Option<usize>,
     eval_count: Option<usize>,
+    /// Ollama `done_reason` from the terminating chunk (e.g. "stop", "length",
+    /// "stream_end"). "stream_end" means the remote closed the connection without
+    /// a `done:true` chunk — used to detect dropped/empty responses.
+    done_reason: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2218,6 +2227,7 @@ fn stream_single_step_generate(
     prompt: String,
     context_handle: Option<Vec<i64>>,
     num_ctx: u64,
+    think: bool,
     tx: &mpsc::Sender<agent::retry::PipelineResult>,
 ) -> StepResult {
     let tx = tx.clone();
@@ -2227,6 +2237,12 @@ fn stream_single_step_generate(
     let mut final_context_handle: Option<Vec<i64>> = None;
     let mut final_prompt_eval_count: Option<usize> = None;
     let mut final_eval_count: Option<usize> = None;
+    let mut final_done_reason: Option<String> = None;
+    // Statefully strips inline `<think>…</think>` reasoning blocks from the
+    // streamed response. No-op when thinking is off (no tags present). When on,
+    // it hides complete reasoning blocks and — per the robustness rule — keeps
+    // the content of any block left unclosed at stream end.
+    let mut think_stripper = agent::tools_parser::ThinkStripper::new();
 
     for attempt in 0..=MAX_TRUNCATION_CONTINUATIONS {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -2238,6 +2254,7 @@ fn stream_single_step_generate(
             current_prompt.clone(),
             current_context.clone(),
             num_ctx,
+            think,
             cancel_rx,
         );
         let mut pin = std::pin::pin!(stream);
@@ -2248,10 +2265,17 @@ fn stream_single_step_generate(
                 match chunk_result {
                     Ok(chunk) => {
                         if !chunk.response.is_empty() {
-                            let _ = tx.send(agent::retry::PipelineResult::StreamChunk {
-                                content: chunk.response.clone(),
-                            });
-                            full_content.push_str(&chunk.response);
+                            // Strip inline `<think>` reasoning before display,
+                            // parsing, or accumulation. `chunk.thinking` (Ollama's
+                            // separate field) is intentionally ignored here — it
+                            // never enters the response.
+                            let clean = think_stripper.feed(&chunk.response);
+                            if !clean.is_empty() {
+                                let _ = tx.send(agent::retry::PipelineResult::StreamChunk {
+                                    content: clean.clone(),
+                                });
+                                full_content.push_str(&clean);
+                            }
                         }
                         if chunk.done {
                             // Capture metadata from final chunk
@@ -2264,6 +2288,7 @@ fn stream_single_step_generate(
                             if chunk.eval_count.is_some() {
                                 final_eval_count = chunk.eval_count;
                             }
+                            final_done_reason = chunk.done_reason.clone();
                             return Ok(chunk.done_reason);
                         }
                     }
@@ -2294,6 +2319,14 @@ fn stream_single_step_generate(
                     current_context = final_context_handle.clone();
                     continue;
                 }
+                // Flush any buffered (unclosed-think) content as response.
+                let tail = think_stripper.finish();
+                if !tail.is_empty() {
+                    let _ = tx.send(agent::retry::PipelineResult::StreamChunk {
+                        content: tail.clone(),
+                    });
+                    full_content.push_str(&tail);
+                }
                 tracing::info!(
                     "stream done: reason={}, {} bytes",
                     reason,
@@ -2304,6 +2337,7 @@ fn stream_single_step_generate(
                     context_handle: final_context_handle,
                     prompt_eval_count: final_prompt_eval_count,
                     eval_count: final_eval_count,
+                    done_reason: final_done_reason.clone(),
                 };
             }
             Err(e) => {
@@ -2312,11 +2346,19 @@ fn stream_single_step_generate(
                     context_handle: None,
                     prompt_eval_count: None,
                     eval_count: None,
+                    done_reason: None,
                 };
             }
         }
     }
 
+    let tail = think_stripper.finish();
+    if !tail.is_empty() {
+        let _ = tx.send(agent::retry::PipelineResult::StreamChunk {
+            content: tail.clone(),
+        });
+        full_content.push_str(&tail);
+    }
     tracing::warn!(
         "max continuations reached, returning {} bytes",
         full_content.len()
@@ -2326,6 +2368,7 @@ fn stream_single_step_generate(
         context_handle: final_context_handle,
         prompt_eval_count: final_prompt_eval_count,
         eval_count: final_eval_count,
+        done_reason: final_done_reason.clone(),
     }
 }
 
@@ -2360,6 +2403,7 @@ fn stream_step_with_tools(
     initial_prompt: String,
     context_handle: Option<Vec<i64>>,
     num_ctx: u64,
+    think: bool,
     tools: &tools::ToolRegistry,
     tx: &mpsc::Sender<agent::retry::PipelineResult>,
 ) -> StepResult {
@@ -2379,6 +2423,7 @@ fn stream_step_with_tools(
             current_prompt.clone(),
             current_context.clone(),
             num_ctx,
+            think,
             tx,
         );
 
@@ -2420,6 +2465,14 @@ fn stream_step_with_tools(
 
         // No parseable tool calls — decide whether to retry or finalize.
         if parse_result.calls.is_empty() {
+            let reason = step_result.done_reason.as_deref().unwrap_or("");
+            // An empty response (no content at all) usually means the model emitted
+            // only thinking tokens or the stream was dropped mid-generation
+            // (done_reason="stream_end"). Unlike a malformed-tool attempt, this
+            // produces zero parseable signal, so without a retry the step would
+            // silently "complete" with nothing and collapse to an empty answer.
+            // Re-prompt up to MAX_TOOL_CORRECTION_RETRIES before giving up.
+            let is_empty_response = content.trim().is_empty();
             if parse_result.is_failed_attempt() && correction_retries < MAX_TOOL_CORRECTION_RETRIES
             {
                 correction_retries += 1;
@@ -2438,6 +2491,25 @@ fn stream_step_with_tools(
                      or finish the step without a tool call.",
                     content,
                     parse_result.diagnostics.format_for_correction()
+                );
+                continue;
+            } else if is_empty_response && correction_retries < MAX_TOOL_CORRECTION_RETRIES {
+                correction_retries += 1;
+                tracing::warn!(
+                    "stream_step_with_tools round {}: empty response (done_reason={}, likely \
+                     thinking-only output or dropped stream), retrying ({}/{})",
+                    round,
+                    if reason.is_empty() { "(none)" } else { reason },
+                    correction_retries,
+                    MAX_TOOL_CORRECTION_RETRIES
+                );
+                current_prompt = format!(
+                    "{}\n\nuser: Your previous response contained no content (done_reason={}). \
+                     If you intended to call a tool, emit a valid \
+                     <tool_call name=\"...\" call_id=\"...\">{{...}}</tool_call> block. Otherwise, \
+                     produce the actual response text for this step. Do not emit an empty reply.",
+                    content,
+                    if reason.is_empty() { "(none)" } else { reason }
                 );
                 continue;
             }
@@ -2471,26 +2543,95 @@ fn stream_step_with_tools(
         last_step_result = Some(step_result.clone());
         current_context = step_result.context_handle.clone();
 
-        // Dispatch each tool call.
-        let mut tool_result_blocks: Vec<String> = Vec::new();
-        for call in &tool_calls {
-            tracing::info!(
-                "stream_step_with_tools round {}: dispatching tool={} params={:?}",
+        // If the first call's JSON params failed to parse, retry the round for
+        // correction rather than dispatching empty params. Local models often
+        // corrupt large JSON content blobs (unquoted values, stray trailing
+        // commas); a generic "missing params" validation error gives the model
+        // no signal about the actual syntax problem, so it re-emits the same
+        // broken payload and the step dead-ends. The targeted parse error lets
+        // it self-correct. Only retries over the first call, since later calls
+        // are dropped this round anyway (see "one call per round" below).
+        if let Some(err) = tool_calls
+            .first()
+            .and_then(|c| c.parse_error.clone())
+            .filter(|_| correction_retries < MAX_TOOL_CORRECTION_RETRIES)
+        {
+            correction_retries += 1;
+            let first_name = tool_calls[0].name.clone();
+            tracing::warn!(
+                "stream_step_with_tools round {}: malformed JSON params for '{}', retrying ({}/{}) — {}",
                 round,
-                call.name,
-                call.parameters
+                first_name,
+                correction_retries,
+                MAX_TOOL_CORRECTION_RETRIES,
+                err
             );
-            // Validate name.
-            if !tools.has_tool(&call.name) {
-                let err = tools::ToolResult::err(
-                    &call.name,
-                    &call.call_id,
-                    format!(
-                        "Unknown tool '{}'. Available tools: {}",
-                        call.name,
-                        tools.list_names().join(", ")
-                    ),
-                );
+            current_prompt = format!(
+                "{}\n\nuser: Your last <tool_call name=\"{}\"> had malformed JSON parameters \
+                 and was NOT executed. {}. Re-emit the call with valid JSON — keys at the top \
+                 level (not nested under \"param\"/\"parameters\"), every string value properly \
+                 quoted, no trailing commas, no extra fields. Alternatively, finish the step \
+                 without a tool call.",
+                content, first_name, err
+            );
+            continue;
+        }
+
+        // Dispatch only the FIRST tool call this round. The agent loop is
+        // sequential: the model must see a tool's result before emitting a call
+        // that depends on it (e.g. write_file after web_reader). When the model
+        // batches dependent calls in one message, it hallucinates the dependent
+        // call's content before the prerequisite returns — and a giant inline
+        // content blob next to another call is far more likely to corrupt the
+        // JSON. Dropping the extra calls here and re-soliciting them next round
+        // (after the first result is visible) forces genuine sequencing. The
+        // signature check above is computed over ALL emitted calls, so a model
+        // that keeps re-emitting the same batch still terminates.
+        let dropped_count = tool_calls.len().saturating_sub(1);
+        let call = tool_calls
+            .into_iter()
+            .next()
+            .expect("non-empty calls verified above");
+        if dropped_count > 0 {
+            tracing::info!(
+                "stream_step_with_tools round {}: model emitted {} tool calls; dispatching only \
+                 the first ('{}'), {} deferred to later rounds",
+                round,
+                dropped_count + 1,
+                call.name,
+                dropped_count
+            );
+        }
+        let mut tool_result_blocks: Vec<String> = Vec::new();
+
+        tracing::info!(
+            "stream_step_with_tools round {}: dispatching tool={} params={:?}",
+            round,
+            call.name,
+            call.parameters
+        );
+        // Validate name.
+        if !tools.has_tool(&call.name) {
+            let err = tools::ToolResult::err(
+                &call.name,
+                &call.call_id,
+                format!(
+                    "Unknown tool '{}'. Available tools: {}",
+                    call.name,
+                    tools.list_names().join(", ")
+                ),
+            );
+            let _ = tx.send(agent::retry::PipelineResult::ToolStart {
+                tool_name: call.name.clone(),
+                call_id: call.call_id.clone(),
+            });
+            let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
+                result: err.clone(),
+            });
+            tool_result_blocks.push(format_tool_result_block(&err));
+        } else if let Ok(validation) = tools.validate_params(&call.name, &call.parameters) {
+            if !validation.is_empty() {
+                let err = tools::ToolResult::err(&call.name, &call.call_id, validation);
                 let _ = tx.send(agent::retry::PipelineResult::ToolStart {
                     tool_name: call.name.clone(),
                     call_id: call.call_id.clone(),
@@ -2499,46 +2640,47 @@ fn stream_step_with_tools(
                     result: err.clone(),
                 });
                 tool_result_blocks.push(format_tool_result_block(&err));
-                continue;
-            }
-            // Validate required params.
-            if let Ok(validation) = tools.validate_params(&call.name, &call.parameters) {
-                if !validation.is_empty() {
-                    let err = tools::ToolResult::err(&call.name, &call.call_id, validation);
-                    let _ = tx.send(agent::retry::PipelineResult::ToolStart {
-                        tool_name: call.name.clone(),
-                        call_id: call.call_id.clone(),
+            } else {
+                // Dispatch.
+                let _ = tx.send(agent::retry::PipelineResult::ToolStart {
+                    tool_name: call.name.clone(),
+                    call_id: call.call_id.clone(),
+                });
+                let result = tools
+                    .get(&call.name)
+                    .unwrap()
+                    .execute(call.parameters.clone(), call.call_id.clone())
+                    .unwrap_or_else(|e| {
+                        tools::ToolResult::err(&call.name, &call.call_id, format!("{}", e))
                     });
-                    let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
-                        result: err.clone(),
-                    });
-                    tool_result_blocks.push(format_tool_result_block(&err));
-                    continue;
-                }
+                tracing::info!(
+                    "stream_step_with_tools round {}: tool {} result success={} output_chars={}",
+                    round,
+                    call.name,
+                    result.success,
+                    result.output.chars().count()
+                );
+                let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
+                    result: result.clone(),
+                });
+                tool_result_blocks.push(format_tool_result_block(&result));
             }
-            // Dispatch.
+        } else {
+            // validate_params itself errored (shouldn't happen in practice) —
+            // surface as a failed tool result so the model can react.
+            let err = tools::ToolResult::err(
+                &call.name,
+                &call.call_id,
+                "Could not validate tool parameters.".to_string(),
+            );
             let _ = tx.send(agent::retry::PipelineResult::ToolStart {
                 tool_name: call.name.clone(),
                 call_id: call.call_id.clone(),
             });
-            let result = tools
-                .get(&call.name)
-                .unwrap()
-                .execute(call.parameters.clone(), call.call_id.clone())
-                .unwrap_or_else(|e| {
-                    tools::ToolResult::err(&call.name, &call.call_id, format!("{}", e))
-                });
-            tracing::info!(
-                "stream_step_with_tools round {}: tool {} result success={} output_chars={}",
-                round,
-                call.name,
-                result.success,
-                result.output.chars().count()
-            );
             let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
-                result: result.clone(),
+                result: err.clone(),
             });
-            tool_result_blocks.push(format_tool_result_block(&result));
+            tool_result_blocks.push(format_tool_result_block(&err));
         }
 
         // Build next-round prompt: append verbatim assistant output + tool_result blocks
@@ -2551,7 +2693,9 @@ fn stream_step_with_tools(
             appended.push_str(block);
         }
         appended.push_str(
-            "\nuser: Continue the step using the tool results above. Emit another <tool_call> block if more tools are needed, otherwise finish the step.\n",
+            "\nuser: Continue the step using the tool result above. Emit ONE <tool_call> block \
+             for the next tool you need (wait for its result before calling the next one), or \
+             finish the step.\n",
         );
         current_prompt = format!("{}{}", current_prompt, appended);
     }
@@ -2565,6 +2709,7 @@ fn stream_step_with_tools(
         context_handle: current_context,
         prompt_eval_count: None,
         eval_count: None,
+        done_reason: None,
     })
 }
 

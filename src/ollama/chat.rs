@@ -16,7 +16,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// Serialized unconditionally — see `GenerateRequest.think` for why
+    /// `skip_serializing_if = Not::not` would drop the explicit `false`.
     think: bool,
     options: ChatOptions,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -563,6 +564,13 @@ struct GenerateRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
+    /// Disable thinking/reasoning output. Hybrid models (e.g. qwen3.5) default to
+    /// thinking mode; without this, the model emits reasoning into the `thinking`
+    /// field while `response` stays empty, yielding a content-less stream.
+    /// Serialized unconditionally: `skip_serializing_if = Not::not` would omit
+    /// `think:false` from the JSON, causing Ollama to fall back to the model's
+    /// default (thinking ON). We must send the explicit `false`.
+    think: bool,
     options: ChatOptions,
 }
 
@@ -570,6 +578,11 @@ struct GenerateRequest {
 #[derive(Debug, Clone)]
 pub struct GenerateChunk {
     pub response: String,
+    /// Reasoning/thinking content from hybrid models. Emitted in the `thinking`
+    /// JSON field (separate from `response`) when thinking is enabled. Captured so
+    /// a thinking-only response is diagnosable rather than silently lost.
+    #[allow(dead_code)]
+    pub thinking: String,
     pub done: bool,
     pub done_reason: Option<String>,
     #[allow(dead_code)]
@@ -608,17 +621,19 @@ impl OllamaClient {
         prompt: String,
         context_handle: Option<Vec<i64>>,
         num_ctx: u64,
+        think: bool,
         cancel: watch::Receiver<bool>,
     ) -> impl futures::Stream<Item = Result<GenerateChunk>> {
         let url = format!("{}/api/generate", endpoint);
 
         tracing::info!(
-            "generate request: model={}, num_ctx={}, prompt_chars={}, system_chars={}, context_handle={}",
+            "generate request: model={}, num_ctx={}, prompt_chars={}, system_chars={}, context_handle={}, think={}",
             model,
             num_ctx,
             prompt.chars().count(),
             system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0),
-            if context_handle.is_some() { format!("Some({} tokens)", context_handle.as_ref().unwrap().len()) } else { "None".into() }
+            if context_handle.is_some() { format!("Some({} tokens)", context_handle.as_ref().unwrap().len()) } else { "None".into() },
+            think
         );
 
         let body = GenerateRequest {
@@ -627,6 +642,7 @@ impl OllamaClient {
             context: context_handle,
             stream: true,
             system: system_prompt,
+            think,
             options: ChatOptions {
                 num_ctx,
                 num_predict: -1,
@@ -671,6 +687,7 @@ impl OllamaClient {
             const MAX_ERRORS: usize = 5;
             let mut chunk_count: usize = 0;
             let mut content_chars: usize = 0;
+            let mut thinking_chars: usize = 0;
             let mut first_content_logged = false;
 
             loop {
@@ -679,6 +696,7 @@ impl OllamaClient {
                     tracing::info!("generate cancelled by user (chunks={}, content_chars={})", chunk_count, content_chars);
                     yield Ok(GenerateChunk {
                         response: String::new(),
+                        thinking: String::new(),
                         done: true,
                         done_reason: Some("cancel".into()),
                         model: model.clone(),
@@ -706,6 +724,7 @@ impl OllamaClient {
                         );
                         yield Ok(GenerateChunk {
                             response: String::new(),
+                            thinking: String::new(),
                             done: true,
                             done_reason: Some("stream_end".into()),
                             model: model.clone(),
@@ -766,6 +785,13 @@ impl OllamaClient {
                                 .and_then(|r| r.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            let thinking = val.get("thinking")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !thinking.is_empty() {
+                                thinking_chars += thinking.chars().count();
+                            }
                             let done = val.get("done")
                                 .and_then(|d| d.as_bool())
                                 .unwrap_or(false);
@@ -820,11 +846,18 @@ impl OllamaClient {
                             if done {
                                 if content_chars == 0 {
                                     tracing::warn!(
-                                        "generate done with EMPTY response: reason={} chunks={} total_bytes={} total_ms={}",
+                                        "generate done with EMPTY response: reason={} chunks={} total_bytes={} thinking_chars={} total_ms={}",
                                         done_reason.as_deref().unwrap_or("(none)"),
-                                        chunk_count, total_bytes,
+                                        chunk_count, total_bytes, thinking_chars,
                                         request_start.elapsed().as_millis()
                                     );
+                                    if thinking_chars > 0 {
+                                        tracing::warn!(
+                                            "generate EMPTY response had {} thinking chars — model produced only \
+                                             reasoning (thinking enabled?). Set think:false or check model config.",
+                                            thinking_chars
+                                        );
+                                    }
                                 } else {
                                     tracing::info!(
                                         "generate done: chars={} prompt_eval={:?} eval={:?} reason={} chunks={} total_ms={}",
@@ -840,6 +873,7 @@ impl OllamaClient {
 
                             yield Ok(GenerateChunk {
                                 response,
+                                thinking,
                                 done,
                                 done_reason,
                                 model: resp_model,
@@ -997,6 +1031,7 @@ mod tests {
             name: tc.name.clone(),
             call_id: "native-0".into(),
             parameters: tc.arguments.clone(),
+            parse_error: None,
         };
         assert_eq!(tool_call.name, "exec_shell");
         assert_eq!(tool_call.call_id, "native-0");

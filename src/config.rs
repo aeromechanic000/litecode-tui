@@ -55,6 +55,13 @@ pub struct Config {
     pub max_template_context_tokens: usize,
     pub template_max_select: usize,
     pub max_retries: usize,
+    /// Enable model thinking/reasoning. When true, requests are sent with
+    /// `think: true` and inline `<think>…</think>` blocks are stripped from the
+    /// streamed response (their content kept as response if a block is left
+    /// unclosed). Default off — thinking is unreliable on the `/api/generate`
+    /// path without a chat template.
+    #[serde(default)]
+    pub enable_thinking: bool,
     #[serde(default = "default_context_window")]
     pub context_window_limit: u64,
     #[serde(default = "default_max_file_lines")]
@@ -86,6 +93,7 @@ impl Default for Config {
             max_template_context_tokens: 2048,
             template_max_select: 5,
             max_retries: 3,
+            enable_thinking: false,
             context_window_limit: 262144,
             max_file_lines: 60,
             model_residency: "none".to_string(),

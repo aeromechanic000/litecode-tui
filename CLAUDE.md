@@ -50,7 +50,8 @@ src/
 │   ├── mod.rs           Agent module root: submodules (auto_run, diagnostics, editor,
 │   │                    planner, prompts, retry, summarizer, syntax, tools_parser)
 │   ├── tools_parser.rs  Parse text/JSON tool calls from LLM output + sanitize_output()
-│   │                    scrubs forged tool call markers from display
+│   │                    scrubs forged tool call markers from display; ThinkStripper
+│   │                    removes inline <think> reasoning blocks from streamed responses
 │   ├── planner.rs       Plan mode: builds prompt context for read-only analysis
 │   ├── editor.rs        Edit mode: generates file changes, presents diff for approval
 │   ├── auto_run.rs      Auto mode: full pipeline orchestration constants
@@ -221,6 +222,37 @@ forged markers.
 
 ---
 
+## Thinking Block Stripping (`enable_thinking`)
+
+Hybrid models (e.g. qwen3.5) can emit reasoning. Two channels are handled separately:
+
+- **Ollama's `thinking` field** (v0.9+): carried on `GenerateChunk.thinking` for
+  diagnostics/logging but never added to the response — so field-separated thinking
+  never reaches display or the tool parser.
+- **Inline `<think>…</think>` blocks** in the response text: stripped by
+  `tools_parser::ThinkStripper`, a stateful streaming parser used in
+  `stream_single_step_generate`. It handles tags split across chunks and, by design,
+  **keeps the content of any `<think>` left unclosed at stream end** as response
+  (dropping only the opener tag) so an incomplete thinking block never silently loses
+  data. Stray `</think>` closers are also removed. `<tool_call>` blocks are untouched.
+
+The request-level `think` flag is sent **explicitly** (`think: true`/`false`) on both
+`/api/generate` (`GenerateRequest`) and `/api/chat` (`ChatRequest`). It must not use
+`skip_serializing_if = Not::not` — that would omit `think:false` and let Ollama fall
+back to the model default (thinking ON).
+
+`enable_thinking` (default `false`) in config threads through `spawn_execution_with_plan`
+and `spawn_llm_request` → `stream_step_with_tools` → `stream_single_step_generate` →
+`generate_stream`. With it off, no `<think>` tags appear and the stripper is a no-op.
+
+> Caveat: on `/api/generate` the model's chat template is not applied, so thinking is
+> unreliable here (the model may think briefly then emit an empty `response`). If
+> `enable_thinking = true` still yields empty responses, that is the template issue —
+> the robust fix is to wrap the executor prompt in the qwen3 chat template (a future
+> "Approach C" change). The default `think:false` path is unaffected.
+
+---
+
 ## Layered System Prompt & KV Cache Stability
 
 `PromptBuilder` (`src/prompt.rs`) separates the system prompt into:
@@ -339,6 +371,7 @@ exec_model = "qwen3:8b"
 eval_model = "qwen3:14b"
 default_mode = "edit"
 max_retries = 3
+enable_thinking = false
 enable_free_web_search = true
 search_cache_valid_days = 30
 max_search_context_tokens = 2048

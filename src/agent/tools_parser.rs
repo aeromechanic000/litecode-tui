@@ -6,6 +6,13 @@ pub struct ToolCall {
     pub name: String,
     pub call_id: String,
     pub parameters: serde_json::Value,
+    /// Set when the JSON params failed to parse (parameters fell back to `{}`).
+    /// Dispatch should treat this as a malformed call and retry for correction
+    /// rather than executing with empty params — local models frequently corrupt
+    /// large JSON content blobs, and the generic "missing params" validation
+    /// error gives the model no actionable signal about the real syntax mistake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_error: Option<String>,
 }
 
 /// Diagnostic info about why tool call parsing failed.
@@ -188,21 +195,21 @@ fn parse_json_calls_inner(text: &str, reasons: &mut Vec<String>) -> Vec<ToolCall
             .map(|m| m.as_str().to_string())
             .unwrap_or_else(uuid_short);
         let params_str = cap.name("params").map(|m| m.as_str()).unwrap_or("{}");
-        let parameters = match serde_json::from_str::<serde_json::Value>(params_str) {
-            Ok(v) if v.is_object() => v,
+        let (parameters, parse_error) = match serde_json::from_str::<serde_json::Value>(params_str)
+        {
+            Ok(v) if v.is_object() => (v, None),
             Ok(_) => {
-                reasons.push(format!(
-                    "Parameters for '{}' is not a JSON object: {}",
-                    name, params_str
-                ));
-                serde_json::json!({})
+                let msg = format!("Parameters for '{}' is not a JSON object: {}", name, params_str);
+                reasons.push(msg.clone());
+                (serde_json::json!({}), Some(msg))
             }
             Err(e) => {
-                reasons.push(format!(
+                let msg = format!(
                     "Invalid JSON in parameters for '{}': {} — raw: {}",
                     name, e, params_str
-                ));
-                serde_json::json!({})
+                );
+                reasons.push(msg.clone());
+                (serde_json::json!({}), Some(msg))
             }
         };
 
@@ -217,6 +224,7 @@ fn parse_json_calls_inner(text: &str, reasons: &mut Vec<String>) -> Vec<ToolCall
                 name,
                 call_id,
                 parameters,
+                parse_error,
             });
         }
     }
@@ -262,6 +270,7 @@ fn parse_single_text_call(line: &str) -> Option<ToolCall> {
         name,
         call_id: uuid_short(),
         parameters: serde_json::Value::Object(params),
+        parse_error: None,
     })
 }
 
@@ -357,9 +366,257 @@ pub fn sanitize_output(text: &str) -> String {
     result
 }
 
+// ---------------------------------------------------------------------------
+// Inline `<think>…</think>` reasoning-block stripping
+// ---------------------------------------------------------------------------
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Length of the longest suffix of `s` that is also a (proper) prefix of `tag`.
+///
+/// Used to decide how much trailing text to hold back when a `<think>` or
+/// `</think>` tag might be split across two stream chunks. `tag` is ASCII, so
+/// byte-length slicing is char-boundary safe.
+fn trailing_tag_prefix_len(s: &str, tag: &str) -> usize {
+    if s.is_empty() || tag.len() <= 1 {
+        return 0;
+    }
+    let max = std::cmp::min(s.len(), tag.len() - 1);
+    let mut best = 0;
+    for len in 1..=max {
+        if let Some(suffix) = s.get(s.len() - len..) {
+            if tag.starts_with(suffix) {
+                best = len;
+            }
+        }
+    }
+    best
+}
+
+/// Stateful streaming stripper for inline `<think>…</think>` reasoning blocks.
+///
+/// Models that lack a proper chat template (notably on `/api/generate`) often
+/// emit reasoning inline as `<think>…</think>` *inside* the response text rather
+/// than via Ollama's separate `thinking` field. This removes those blocks from
+/// the streamed response so the tool parser and display never see raw reasoning.
+///
+/// Robustness rule (by design): if a `<think>` opener is never closed by the
+/// time the stream ends, the opener tag is dropped but its buffered content is
+/// *kept as response* (`finish()` flushes it) — silently discarding it would
+/// lose potentially-valid output. In that case the thinking text leaks into the
+/// response, which is the intended fallback.
+///
+/// Tag boundaries may fall between chunks; a possible partial-tag suffix is held
+/// back until the next chunk resolves it, so a `<think>` split as `<thi` + `nk>`
+/// is still recognized.
+pub struct ThinkStripper {
+    pending: String,
+    in_think: bool,
+}
+
+impl Default for ThinkStripper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ThinkStripper {
+    pub fn new() -> Self {
+        Self {
+            pending: String::new(),
+            in_think: false,
+        }
+    }
+
+    /// Feed one chunk of response text. Returns the portion that is safe to emit
+    /// as clean response right now. Text that might be part of a tag split across
+    /// the chunk boundary is held back until the next call.
+    pub fn feed(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        self.drain(false)
+    }
+
+    /// Call when the stream has ended. Returns any remaining clean text. Per the
+    /// unclosed-think rule, buffered thinking content is flushed as response.
+    pub fn finish(&mut self) -> String {
+        let mut out = self.drain(true);
+        if self.in_think {
+            // Unclosed `<think>`: keep buffered content as response.
+            out.push_str(&self.pending);
+        }
+        self.pending.clear();
+        self.in_think = false;
+        out
+    }
+
+    /// Process `pending` as far as can be decided. When `final_pass` is false,
+    /// a possible partial-tag suffix is held back for the next chunk.
+    fn drain(&mut self, final_pass: bool) -> String {
+        let mut out = String::new();
+        loop {
+            let open_idx = self.pending.find(THINK_OPEN);
+            let close_idx = self.pending.find(THINK_CLOSE);
+            if self.in_think {
+                // Inside a think block: only a closer ends it. Until one arrives,
+                // hold ALL buffered content — if the stream ends with no closer,
+                // finish() must still be able to flush it as response.
+                match close_idx {
+                    Some(c) => {
+                        self.pending.drain(..c + THINK_CLOSE.len());
+                        self.in_think = false;
+                        continue;
+                    }
+                    None => return out,
+                }
+            } else {
+                match (open_idx, close_idx) {
+                    // Stray closer with no preceding opener (or after an opener
+                    // we already closed): strip just the tag, keep surrounding text.
+                    (Some(o), Some(c)) if c < o => {
+                        out.push_str(&self.pending[..c]);
+                        self.pending.drain(..c + THINK_CLOSE.len());
+                        continue;
+                    }
+                    (None, Some(c)) => {
+                        out.push_str(&self.pending[..c]);
+                        self.pending.drain(..c + THINK_CLOSE.len());
+                        continue;
+                    }
+                    // Opener (first, or only): emit preceding text, enter think.
+                    (Some(o), _) => {
+                        out.push_str(&self.pending[..o]);
+                        self.pending.drain(..o + THINK_OPEN.len());
+                        self.in_think = true;
+                        continue;
+                    }
+                    // No tag at all: emit (or hold back a partial-tag suffix).
+                    (None, None) => {
+                        if final_pass {
+                            out.push_str(&self.pending);
+                            self.pending.clear();
+                        } else {
+                            let hold = trailing_tag_prefix_len(&self.pending, THINK_OPEN)
+                                .max(trailing_tag_prefix_len(&self.pending, THINK_CLOSE));
+                            let keep = self.pending.len() - hold;
+                            out.push_str(&self.pending[..keep]);
+                            self.pending.drain(..keep);
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One-shot convenience: strip complete `<think>…</think>` blocks from `text`,
+/// keeping content from any unclosed `<think>` as response. Useful for non-streamed
+/// responses (e.g. `/api/chat`); the streaming path uses `ThinkStripper` directly.
+#[allow(dead_code)]
+pub fn strip_think_blocks(text: &str) -> String {
+    let mut s = ThinkStripper::new();
+    let mut out = s.feed(text);
+    out.push_str(&s.finish());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn think_strip_complete_block() {
+        let text = "<think>let me reason</think>Here is the answer.";
+        assert_eq!(strip_think_blocks(text), "Here is the answer.");
+    }
+
+    #[test]
+    fn think_strip_multiple_blocks() {
+        let text = "<think>a</think>part1<think>b</think>part2";
+        assert_eq!(strip_think_blocks(text), "part1part2");
+    }
+
+    #[test]
+    fn think_strip_unclosed_keeps_content() {
+        // No </think>: opener removed, content kept as response (robustness rule).
+        let text = "<think>some reasoning that never closes\nactual-ish content";
+        assert_eq!(
+            strip_think_blocks(text),
+            "some reasoning that never closes\nactual-ish content"
+        );
+    }
+
+    #[test]
+    fn think_strip_no_tags_unchanged() {
+        let text = "just a normal response with <tool_call> adjacent";
+        assert_eq!(strip_think_blocks(text), text);
+    }
+
+    #[test]
+    fn think_strip_stray_close_removed() {
+        // </think> without an opener: tag removed, text kept.
+        let text = "response</think>tail";
+        assert_eq!(strip_think_blocks(text), "responsetail");
+    }
+
+    #[test]
+    fn think_strip_does_not_touch_tool_call() {
+        let text = "<think>plan</think><tool_call name=\"web_reader\" call_id=\"1\">{\"url\":\"x\"}</tool_call>";
+        let stripped = strip_think_blocks(text);
+        assert!(stripped.contains("<tool_call name=\"web_reader\""));
+        assert!(stripped.contains("</tool_call>"));
+        assert!(!stripped.contains("<think>"));
+    }
+
+    #[test]
+    fn think_strip_streaming_split_tag() {
+        // `<think>` split across chunks: `<thi` + `nk>`.
+        let mut s = ThinkStripper::new();
+        let a = s.feed("before<thi");
+        let b = s.feed("nk>reason");
+        let c = s.feed("</think>after");
+        let d = s.finish();
+        let combined = format!("{}{}{}{}", a, b, c, d);
+        assert_eq!(combined, "beforeafter");
+    }
+
+    #[test]
+    fn think_strip_streaming_split_close() {
+        // `</think>` split across chunks, with content after.
+        let mut s = ThinkStripper::new();
+        let a = s.feed("<think>reasoning</thin");
+        let b = s.feed("k>response");
+        let c = s.finish();
+        assert_eq!(format!("{}{}{}", a, b, c), "response");
+    }
+
+    #[test]
+    fn think_strip_streaming_unclosed_flushes_at_finish() {
+        let mut s = ThinkStripper::new();
+        let a = s.feed("hello <think>still thinking");
+        let b = s.finish();
+        // "hello " emitted normally; the unclosed thinking flushed as response.
+        assert_eq!(format!("{}{}", a, b), "hello still thinking");
+    }
+
+    #[test]
+    fn think_strip_streaming_partial_prefix_resolved() {
+        // Trailing "<t" is a potential tag prefix; held back then resolved as
+        // normal text when it doesn't continue into "<think>".
+        let mut s = ThinkStripper::new();
+        let a = s.feed("text <t");
+        let b = s.feed("able> not a think tag");
+        let c = s.finish();
+        assert_eq!(format!("{}{}{}", a, b, c), "text <table> not a think tag");
+    }
+
+    #[test]
+    fn trailing_prefix_basic() {
+        assert_eq!(trailing_tag_prefix_len("abc<thi", THINK_OPEN), 4); // "<thi"
+        assert_eq!(trailing_tag_prefix_len("xyz", THINK_OPEN), 0);
+        assert_eq!(trailing_tag_prefix_len("</thin", THINK_CLOSE), 6); // "</thin"
+    }
 
     #[test]
     fn parse_json_tool_call() {
@@ -502,6 +759,48 @@ Call: write_file(path="b.rs")"#;
         let calls = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].parameters["param"], "url=https://x.com");
+    }
+
+    // --- Malformed-JSON surface (parse_error) ---
+
+    #[test]
+    fn malformed_json_params_records_parse_error() {
+        // The bug report's shape: write_file with a huge inline content blob plus
+        // a bogus unquoted `"action": create"` field. serde rejects it; the parser
+        // must surface parse_error so dispatch retries for correction instead of
+        // executing with empty params.
+        let text = r##"<tool_call name="write_file" call_id="2">{"path": "out.md", "content": "# hi", "action": create"}</tool_call>"##;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert!(
+            calls[0].parameters.as_object().map_or(true, |o| o.is_empty()),
+            "malformed params should fall back to empty object"
+        );
+        let err = calls[0]
+            .parse_error
+            .as_ref()
+            .expect("parse_error should be set on malformed JSON");
+        assert!(err.contains("Invalid JSON"), "unexpected error text: {}", err);
+    }
+
+    #[test]
+    fn valid_json_params_have_no_parse_error() {
+        let text = r#"<tool_call name="write_file" call_id="2">{"path": "out.md", "content": "hi"}</tool_call>"#;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].parse_error.is_none());
+        assert_eq!(calls[0].parameters["path"], "out.md");
+    }
+
+    #[test]
+    fn mixed_valid_and_malformed_calls_flag_only_bad_one() {
+        // web_reader valid, write_file malformed in the same response.
+        let text = r##"<tool_call name="web_reader" call_id="1">{"url": "https://example.com"}</tool_call><tool_call name="write_file" call_id="2">{"path": "x", "action": create"}</tool_call>"##;
+        let calls = parse_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].parse_error.is_none());
+        assert!(calls[1].parse_error.is_some());
     }
 
     // --- Orphan opener detection (parser-side) ---
