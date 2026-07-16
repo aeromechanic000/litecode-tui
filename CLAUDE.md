@@ -41,8 +41,9 @@ src/
 │   │                    cache hit rate, context usage tracking, static prefix hash)
 │   │                    tokenize() for accurate token counting via /api/tokenize
 │   ├── chat.rs          /api/chat (blocking, for skills) + /api/generate (streaming,
-│   │                    with KV cache context handle reuse). GenerateChunk carries
-│   │                    prompt_eval_count, eval_count, context on final chunk.
+│   │                    with KV cache context handle reuse) + chat_native_streaming
+│   │                    (native tool-calling path for thinking models). GenerateChunk
+│   │                    carries prompt_eval_count, eval_count, context on final chunk.
 │   └── model.rs         ModelInfo, ModelSize classification (Small/Medium/Large),
 │                        context window estimation, parameter count heuristics
 │
@@ -163,21 +164,41 @@ There is **one** execution pipeline: plan-then-execute (`spawn_plan_then_execute
 `spawn_execution_with_plan`). Every free-text request flows through it, regardless of
 mode (Plan / Edit / Auto) or whether tools are needed.
 
-### Tool awareness via prompt engineering on `/api/generate`
+### Tool awareness via prompt engineering on `/api/generate` (default)
 
-Tool calls are enabled without native `/api/chat` tool-calling. Both phases are
-tool-aware through prompt text:
+By default, tool calls are enabled without native `/api/chat` tool-calling. Both phases
+are tool-aware through prompt text:
 
 - **Planner**: `QUICK_PLAN_SYSTEM` interpolates a `{TOOLS}` block — a prose listing of
   tool names + descriptions from `ToolRegistry::descriptions_text()`. The planner does
   not call tools; it emits text steps that reference them (e.g. "Use web_reader to
   fetch https://…"). See `apply_plan_prompt()` in `src/main.rs`.
 
-- **Executor**: `base_identity_prompt()` (`src/prompt.rs`) teaches the LLM to emit
-  text-format `<tool_call name="…" call_id="…">{…}</tool_call>` blocks. The wrapper
-  `stream_step_with_tools` (`src/main.rs`) wraps the unchanged `/api/generate`
-  primitive (`stream_single_step_generate`), parsing each step's output via
-  `parse_tool_calls_with_diagnostics` and dispatching through `ToolRegistry`.
+- **Executor** (text tool path, default): `base_identity_prompt()` (`src/prompt.rs`)
+  teaches the LLM to emit text-format `<tool_call name="…" call_id="…">{…}</tool_call>`
+  blocks. The wrapper `stream_step_with_tools` (`src/main.rs`) wraps the unchanged
+  `/api/generate` primitive (`stream_single_step_generate`), parsing each step's output
+  via `parse_tool_calls_with_diagnostics` and dispatching through `ToolRegistry`.
+
+### Native tool calling (opt-in, for thinking models)
+
+When `config.native_tool_calls = true`, the executor uses Ollama's **native**
+tool-calling (`tools=` field on `/api/chat`) instead of the text-format path:
+
+- `stream_step_native_tools` (`src/main.rs`) calls `OllamaClient::chat_native_streaming`
+  (`src/ollama/chat.rs`) with `ToolRegistry::ollama_tool_definitions()`. The model
+  returns structured `tool_calls` (parsed into `NativeToolCall`); the loop dispatches
+  the first, appends the assistant turn + `tool`-role result to the message history,
+  and re-calls until the model returns no tool calls.
+- **Why it exists:** thinking models (e.g. qwen3.5) will not emit text-format
+  `<tool_call>` blocks on `/api/generate` — they put tool intent in their reasoning and
+  stop with empty content, and on some Ollama builds sending the `think` field crashes
+  the runner (`500 {"error":"EOF"}`). They emit native tool calls reliably.
+- **Tradeoff:** this path uses `/api/chat`, which does NOT expose the KV-cache `context`
+  handle, so manual cache reuse is bypassed (the returned `StepResult.context_handle`
+  is always `None`). The default text path keeps the `/api/generate` KV-cache design.
+- The `think` field is **omitted** on both request types when `enable_thinking` is false
+  (sending it triggers the runner crash); `enable_thinking = true` sends `think: true`.
 
 ### Per-step tool loop
 
@@ -236,20 +257,23 @@ Hybrid models (e.g. qwen3.5) can emit reasoning. Two channels are handled separa
   (dropping only the opener tag) so an incomplete thinking block never silently loses
   data. Stray `</think>` closers are also removed. `<tool_call>` blocks are untouched.
 
-The request-level `think` flag is sent **explicitly** (`think: true`/`false`) on both
-`/api/generate` (`GenerateRequest`) and `/api/chat` (`ChatRequest`). It must not use
-`skip_serializing_if = Not::not` — that would omit `think:false` and let Ollama fall
-back to the model default (thinking ON).
+The request-level `think` flag is **omitted when false** (`#[serde(skip_serializing_if = "Not::not")]`
+on both `GenerateRequest` and `ChatRequest`). Sending an explicit `think:false`/`think:true`
+crashes some Ollama builds with thinking models (`500 {"error":"EOF"}`); omitting it lets
+Ollama use the model default and avoids the crash. `enable_thinking = true` is the only
+path that sends `think: true`. (The native tool path, `chat_native_streaming`, builds its
+body as raw JSON and also omits `think`.)
 
 `enable_thinking` (default `false`) in config threads through `spawn_execution_with_plan`
 and `spawn_llm_request` → `stream_step_with_tools` → `stream_single_step_generate` →
 `generate_stream`. With it off, no `<think>` tags appear and the stripper is a no-op.
 
 > Caveat: on `/api/generate` the model's chat template is not applied, so thinking is
-> unreliable here (the model may think briefly then emit an empty `response`). If
-> `enable_thinking = true` still yields empty responses, that is the template issue —
-> the robust fix is to wrap the executor prompt in the qwen3 chat template (a future
-> "Approach C" change). The default `think:false` path is unaffected.
+> unreliable here (the model may think briefly then emit an empty `response`), and thinking
+> models will not emit text-format tool calls on this path. For thinking models like
+> qwen3.5, set `native_tool_calls = true` to use the native tool-calling path (above),
+> which uses `/api/chat` with the chat template applied and works reliably. The default
+> `think:false` text path is unaffected and suits non-thinking models.
 
 ---
 
@@ -372,6 +396,7 @@ eval_model = "qwen3:14b"
 default_mode = "edit"
 max_retries = 3
 enable_thinking = false
+native_tool_calls = false
 enable_free_web_search = true
 search_cache_valid_days = 30
 max_search_context_tokens = 2048

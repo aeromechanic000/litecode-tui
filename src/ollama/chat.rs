@@ -16,8 +16,11 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
-    /// Serialized unconditionally — see `GenerateRequest.think` for why
-    /// `skip_serializing_if = Not::not` would drop the explicit `false`.
+    /// Omitted when false. Sending an explicit `think:false`/`think:true` crashes
+    /// some Ollama builds with thinking models (500 {"error":"EOF"}); omitting it
+    /// lets Ollama use the model default and avoids the crash. Set `enable_thinking`
+    // to send `think:true`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     think: bool,
     options: ChatOptions,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -41,6 +44,10 @@ struct ChatOptions {
 pub struct NativeToolCall {
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Ollama-assigned tool call id (e.g. "call_xbji0uev"). Captured so the
+    /// assistant turn can be echoed back verbatim in the tool loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,10 +89,15 @@ fn extract_tool_calls_from_message(msg: &serde_json::Value) -> Vec<NativeToolCal
             Some(other) => other.clone(),
             None => serde_json::Value::Object(serde_json::Map::new()),
         };
+        let id = tc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         while accum.len() <= idx {
             accum.push(NativeToolCall {
                 name: String::new(),
                 arguments: serde_json::Value::Object(serde_json::Map::new()),
+                id: None,
             });
         }
         if !name.is_empty() {
@@ -93,6 +105,9 @@ fn extract_tool_calls_from_message(msg: &serde_json::Value) -> Vec<NativeToolCal
         }
         if !arguments.is_null() {
             accum[idx].arguments = arguments;
+        }
+        if id.is_some() {
+            accum[idx].id = id;
         }
     }
     accum.into_iter().filter(|tc| !tc.name.is_empty()).collect()
@@ -474,6 +489,7 @@ impl OllamaClient {
                                         arguments: serde_json::Value::Object(
                                             serde_json::Map::new(),
                                         ),
+                                        id: None,
                                     });
                                 }
                                 tool_calls[idx] = tc;
@@ -549,6 +565,200 @@ impl OllamaClient {
             model: resp_model,
         })
     }
+
+    /// Streaming `/api/chat` with native Ollama tool definitions, for the opt-in
+    /// native-tool executor path (`config.native_tool_calls`).
+    ///
+    /// Accepts raw `serde_json::Value` messages so the full tool conversation can
+    /// be represented — including assistant turns carrying a `tool_calls` array and
+    /// `tool`-role result turns, which the `ChatMessage` struct cannot express.
+    ///
+    /// `think` is intentionally OMITTED: sending it (true or false) crashes some
+    /// Ollama builds with thinking models (500 {"error":"EOF"}), while native tool
+    /// calling works reliably with the field omitted.
+    pub async fn chat_native_streaming(
+        &self,
+        model: &str,
+        messages: Vec<serde_json::Value>,
+        tools: &[serde_json::Value],
+        mut on_chunk: impl FnMut(&str),
+    ) -> Result<ChatResponse> {
+        let url = format!("{}/api/chat", self.endpoint);
+        let msg_summary: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}:{}c",
+                    m.get("role").and_then(|r| r.as_str()).unwrap_or("?"),
+                    m.get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0)
+                )
+            })
+            .collect();
+        tracing::info!(
+            "native chat request: model={}, num_ctx={}, tools={}, messages=[{}]",
+            model,
+            self.num_ctx,
+            tools.len(),
+            msg_summary.join(",")
+        );
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "stream": true,
+            // No "think" field — see method doc.
+            "options": { "num_ctx": self.num_ctx, "num_predict": -1 }
+        });
+
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("Creating streaming HTTP client for native chat")?;
+
+        let request_start = std::time::Instant::now();
+        let resp = http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "Ollama at {} did not respond (is it running?) for model '{}'",
+                    url, model
+                )
+            })?;
+
+        let status = resp.status();
+        tracing::info!(
+            "native chat response: status={} connect_ms={}",
+            status,
+            request_start.elapsed().as_millis()
+        );
+        if resp.status() == StatusCode::NOT_FOUND {
+            anyhow::bail!(
+                "Ollama returned 404 for model '{}' — it may have been removed, try re-pulling",
+                model
+            );
+        }
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Ollama returned error {} for model '{}': {}",
+                status,
+                model,
+                text
+            );
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut full_content = String::new();
+        let mut tool_calls: Vec<NativeToolCall> = Vec::new();
+        let mut buffer = String::new();
+        let mut resp_model = model.to_string();
+        let read_timeout = std::time::Duration::from_secs(300);
+        let mut chunk_count: usize = 0;
+        let mut raw_bytes: usize = 0;
+
+        loop {
+            let chunk_opt = match tokio::time::timeout(read_timeout, stream.next()).await {
+                Ok(opt) => opt,
+                Err(_) => {
+                    tracing::warn!(
+                        "native chat timed out after 300s (chunks={}, bytes={})",
+                        chunk_count,
+                        raw_bytes
+                    );
+                    anyhow::bail!("Native chat stream timed out (no data for 300s)");
+                }
+            };
+            let bytes = match chunk_opt {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => {
+                    tracing::warn!("native chat read error: {}", e);
+                    break;
+                }
+                None => break,
+            };
+            raw_bytes += bytes.len();
+            chunk_count += 1;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer = buffer[pos + 1..].to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(m) = val.get("model").and_then(|m| m.as_str()) {
+                        resp_model = m.to_string();
+                    }
+                    let message = val.get("message");
+                    let chunk_text = message
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    if !chunk_text.is_empty() {
+                        on_chunk(chunk_text);
+                        full_content.push_str(chunk_text);
+                    }
+                    if let Some(msg) = message {
+                        let chunk_tcs = extract_tool_calls_from_message(msg);
+                        for (idx, tc) in chunk_tcs.into_iter().enumerate() {
+                            while tool_calls.len() <= idx {
+                                tool_calls.push(NativeToolCall {
+                                    name: String::new(),
+                                    arguments: serde_json::Value::Object(serde_json::Map::new()),
+                                    id: None,
+                                });
+                            }
+                            tool_calls[idx] = tc;
+                        }
+                    }
+                    let done = val.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+                    if done {
+                        let tool_calls: Vec<NativeToolCall> = tool_calls
+                            .into_iter()
+                            .filter(|tc| !tc.name.is_empty())
+                            .collect();
+                        tracing::info!(
+                            "native chat done: content_chars={} tool_calls={} chunks={} bytes={}",
+                            full_content.chars().count(),
+                            tool_calls.len(),
+                            chunk_count,
+                            raw_bytes
+                        );
+                        return Ok(ChatResponse {
+                            content: full_content,
+                            tool_calls,
+                            model: resp_model,
+                        });
+                    }
+                }
+            }
+        }
+
+        let tool_calls: Vec<NativeToolCall> = tool_calls
+            .into_iter()
+            .filter(|tc| !tc.name.is_empty())
+            .collect();
+        tracing::warn!(
+            "native chat stream ended WITHOUT done=true: content_chars={} tool_calls={} chunks={} bytes={}",
+            full_content.chars().count(),
+            tool_calls.len(),
+            chunk_count,
+            raw_bytes
+        );
+        Ok(ChatResponse {
+            content: full_content,
+            tool_calls,
+            model: resp_model,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,12 +774,11 @@ struct GenerateRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
-    /// Disable thinking/reasoning output. Hybrid models (e.g. qwen3.5) default to
-    /// thinking mode; without this, the model emits reasoning into the `thinking`
-    /// field while `response` stays empty, yielding a content-less stream.
-    /// Serialized unconditionally: `skip_serializing_if = Not::not` would omit
-    /// `think:false` from the JSON, causing Ollama to fall back to the model's
-    /// default (thinking ON). We must send the explicit `false`.
+    /// Omitted when false. Sending an explicit `think:false`/`think:true` crashes
+    /// some Ollama builds with thinking models (500 {"error":"EOF"}); omitting it
+    /// lets Ollama use the model default and avoids the crash. Set `enable_thinking`
+    /// to send `think:true`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     think: bool,
     options: ChatOptions,
 }
@@ -1026,6 +1235,7 @@ mod tests {
         let tc = NativeToolCall {
             name: "exec_shell".into(),
             arguments: serde_json::json!({"command": "ls"}),
+            id: Some("call_abc".into()),
         };
         let tool_call = crate::agent::tools_parser::ToolCall {
             name: tc.name.clone(),

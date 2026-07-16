@@ -185,7 +185,7 @@ pub fn classify_error(error_msg: &str) -> ErrorClass {
 }
 
 /// Exponential backoff delay: base 1s, doubling, capped at 16s, with random jitter.
-fn backoff_delay(attempt: usize) -> std::time::Duration {
+pub fn backoff_delay(attempt: usize) -> std::time::Duration {
     let base_ms: u64 = 1000;
     let max_ms: u64 = 16_000;
     let delay_ms = base_ms.saturating_mul(2u64.saturating_pow(attempt as u32)).min(max_ms);

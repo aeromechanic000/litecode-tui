@@ -1927,6 +1927,7 @@ fn spawn_execution_with_plan(
     let workspace = app_state.workspace.clone();
     let context_window_limit = app_state.config.context_window_limit;
     let enable_thinking = app_state.config.enable_thinking;
+    let native_tool_calls = app_state.config.native_tool_calls;
     let now = current_datetime();
     let context_handle = app_state.context_manager.context_handle_for_model(&model).cloned();
 
@@ -1977,6 +1978,31 @@ fn spawn_execution_with_plan(
             }
         };
 
+        // Native-tool client (/api/chat) — only needed on the native path.
+        let native_client: Option<ollama::OllamaClient> = if native_tool_calls {
+            match ollama::OllamaClient::new(&config) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    let _ = tx.send(agent::retry::PipelineResult::Retry(
+                        agent::retry::RetryResult::Failed {
+                            last_error: format!("Native client error: {}", e),
+                            attempts: 0,
+                        },
+                    ));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Conversation history as native chat messages (for the /api/chat path).
+        let native_history: Vec<serde_json::Value> = history
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+            .collect();
+
         // Parse plan into individual steps
         let steps: Vec<String> = plan
             .lines()
@@ -2025,19 +2051,37 @@ fn spawn_execution_with_plan(
             };
             let total_tokens = estimate_prompt_tokens(Some(&system_prompt), &prompt);
 
-            let step = stream_step_with_tools(
-                &rt,
-                http,
-                &endpoint,
-                &model,
-                Some(system_prompt),
-                prompt,
-                context_handle,
-                context_window_limit,
-                enable_thinking,
-                &tool_registry,
-                &tx,
-            );
+            let step = if let Some(nc) = native_client.as_ref() {
+                let user_message = if history_prompt.is_empty() {
+                    format!("[Plan]\n{}\n\n{}", plan, input)
+                } else {
+                    format!("{}\n[Plan]\n{}\n\n{}", history_prompt, plan, input)
+                };
+                stream_step_native_tools(
+                    &rt,
+                    nc,
+                    &model,
+                    system_prompt,
+                    native_history.clone(),
+                    user_message,
+                    &tool_registry,
+                    &tx,
+                )
+            } else {
+                stream_step_with_tools(
+                    &rt,
+                    http,
+                    &endpoint,
+                    &model,
+                    Some(system_prompt),
+                    prompt,
+                    context_handle,
+                    context_window_limit,
+                    enable_thinking,
+                    &tool_registry,
+                    &tx,
+                )
+            };
             let _ = tx.send(agent::retry::PipelineResult::StreamDone {
                 content: step.content,
             });
@@ -2129,19 +2173,37 @@ fn spawn_execution_with_plan(
                 format!("{}\nuser: {}", history_prompt, user_msg)
             };
 
-            let step_result = stream_step_with_tools(
-                &rt,
-                http.clone(),
-                &endpoint,
-                &model,
-                Some(system_prompt.clone()),
-                prompt,
-                current_context.clone(),
-                context_window_limit,
-                enable_thinking,
-                &tool_registry,
-                &tx,
-            );
+            let step_result = if let Some(nc) = native_client.as_ref() {
+                let user_message = if history_prompt.is_empty() {
+                    user_msg.clone()
+                } else {
+                    format!("{}\n{}", history_prompt, user_msg)
+                };
+                stream_step_native_tools(
+                    &rt,
+                    nc,
+                    &model,
+                    system_prompt.clone(),
+                    native_history.clone(),
+                    user_message,
+                    &tool_registry,
+                    &tx,
+                )
+            } else {
+                stream_step_with_tools(
+                    &rt,
+                    http.clone(),
+                    &endpoint,
+                    &model,
+                    Some(system_prompt.clone()),
+                    prompt,
+                    current_context.clone(),
+                    context_window_limit,
+                    enable_thinking,
+                    &tool_registry,
+                    &tx,
+                )
+            };
 
             tracing::info!(
                 "step {}/{} complete: {} bytes, {} lines",
@@ -2382,6 +2444,12 @@ const MAX_TOOL_ROUNDS_PER_STEP: usize = 5;
 /// fails to parse (e.g. missing closing tag, malformed JSON). Mirrors agent loop.
 const MAX_TOOL_CORRECTION_RETRIES: usize = 2;
 
+/// Maximum retries on a transient transport error from `/api/generate` (500 EOF
+/// from a runner crash under memory pressure, connection drop, timeout). The
+/// generate path has no built-in retry, so without this a single transient
+/// failure aborts the whole turn. Mirrors the chat path's `chat_with_retry`.
+const MAX_TRANSPORT_RETRIES: usize = 3;
+
 /// Execute one plan step with optional tool calls. Repeatedly calls
 /// `stream_single_step_generate` (the `/api/generate` primitive that owns truncation
 /// continuation and KV-cache context-handle threading). After each round, parses the
@@ -2412,6 +2480,7 @@ fn stream_step_with_tools(
     let mut last_step_result: Option<StepResult> = None;
     let mut correction_retries = 0usize;
     let mut prev_signature = String::new();
+    let mut transport_retries = 0usize;
 
     for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
         let step_result = stream_single_step_generate(
@@ -2427,8 +2496,31 @@ fn stream_step_with_tools(
             tx,
         );
 
-        // Surface transport-level errors immediately (content starts with "ERROR:").
+        // Transport-level errors surface as content starting with "ERROR:". The
+        // generate path has no built-in retry (unlike /api/chat's chat_with_retry),
+        // so a single transient runner crash — common with local Ollama under
+        // memory pressure (500 {"error":"EOF"}) or a brief connection drop — would
+        // abort the whole turn. Retry retryable classes with backoff; re-calling
+        // stream_single_step_generate gives a fresh generation (clean state).
         if step_result.content.starts_with("ERROR:") {
+            if transport_retries < MAX_TRANSPORT_RETRIES
+                && agent::retry::classify_error(&step_result.content)
+                    == agent::retry::ErrorClass::Retryable
+            {
+                transport_retries += 1;
+                let delay = agent::retry::backoff_delay(transport_retries - 1);
+                tracing::warn!(
+                    "stream_step_with_tools round {}: transient generate error, retrying {}/{} after {:?}: {}",
+                    round,
+                    transport_retries,
+                    MAX_TRANSPORT_RETRIES,
+                    delay,
+                    step_result.content
+                );
+                std::thread::sleep(delay);
+                // Re-run this round from scratch (same prompt/context) → fresh generation.
+                continue;
+            }
             return step_result;
         }
 
@@ -2711,6 +2803,174 @@ fn stream_step_with_tools(
         eval_count: None,
         done_reason: None,
     })
+}
+
+/// Execute one plan step via Ollama's NATIVE tool-calling (`tools=` on `/api/chat`),
+/// the opt-in path used when `config.native_tool_calls` is set.
+///
+/// Thinking models (e.g. qwen3.5) will not emit text-format `<tool_call>` blocks on
+/// `/api/generate` — they put tool intent in their reasoning and stop with empty
+/// content — but they emit native tool calls reliably. This loops: call
+/// `/api/chat` with the tool definitions → if the model returns native tool calls,
+/// dispatch the first via the `ToolRegistry`, append the assistant turn (with its
+/// `tool_calls`) and the `tool`-role result to the message history, and re-call so
+/// the model sees the result and continues. Terminates when the model returns no
+/// tool calls (content is the step's final answer) or `MAX_TOOL_ROUNDS_PER_STEP` is hit.
+///
+/// Unlike `stream_step_with_tools`, this uses `/api/chat`, which does NOT expose the
+/// KV-cache `context` handle — so the returned `StepResult.context_handle` is always
+/// `None` (no manual cache reuse on this path).
+fn stream_step_native_tools(
+    rt: &tokio::runtime::Runtime,
+    client: &ollama::OllamaClient,
+    model: &str,
+    system_prompt: String,
+    history_messages: Vec<serde_json::Value>,
+    user_message: String,
+    tools: &tools::ToolRegistry,
+    tx: &mpsc::Sender<agent::retry::PipelineResult>,
+) -> StepResult {
+    let tool_defs = tools.ollama_tool_definitions();
+    let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history_messages.len() + 2);
+    messages.push(serde_json::json!({ "role": "system", "content": system_prompt }));
+    messages.extend(history_messages);
+    messages.push(serde_json::json!({ "role": "user", "content": user_message }));
+
+    let mut prev_signature = String::new();
+
+    for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
+        let tx_chunk = tx.clone();
+        let response = match rt.block_on(client.chat_native_streaming(
+            model,
+            messages.clone(),
+            &tool_defs,
+            |c: &str| {
+                let _ = tx_chunk.send(agent::retry::PipelineResult::StreamChunk {
+                    content: c.to_string(),
+                });
+            },
+        )) {
+            Ok(r) => r,
+            Err(e) => {
+                return StepResult {
+                    content: format!("ERROR: Native chat failed: {}", e),
+                    context_handle: None,
+                    prompt_eval_count: None,
+                    eval_count: None,
+                    done_reason: None,
+                };
+            }
+        };
+
+        if response.tool_calls.is_empty() {
+            tracing::info!(
+                "stream_step_native_tools round {}: no tool calls, step complete (chars={})",
+                round,
+                response.content.chars().count()
+            );
+            return StepResult {
+                content: response.content,
+                context_handle: None,
+                prompt_eval_count: None,
+                eval_count: None,
+                done_reason: Some("stop".into()),
+            };
+        }
+
+        // Dispatch only the FIRST tool call (sequential agent loop — the model must
+        // see a tool's result before emitting a call that depends on it).
+        let tc = response.tool_calls.into_iter().next().expect("non-empty");
+        let call_id = tc
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("native-{}", round));
+        let signature = format!("{}:{}", tc.name, tc.arguments);
+        if signature == prev_signature {
+            tracing::warn!(
+                "stream_step_native_tools round {}: repeating tool signature, finalizing step",
+                round
+            );
+            return StepResult {
+                content: response.content,
+                context_handle: None,
+                prompt_eval_count: None,
+                eval_count: None,
+                done_reason: Some("stop".into()),
+            };
+        }
+        prev_signature = signature;
+
+        // Echo the assistant turn (with its tool_calls) so the model sees what it said.
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": response.content,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": { "name": tc.name, "arguments": tc.arguments }
+            }]
+        }));
+
+        tracing::info!(
+            "stream_step_native_tools round {}: dispatching tool={} args={:?}",
+            round,
+            tc.name,
+            tc.arguments
+        );
+        let _ = tx.send(agent::retry::PipelineResult::ToolStart {
+            tool_name: tc.name.clone(),
+            call_id: call_id.clone(),
+        });
+
+        let result = if !tools.has_tool(&tc.name) {
+            tools::ToolResult::err(
+                &tc.name,
+                &call_id,
+                format!(
+                    "Unknown tool '{}'. Available tools: {}",
+                    tc.name,
+                    tools.list_names().join(", ")
+                ),
+            )
+        } else {
+            tools
+                .get(&tc.name)
+                .expect("checked above")
+                .execute(tc.arguments.clone(), call_id.clone())
+                .unwrap_or_else(|e| {
+                    tools::ToolResult::err(&tc.name, &call_id, format!("{}", e))
+                })
+        };
+        tracing::info!(
+            "stream_step_native_tools round {}: tool {} success={} output_chars={}",
+            round,
+            tc.name,
+            result.success,
+            result.output.chars().count()
+        );
+        let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
+            result: result.clone(),
+        });
+
+        // Append the tool result so the model can continue.
+        messages.push(serde_json::json!({
+            "role": "tool",
+            "name": tc.name,
+            "content": result.output
+        }));
+    }
+
+    tracing::warn!(
+        "stream_step_native_tools: hit MAX_TOOL_ROUNDS_PER_STEP={}, returning empty content",
+        MAX_TOOL_ROUNDS_PER_STEP
+    );
+    StepResult {
+        content: String::new(),
+        context_handle: None,
+        prompt_eval_count: None,
+        eval_count: None,
+        done_reason: None,
+    }
 }
 
 /// Format a `ToolResult` as a `<tool_result>` block for inclusion in the next `/api/generate`
@@ -4071,6 +4331,39 @@ mod tests {
         assert!(rendered.contains("- web_reader: fetch a URL"));
         assert!(rendered.contains("- read_file: read a file"));
         assert!(rendered.ends_with("End."));
+    }
+
+    /// LIVE (needs Ollama at the configured endpoint + qwen3.5): verifies the
+    /// native tool-calling path (`chat_native_streaming`) returns a `web_reader`
+    /// tool call for the summarize task — the proven-working flow for thinking
+    /// models that won't emit text-format tool calls.
+    /// Run: cargo test native_chat_streaming_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn native_chat_streaming_live() {
+        let workspace = std::path::PathBuf::from("/Users/nil/PBL");
+        let config = config::Config::load_for_workspace(&workspace).unwrap_or_default();
+        let client = ollama::OllamaClient::new(&config).unwrap();
+        let tools = tools::ToolRegistry::new(workspace.clone(), &config);
+        let defs = tools.ollama_tool_definitions();
+        let messages = vec![
+            serde_json::json!({ "role": "system", "content": "You are a coding agent. Use the provided tools." }),
+            serde_json::json!({ "role": "user", "content": "Fetch https://github.com/aeromechanic000/quick-share-for-lan" }),
+        ];
+        let resp = client
+            .chat_native_streaming(&config.exec_model, messages, &defs, |_| {})
+            .await
+            .expect("native chat call");
+        println!(
+            "content={} tool_calls={:?}",
+            resp.content,
+            resp.tool_calls.iter().map(|t| (&t.name, &t.id)).collect::<Vec<_>>()
+        );
+        assert!(
+            resp.tool_calls.iter().any(|t| t.name == "web_reader"),
+            "expected a web_reader tool call, got: {:?}",
+            resp.tool_calls
+        );
     }
 
     /// Phase A: tool descriptions come from a real ToolRegistry, so the planner

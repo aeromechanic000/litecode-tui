@@ -62,6 +62,14 @@ pub struct Config {
     /// path without a chat template.
     #[serde(default)]
     pub enable_thinking: bool,
+    /// Use Ollama's native tool-calling (`tools=` on `/api/chat`) for the executor
+    /// instead of text-format `<tool_call>` blocks on `/api/generate`. Required for
+    /// thinking models (e.g. qwen3.5) that won't emit text tool-call blocks — they
+    /// emit native tool calls reliably. Tradeoff: this path uses `/api/chat`, which
+    /// does not expose the KV-cache `context` handle, so manual cache reuse is
+    /// bypassed. Default off (preserves the `/api/generate` KV-cache design).
+    #[serde(default)]
+    pub native_tool_calls: bool,
     #[serde(default = "default_context_window")]
     pub context_window_limit: u64,
     #[serde(default = "default_max_file_lines")]
@@ -94,6 +102,7 @@ impl Default for Config {
             template_max_select: 5,
             max_retries: 3,
             enable_thinking: false,
+            native_tool_calls: false,
             context_window_limit: 262144,
             max_file_lines: 60,
             model_residency: "none".to_string(),
