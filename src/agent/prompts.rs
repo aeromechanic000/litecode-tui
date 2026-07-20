@@ -22,7 +22,11 @@ When a step requires a tool, name it explicitly so the executor knows to use it.
 File-as-memory planning:
 - Design each step to write its output to a file immediately — the file becomes the agent's memory for subsequent steps.
 - Later steps should reference files written by earlier steps (e.g. "Read index.html from step 2, then add the CSS link").
-- NEVER plan a step that says "output the final result" — instead, plan steps that build content incrementally into files.
+
+Final answer step (REQUIRED):
+- The LAST step of every plan MUST answer the user's request in plain text. This is what the user sees as the result.
+- For file-building tasks: the final step briefly states what was created or changed (e.g. "Created src/api.rs with the auth endpoints").
+- For informational or question tasks (count, list, find, explain, look up): the final step states the answer directly — do NOT write a file just to hold the answer.
 
 Output format: numbered steps, one per line:
 1. Step description

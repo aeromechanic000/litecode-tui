@@ -266,6 +266,13 @@ call, the executor appends a <tool_result> block and you may continue the same s
 call, more prose, or the step's final output). Do not invent tool names — only the tools
 listed below exist.
 
+## Always answer the user
+End EVERY turn with a concise natural-language answer to what the user asked. After your
+last tool returns, state the result or findings in plain prose. For a question (counting,
+listing, explaining, looking something up), answer it directly in words — do not end with
+only a tool call, a file block, or empty output. The user must always receive a direct
+answer.
+
 ### FILE: path/to/file
 ### ACTION: create|modify|delete
 ```

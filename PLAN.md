@@ -828,7 +828,7 @@ The project's design intent is a **single execution pipeline**: plan-then-execut
 
 ---
 
-### M15.1 Collapse to Single Pipeline + Prompt-Driven Tool Calls — P0 TODO
+### M15.1 Collapse to Single Pipeline + Prompt-Driven Tool Calls — P0 DONE
 
 **Problem:** Commit `f772df5` added `looks_like_tool_request()` routing (`src/main.rs:3842`) that bypasses `spawn_plan_then_execute` for any input containing `http://`, `https://`, or phrases like "fetch url" / "search for". The bypass routes to `spawn_agent_loop`, which has no approval gate — so plan approval is silently lost for any web/tool request. Root cause: the plan-then-execute path was never tool-aware, so the only path to tool use was a parallel agent loop. Three wiring gaps:
 1. The planner LLM call hardcodes `tools=&[]` via `OllamaClient::chat()` (`src/ollama/chat.rs:124–131`) — planner cannot see tools exist.
@@ -840,35 +840,35 @@ The project's design intent is a **single execution pipeline**: plan-then-execut
 **Tasks:**
 
 *Phase A — Planner prompt learns tools (text only)*
-- [ ] A1. Add `ToolRegistry::descriptions_text() -> String` in `src/tools/mod.rs` (formats `ToolDef.description` prose list)
-- [ ] A2. Update `QUICK_PLAN_SYSTEM` (`src/agent/prompts.rs:3`): interpolate `{TOOLS}` block, drop `[SEARCH]` rule at line 10
-- [ ] A3. Extend `apply_prompt_limits` (`src/main.rs:3096`) or add sibling helper to substitute both `{MAX_LINES}` and `{TOOLS}`
-- [ ] A4. In `spawn_plan_then_execute` (`src/main.rs:1779`): build `ToolRegistry::new(workspace, &config)`, substitute `{TOOLS}` into planner system prompt; planner call stays as `OllamaClient::chat(...)` (no `tools=` field)
+- [x] A1. Add `ToolRegistry::descriptions_text() -> String` in `src/tools/mod.rs` (formats `ToolDef.description` prose list)
+- [x] A2. Update `QUICK_PLAN_SYSTEM` (`src/agent/prompts.rs:3`): interpolate `{TOOLS}` block, drop `[SEARCH]` rule at line 10
+- [x] A3. Extend `apply_prompt_limits` (`src/main.rs:3096`) or add sibling helper to substitute both `{MAX_LINES}` and `{TOOLS}`
+- [x] A4. In `spawn_plan_then_execute` (`src/main.rs:1779`): build `ToolRegistry::new(workspace, &config)`, substitute `{TOOLS}` into planner system prompt; planner call stays as `OllamaClient::chat(...)` (no `tools=` field)
 
 *Phase B — Executor runs tool loop per step on `/api/generate`*
-- [ ] B1. Extend `base_identity_prompt()` (`src/prompt.rs:234`) with `<tool_call>` syntax spec (lift wording from `TOOL_CORRECTION_PROMPT` at `src/agent/prompts.rs:145`)
-- [ ] B2. Add `MAX_TOOL_ROUNDS_PER_STEP: usize = 5` constant and `stream_step_with_tools(...)` wrapper in `src/main.rs` adjacent to `stream_single_step_generate` (line 2248)
-- [ ] B3. Per-round logic: call `stream_single_step_generate` unchanged → parse output via `parse_tool_calls_with_diagnostics` → terminate on no-calls-AND-not-failed-attempt, signature-repeat, or `MAX_CORRECTION_RETRIES=2` exhaustion
-- [ ] B4. Per-call dispatch: validate name (`tools.has_tool`) + params (`tools.validate_params`) → emit `PipelineResult::ToolStart` → `tools.execute(...)` → emit `PipelineResult::ToolResultReady`; emit `ToolResult::err(...)` on validation failure
-- [ ] B5. Build next-round prompt: append verbatim assistant output + `<tool_result tool="..." call_id="...">{...}</tool_result>` per call + `user: Continue the step using the tool results above.` line
-- [ ] B6. Thread context handle across rounds (each round passes previous round's `StepResult.context_handle`)
-- [ ] B7. Swap call sites at `src/main.rs:2012` (no-parseable-steps branch) and `src/main.rs:2166` (main step loop) to use `stream_step_with_tools`; build one `ToolRegistry` outside step loop
+- [x] B1. Extend `base_identity_prompt()` (`src/prompt.rs:234`) with `<tool_call>` syntax spec (lift wording from `TOOL_CORRECTION_PROMPT` at `src/agent/prompts.rs:145`)
+- [x] B2. Add `MAX_TOOL_ROUNDS_PER_STEP: usize = 5` constant and `stream_step_with_tools(...)` wrapper in `src/main.rs` adjacent to `stream_single_step_generate` (line 2248)
+- [x] B3. Per-round logic: call `stream_single_step_generate` unchanged → parse output via `parse_tool_calls_with_diagnostics` → terminate on no-calls-AND-not-failed-attempt, signature-repeat, or `MAX_CORRECTION_RETRIES=2` exhaustion
+- [x] B4. Per-call dispatch: validate name (`tools.has_tool`) + params (`tools.validate_params`) → emit `PipelineResult::ToolStart` → `tools.execute(...)` → emit `PipelineResult::ToolResultReady`; emit `ToolResult::err(...)` on validation failure
+- [x] B5. Build next-round prompt: append verbatim assistant output + `<tool_result tool="..." call_id="...">{...}</tool_result>` per call + `user: Continue the step using the tool results above.` line
+- [x] B6. Thread context handle across rounds (each round passes previous round's `StepResult.context_handle`)
+- [x] B7. Swap call sites at `src/main.rs:2012` (no-parseable-steps branch) and `src/main.rs:2166` (main step loop) to use `stream_step_with_tools`; build one `ToolRegistry` outside step loop
 
 *Phase C — Remove `[SEARCH]` hack*
-- [ ] C1. Delete `[SEARCH]` branch at `src/main.rs:2066–2120`
-- [ ] C2. Remove `[SEARCH]` example from `QUICK_PLAN_SYSTEM` (line 23) — replace with tool-reference style
+- [x] C1. Delete `[SEARCH]` branch at `src/main.rs:2066–2120`
+- [x] C2. Remove `[SEARCH]` example from `QUICK_PLAN_SYSTEM` (line 23) — replace with tool-reference style
 
 *Phase D — Remove agent loop; route all to plan-then-execute*
-- [ ] D1. Replace body of `spawn_request_for_mode` (`src/main.rs:2822`) with unconditional `spawn_plan_then_execute(...)`
-- [ ] D2. Delete `spawn_agent_loop` (`src/main.rs:2611–2820`)
-- [ ] D3. Delete `src/agent/agent_loop.rs` and remove `pub mod agent_loop;` from `src/agent/mod.rs`
-- [ ] D4. Delete `looks_like_tool_request` (`src/main.rs:3842`) and `looks_like_code_request` (`src/main.rs:3815`) — no remaining callers
-- [ ] D5. Remove `AgentLoopConfig` struct and orphaned imports
+- [x] D1. Replace body of `spawn_request_for_mode` (`src/main.rs:2822`) with unconditional `spawn_plan_then_execute(...)`
+- [x] D2. Delete `spawn_agent_loop` (`src/main.rs:2611–2820`)
+- [x] D3. Delete `src/agent/agent_loop.rs` and remove `pub mod agent_loop;` from `src/agent/mod.rs`
+- [x] D4. Delete `looks_like_tool_request` (`src/main.rs:3842`) and `looks_like_code_request` (`src/main.rs:3815`) — no remaining callers
+- [x] D5. Remove `AgentLoopConfig` struct and orphaned imports
 
 *Phase E — Documentation*
-- [ ] E1. Rewrite "Agent Loop Architecture" section in `CLAUDE.md:159–175` to single-path
-- [ ] E2. Update event-processing diagram at `CLAUDE.md:212–213` — drop `or spawn_agent_loop()` branch
-- [ ] E3. Update "Two-Tier Model Pipeline" section if it references Auto-mode agent routing
+- [x] E1. Rewrite "Agent Loop Architecture" section in `CLAUDE.md:159–175` to single-path
+- [x] E2. Update event-processing diagram at `CLAUDE.md:212–213` — drop `or spawn_agent_loop()` branch
+- [x] E3. Update "Two-Tier Model Pipeline" section if it references Auto-mode agent routing
 
 **Files:** `src/tools/mod.rs`, `src/agent/prompts.rs`, `src/main.rs`, `src/prompt.rs`, `src/agent/agent_loop.rs` (delete), `src/agent/mod.rs`, `CLAUDE.md`
 
@@ -894,3 +894,67 @@ A1–A4 (planner tool-aware)         foundation — no behavior change yet
 ```
 
 Phase A is safe to land first (planner sees tools but executor can't act on them yet — no regression). Phase B is the enabling change. Phases C and D are pure removal once B is verified working. Phase E is documentation.
+
+---
+
+## Phase 16 — Knowledge sources: instructions + skills only (drop dead `code_base`) — DONE
+
+**Target:** LitePilot has two user-editable, no-recompile knowledge channels —
+**global/project instructions** (always-on) and **skills** (invoked or auto-triggered).
+The `codebase/` subsystem (tag-indexed template RAG) was dead in the live path (`CodeBase`
+passed `None` everywhere; `AgentPipeline` `#[allow(dead_code)]`; `run_auto_pipeline` /
+`spawn_auto_pipeline` / `agent/planner.rs` / `agent/editor.rs` all dead; `populate_codebase`
+embedded 52 templates via `include_str!` and wrote them to `~/.litepilot/code_base`, never
+read). It has been removed; skills now auto-inject so they're a real first-class mechanism.
+
+**Result:** build clean, `cargo test --bin litepilot` = 338 passed / 0 failed, zero
+`code_base` references in `src/`, `CLAUDE.md` clean, `README.md` updated. Foundation
+(`~/.litepilot/instructions.md`, `SkillRegistry::match_triggers`) was already in place.
+
+### M16.1 Make skills first-class DONE
+
+*Phase A — Auto-inject matched skills into the prompt*
+- [x] A1. Add `matched_skills_block(input, &skills, token_cap) -> String` in `src/main.rs` (near `format_tool_result_block`): call `match_triggers`, concatenate `### Skill: <name> (<desc>)\n<body>` bodies, cap cumulative tokens via `util::text::estimate_tokens`, return `""` if none
+- [x] A2. Add `const MAX_MATCHED_SKILL_TOKENS: usize = 1500;`
+- [x] A3. Inject into the planner (`spawn_plan_then_execute`): append block to the `apply_plan_prompt(QUICK_PLAN_SYSTEM, …)` system string before `ChatMessage::system(...)`
+- [x] A4. Inject into the executor (`spawn_execution_with_plan`): append block to `coding_system` after `prompt_builder.build()`
+- [x] A5. Unit tests for `matched_skills_block` (empty on no match, includes matching skill, caps total tokens)
+
+*Phase B — Seed skill*
+- [x] B1. Create `~/.litepilot/skills/count-files.md` (frontmatter `trigger: count, how many, number of files, count files`; body = `.`/`..` exclusion rule + correct `find … -type f | wc -l` + files-vs-dirs precision). Complements terse `instructions.md`. `populate_skills` won't overwrite (writes only if absent).
+
+### M16.2 Remove `code_base` subsystem + dead dependents DONE
+
+- [x] C1. `rm -r src/codebase/` (mod.rs, builtin.rs, index.rs, retrieval.rs, `templates/` — 52 files); remove `mod codebase;` from `src/main.rs`
+- [x] C2. `src/config.rs`: drop `populate_codebase` call (keep `populate_skills`); drop `"code_base"` from `create_dir_structure` subdirs + its test; drop `max_template_context_tokens` + `template_max_select` fields + defaults
+- [x] C3. `src/agent/mod.rs`: kept `FileChange` + `parse_file_changes` (promoted to standalone `pub fn`, updated 5 `AgentPipeline::parse_file_changes` call sites in `main.rs`); deleted `use crate::codebase::CodeBase`, `AgentPipeline` struct, `new()`, all `CodeBase`-coupled methods, plus dead `Plan`/`AuditResult`/`parse_plan`/`parse_audit`/`detect_drift`/`drift_warning`
+- [x] C4. Deleted `src/agent/auto_run.rs` + `src/agent/planner.rs` + `src/agent/editor.rs` (all dead, `#[allow(dead_code)]`) and their `mod` declarations
+- [x] C5. `src/main.rs` + `agent/retry.rs`: removed dead `spawn_auto_pipeline` + `render_auto_result`; removed `PipelineResult::AutoSuccess`/`AutoFailed` variants; removed their handler arms in `run_headless` and `run_app`; dropped now-unused imports
+
+### M16.3 Docs + migration DONE
+
+- [x] D1. `README.md`: removed `code_base` tree entry; described instructions + skills model (skills auto-activate on trigger keywords; `instructions.md` always-on); added upgrader note about the orphaned `~/.litepilot/code_base/` dir
+- [x] D2. `CLAUDE.md`: already a clean two-channel design with **zero** `code_base` references — no edits needed; re-read post-implementation confirms architecture tree, config block, and prose match the code
+- [x] D3. Orphaned `~/.litepilot/code_base` dirs on existing installs: left in place (harmless, unused); README notes it can be deleted manually. No destructive startup cleanup.
+
+**Files:** `src/main.rs`, `src/config.rs`, `src/agent/mod.rs`, `src/agent/retry.rs`, `src/skills/mod.rs`, `src/agent/auto_run.rs` (deleted), `src/agent/planner.rs` (deleted), `src/agent/editor.rs` (deleted), `src/codebase/` (deleted), `README.md`, `CLAUDE.md`, `~/.litepilot/skills/count-files.md` (new)
+
+**Verification:**
+- `cargo build` clean, no warnings
+- `cargo test --bin litepilot` — 338 passed / 0 failed / 1 ignored
+- `grep -rn "codebase\|code_base\|CodeBase\|max_template_context_tokens\|template_max_select" src/` returns nothing
+- `CLAUDE.md` clean of code_base references; `README.md`'s only mention is the intentional upgrader note
+- 52 embedded templates removed from the binary
+- Live (needs Ollama): `cargo run -- -p "count how many files in current directory"` → prose answer that does **not** count `.`/`..` (count-files skill auto-triggered + instructions rule)
+- Live: `cargo run -- -p "create a file hello.txt containing hi"` → file written AND final answer (final-answer fallback intact)
+
+### M16.4 Implementation Order
+
+```
+M16.1 A1–A5 (skills auto-inject)   make "keep skills" real first
+  → M16.1 B1 (count-files seed)    demonstrate the mechanism
+  → M16.2 C1–C5 (remove code_base) pure removal, compiler-guided
+  → M16.3 D1–D3 (docs + migration) sync docs, note orphan dir
+```
+
+M16.1 landed first (established the replacement mechanism, no behavior change for non-matching inputs). M16.2 was pure dead-code removal — the compiler flagged every dangling reference, so behavior could not change. Done on a `remove-codebase` branch.

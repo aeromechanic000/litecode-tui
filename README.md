@@ -10,7 +10,7 @@ No cloud. No API keys. Nothing leaves your machine. I run on two local models �
 
 **I work in three modes.** I can Plan (read-only — I look, I think, I tell you what I see). I can Edit (I propose changes, and you approve them with `/apply`). Or I can go Auto — I plan, implement, review, and apply everything in one sandboxed pass. You switch between them with Shift+Tab.
 
-**I have skills.** `/review` for code audits. `/explain` when you want to understand something. `/simplify` for refactoring. `/test` for generating tests. `/search` for finding things. You can teach me new skills too — drop a `.md` file in `~/.litepilot/skills/` and I'll learn it.
+**I have skills.** `/review` for code audits. `/explain` when you want to understand something. `/simplify` for refactoring. `/test` for generating tests. `/search` for finding things. You can teach me new skills too — drop a `.md` file in `~/.litepilot/skills/` and I'll learn it. Skills also **auto-activate**: when your request matches a skill's trigger keywords, I apply its methodology without you invoking it. For universal conventions (how to count files accurately, what `.`/`..` mean), edit `~/.litepilot/instructions.md` — it's always in my context.
 
 **I correct myself.** I validate my own output. When I produce something malformed — and local models sometimes do — I retry with an explanation of what went wrong. I back off exponentially so I don't overwhelm Ollama while I'm figuring it out.
 
@@ -144,6 +144,10 @@ accent = "magenta"
 warning = "yellow"
 ```
 
+> **Note for upgraders:** older versions wrote a `~/.litepilot/code_base/` template
+> directory. It's no longer used (the template subsystem was removed) — you can
+> delete it manually. Your `skills/` and `instructions.md` are unaffected.
+
 ## How I'm built
 
 ```
@@ -165,9 +169,9 @@ src/
 ├── sandbox/             My security: path validation, command filtering, platform sandboxes
 ├── search/              DuckDuckGo search with disk cache
 ├── project/             File tree, git status, file operations, UV toolchain
-├── codebase/            Template library, tag search, context retrieval
 ├── session/             Session persistence (JSON)
-├── skills/              My loadable skills, stored as markdown with YAML frontmatter
+├── skills/              Loadable skills (markdown + YAML frontmatter); invoked via
+│                          /name or auto-injected when input matches a skill's triggers
 ├── ui/                  How I render myself in your terminal (ratatui), status bar with context indicator
 └── util/                Diff generation, text processing, token estimation
 ```

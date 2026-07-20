@@ -366,6 +366,37 @@ pub fn sanitize_output(text: &str) -> String {
     result
 }
 
+/// Returns true if `content` contains a meaningful natural-language answer —
+/// i.e. prose text OUTSIDE of `<tool_call>` blocks, `<tool_result>` blocks,
+/// `### FILE: …` file blocks, and fenced code blocks. Used by the executor's
+/// final-answer fallback to decide whether a tool-using step ended with no
+/// real answer (the model emitted only tool calls / file blocks / empty text
+/// and "finished" without addressing the user).
+///
+/// Threshold: ≥3 surviving non-marker words counts as a real answer. Fewer
+/// than that is treated as stray markers / whitespace, triggering the fallback.
+pub fn has_final_answer(content: &str) -> bool {
+    // Strip file blocks (### FILE: ... ``` ... ```) first, before generic fence
+    // stripping, so the FILE marker and its fence are removed together.
+    let file_re = regex::Regex::new(r"(?s)### FILE:.*?```").unwrap();
+    let call_re = regex::Regex::new(r"(?s)<tool_call[^>]*>.*?</tool_call>").unwrap();
+    let res_re = regex::Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap();
+    // Also drop orphan / unclosed tool_call openers so a lone opener with no
+    // prose doesn't count as an answer.
+    let lone_call_re = regex::Regex::new(r"<tool_call[^>]*>").unwrap();
+    let lone_res_re = regex::Regex::new(r"</tool_result>").unwrap();
+    let fence_re = regex::Regex::new(r"(?s)```.*?```").unwrap();
+
+    let s = file_re.replace_all(content, "");
+    let s = call_re.replace_all(&s, "");
+    let s = res_re.replace_all(&s, "");
+    let s = lone_call_re.replace_all(&s, "");
+    let s = lone_res_re.replace_all(&s, "");
+    let s = fence_re.replace_all(&s, "");
+
+    s.split_whitespace().count() >= 3
+}
+
 // ---------------------------------------------------------------------------
 // Inline `<think>…</think>` reasoning-block stripping
 // ---------------------------------------------------------------------------
@@ -896,5 +927,49 @@ Call: write_file(path="b.rs")"#;
         let text = r#"Some text <tool_call> oops"#;
         let sanitized = sanitize_output(text);
         assert!(sanitized.contains("[invalid tool call]"));
+    }
+
+    #[test]
+    fn has_final_answer_empty_is_false() {
+        assert!(!has_final_answer(""));
+        assert!(!has_final_answer("   \n\t  "));
+    }
+
+    #[test]
+    fn has_final_answer_tool_call_only_is_false() {
+        let text = r#"<tool_call name="exec_shell" call_id="1">{"command": "ls"}</tool_call>"#;
+        assert!(!has_final_answer(text));
+    }
+
+    #[test]
+    fn has_final_answer_tool_result_only_is_false() {
+        let text = r#"<tool_result tool="exec_shell" call_id="1">{"success": true, "output": "5"}</tool_result>"#;
+        assert!(!has_final_answer(text));
+    }
+
+    #[test]
+    fn has_final_answer_file_block_only_is_false() {
+        let text = "### FILE: hello.txt\n### ACTION: create\n```\nhi\n```\n";
+        assert!(!has_final_answer(text));
+    }
+
+    #[test]
+    fn has_final_answer_prose_is_true() {
+        assert!(has_final_answer("There are 5 files in the current directory."));
+        assert!(has_final_answer("Done. I created the file and added the function."));
+    }
+
+    #[test]
+    fn has_final_answer_prose_with_tool_call_is_true() {
+        // Prose answer plus a trailing tool call — the prose survives.
+        let text = "There are 5 files.\n<tool_call name=\"exec_shell\" call_id=\"2\">{\"command\": \"echo done\"}</tool_call>";
+        assert!(has_final_answer(text));
+    }
+
+    #[test]
+    fn has_final_answer_stray_markers_below_threshold_is_false() {
+        // Fewer than 3 surviving words — just stray markers.
+        assert!(!has_final_answer("ok"));
+        assert!(!has_final_answer("### FILE:"));
     }
 }

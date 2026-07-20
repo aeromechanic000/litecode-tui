@@ -48,14 +48,13 @@ src/
 │                        context window estimation, parameter count heuristics
 │
 ├── agent/
-│   ├── mod.rs           Agent module root: submodules (auto_run, diagnostics, editor,
-│   │                    planner, prompts, retry, summarizer, syntax, tools_parser)
+│   ├── mod.rs           Agent module root: FileChange + parse_file_changes() (extracts
+│   │                    ### FILE:/### ACTION: blocks). Submodules: diagnostics, prompts,
+│   │                    retry, summarizer, syntax, tools_parser
 │   ├── tools_parser.rs  Parse text/JSON tool calls from LLM output + sanitize_output()
 │   │                    scrubs forged tool call markers from display; ThinkStripper
-│   │                    removes inline <think> reasoning blocks from streamed responses
-│   ├── planner.rs       Plan mode: builds prompt context for read-only analysis
-│   ├── editor.rs        Edit mode: generates file changes, presents diff for approval
-│   ├── auto_run.rs      Auto mode: full pipeline orchestration constants
+│   │                    removes inline <think> reasoning blocks from streamed responses;
+│   │                    has_final_answer() drives the final-answer fallback
 │   ├── prompts.rs       System prompts per model tier, model-size-adaptive templates
 │   ├── retry.rs         chat_with_retry() with exponential backoff,
 │   │                    ErrorClass (Retryable/Permanent) error classification,
@@ -84,12 +83,6 @@ src/
 │   ├── mod.rs           ProjectContext: file tree scan (respects .gitignore), git status
 │   ├── file_ops.rs      File read/write/delete with sandbox + mode permission checks
 │   └── uv.rs            UV toolchain: init, venv, add, run
-│
-├── codebase/
-│   ├── mod.rs           CodeBase: template loading, tag-based search
-│   ├── builtin.rs       Built-in template library (40+ templates, include_str! at compile)
-│   ├── index.rs         Tag index: @LITE_DESC/@LITE_TAGS scanning, file discovery
-│   └── retrieval.rs     Context budget: template selection within token limits
 │
 ├── session/
 │   ├── mod.rs           Session: id, messages, metadata, UUID-based
@@ -400,7 +393,6 @@ native_tool_calls = false
 enable_free_web_search = true
 search_cache_valid_days = 30
 max_search_context_tokens = 2048
-max_template_context_tokens = 2048
 
 [theme]
 primary = "cyan"
@@ -409,6 +401,62 @@ warning = "yellow"
 ```
 
 Config loading: project-local → global → defaults.
+
+## Knowledge Sources (instructions + skills)
+
+LitePilot has two user-editable knowledge channels — both load from disk at
+runtime, so no recompile is needed to add or change domain rules.
+
+### 1. Global / project instructions — always on
+`prompt::ProjectInstructions::discover()` reads, in priority order: `AGENTS.md`,
+`CLAUDE.md` (workspace), `instructions.md` (effective config dir — project-local
+`.litepilot/` if present, else global `~/.litepilot/`), and `README.md` (first
+100 lines, fallback). These are injected as a static `project_context` prompt
+layer (`set_project_context`), byte-identical across turns → KV-cache friendly.
+This is the home for short, universal conventions (e.g. filesystem/shell accuracy
+rules) that should apply on every turn.
+
+### 2. Skills — invoked or auto-triggered
+Skills live as Markdown + YAML frontmatter files in `~/.litepilot/skills/`
+(`name`, `description`, `trigger: keyword1, keyword2`). `SkillRegistry` loads
+them at startup; `populate_skills` writes the built-in skills only if absent
+(never overwrites user edits).
+
+- **By invocation**: the user types `/skill_name args` → `spawn_skill_request`
+  appends the skill body to the system prompt.
+- **By auto-trigger**: `SkillRegistry::match_triggers(input)` returns every skill
+  whose non-empty trigger keyword appears (case-insensitive substring) in the
+  user's input. The matched bodies are concatenated (token-capped by
+  `matched_skills_block`) and injected into BOTH the planner system message and
+  the executor's `coding_system` for that turn. Skills with empty triggers are
+  skipped (an empty keyword would match every input). This surfaces relevant
+  domain rules without the user invoking the skill, and only bloats the prompt
+  when a rule is actually relevant.
+
+The two channels compose: instructions carry universal rules; skills carry
+task-specific methodologies that auto-attach when the task matches.
+
+## Final-Answer Guarantee
+
+Every turn ends with a natural-language answer to the user, even after tool use.
+This is enforced by prompt rules plus a fallback:
+
+- **Base identity** (`prompt.rs`): an "Always answer the user" rule tells the
+  model to end every turn with prose, never only tool calls / file blocks / empty.
+- **Planner** (`agent::prompts::QUICK_PLAN_SYSTEM`): every plan's LAST step must
+  answer the request in plain text (summarize for file tasks; answer directly for
+  questions).
+- **Per-step workflow** (`spawn_execution_with_plan`): file output is conditional,
+  the final step is flagged as the answer step, and every step must end with a
+  prose answer.
+- **Tool-loop continuation** (`stream_step_with_tools`): after a tool result, the
+  model is told to either call the next tool or give the final answer in prose.
+- **Fallback** (both tool paths): a tool-using step that ends with no prose answer
+  — detected by `tools_parser::has_final_answer()` (≥3 words outside tool-call /
+  tool-result / `### FILE:` / fenced-code blocks) — triggers one more generation
+  that explicitly asks for the answer: `/api/generate` on the text path (reusing
+  the KV-cache context handle) and `/api/chat` with no `tools=` on the native
+  path. Streams live like a normal round; a no-op when no tools ran.
 
 ## Naming Conventions
 

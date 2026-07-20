@@ -333,19 +333,10 @@ pub enum RetryResult {
 }
 
 /// Unified result from the main event loop channel.
-/// Wraps either a direct chat retry result or a full auto pipeline result.
+/// Wraps either a direct chat retry result or a streaming pipeline event.
 pub enum PipelineResult {
     /// Direct chat or skill invocation result (non-streaming fallback)
     Retry(RetryResult),
-    /// Auto pipeline completed — files were generated and applied
-    #[allow(dead_code)]
-    AutoSuccess {
-        changes: Vec<crate::agent::FileChange>,
-        applied: Vec<String>,
-    },
-    /// Auto pipeline failed at some stage
-    #[allow(dead_code)]
-    AutoFailed { error: String },
     /// Web search completed — results will be prepended to LLM context
     SearchDone {
         count: usize,

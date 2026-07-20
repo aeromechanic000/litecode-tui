@@ -52,8 +52,6 @@ pub struct Config {
     pub enable_away_summary: bool,
     pub search_cache_valid_days: u64,
     pub max_search_context_tokens: usize,
-    pub max_template_context_tokens: usize,
-    pub template_max_select: usize,
     pub max_retries: usize,
     /// Enable model thinking/reasoning. When true, requests are sent with
     /// `think: true` and inline `<think>…</think>` blocks are stripped from the
@@ -98,8 +96,6 @@ impl Default for Config {
             enable_away_summary: true,
             search_cache_valid_days: 30,
             max_search_context_tokens: 2048,
-            max_template_context_tokens: 2048,
-            template_max_select: 5,
             max_retries: 3,
             enable_thinking: false,
             native_tool_calls: false,
@@ -143,15 +139,11 @@ impl Config {
         Ok(dir)
     }
 
-    /// Initialize directory structure and populate code_base templates.
+    /// Initialize directory structure and populate built-in skills.
     /// Used for both global (~/.litepilot) and project-local (.litepilot) dirs.
     pub fn ensure_dirs_for(workspace: &Path) -> Result<PathBuf> {
         let dir = Self::effective_dir(workspace);
         Self::create_dir_structure(&dir)?;
-
-        // Populate built-in templates on first run
-        let code_base = dir.join("code_base");
-        crate::codebase::builtin::populate_codebase(&code_base)?;
 
         // Always populate skills in global ~/.litepilot/skills/
         let global_dir = Self::config_dir()?;
@@ -161,7 +153,7 @@ impl Config {
     }
 
     fn create_dir_structure(dir: &Path) -> Result<()> {
-        for sub in &["sessions", "cache", "code_base", "skills", "logs"] {
+        for sub in &["sessions", "cache", "skills", "logs"] {
             std::fs::create_dir_all(dir.join(sub))
                 .with_context(|| format!("Creating directory {}", sub))?;
         }
@@ -404,12 +396,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join(".litepilot");
         // Monkey-patch: just verify the subdirectories would be created
-        for sub in &["sessions", "cache", "code_base", "skills"] {
+        for sub in &["sessions", "cache", "skills", "logs"] {
             std::fs::create_dir_all(base.join(sub)).unwrap();
         }
         assert!(base.join("sessions").exists());
         assert!(base.join("cache").exists());
-        assert!(base.join("code_base").exists());
+        assert!(base.join("skills").exists());
     }
 
     use proptest::prelude::*;

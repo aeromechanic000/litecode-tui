@@ -1,7 +1,6 @@
 mod agent;
 mod app;
 mod approval;
-mod codebase;
 mod config;
 mod context;
 mod hooks;
@@ -370,7 +369,7 @@ fn run_headless(
                 println!("---");
 
                 // Apply file changes (Auto mode).
-                let changes = agent::AgentPipeline::parse_file_changes(&sanitized);
+                let changes = agent::parse_file_changes(&sanitized);
                 if !changes.is_empty() {
                     apply_headless_changes(&mut app_state, &changes, &tx);
                 }
@@ -455,7 +454,7 @@ fn run_headless(
                 };
                 let sanitized = agent::tools_parser::sanitize_output(&content);
                 println!("{}", sanitized);
-                let changes = agent::AgentPipeline::parse_file_changes(&sanitized);
+                let changes = agent::parse_file_changes(&sanitized);
                 if !changes.is_empty() {
                     apply_headless_changes(&mut app_state, &changes, &tx);
                 }
@@ -466,16 +465,6 @@ fn run_headless(
                 });
                 app_state.current_session.add_message("assistant", &sanitized);
                 let _ = session::persistence::save_session(&app_state.current_session);
-                done = true;
-            }
-            agent::retry::PipelineResult::AutoSuccess { applied, .. } => {
-                for path in &applied {
-                    println!("  + {}", path);
-                }
-                done = true;
-            }
-            agent::retry::PipelineResult::AutoFailed { error } => {
-                eprintln!("[auto failed] {}", error);
                 done = true;
             }
         }
@@ -808,20 +797,6 @@ fn run_app(
                     render_retry_result(&mut ui_state, r);
                     ui_state.add_output(OutputLine::Separator);
                 }
-                agent::retry::PipelineResult::AutoSuccess { changes, applied } => {
-                    app_state.is_processing = false;
-                    ui_state.stop_thinking();
-                    tracing::info!("auto pipeline success: {} files applied", applied.len());
-                    render_auto_result(&mut ui_state, &changes, &applied);
-                    ui_state.add_output(OutputLine::Separator);
-                }
-                agent::retry::PipelineResult::AutoFailed { error } => {
-                    app_state.is_processing = false;
-                    ui_state.stop_thinking();
-                    tracing::error!("auto pipeline failed: {}", error);
-                    ui_state.add_output(OutputLine::Error(format!("Pipeline failed: {}", error)));
-                    ui_state.add_output(OutputLine::Separator);
-                }
                 agent::retry::PipelineResult::SearchDone { count, .. } => {
                     // Intermediate status — LLM still running
                     tracing::info!("web search: {} results", count);
@@ -911,7 +886,7 @@ fn run_app(
                     }
                     // Handle file changes per mode
                     if !content.is_empty() {
-                        let changes = agent::AgentPipeline::parse_file_changes(&content);
+                        let changes = agent::parse_file_changes(&content);
                         if !changes.is_empty() {
                             for change in &changes {
                                 app_state.working_set.touch(&change.path);
@@ -1694,7 +1669,7 @@ fn run_app(
                                     );
                                     if let Some(ref content) = last_content {
                                         let changes =
-                                            agent::AgentPipeline::parse_file_changes(content);
+                                            agent::parse_file_changes(content);
                                         if changes.is_empty() {
                                             ui_state.add_output(OutputLine::Error(
                                                 "No file changes found in the last response."
@@ -2176,6 +2151,11 @@ fn spawn_plan_then_execute(
     let tools_description = tools::ToolRegistry::new(workspace.clone(), &app_state.config)
         .descriptions_text();
 
+    // Compute the auto-injected skills block on the main thread (it borrows
+    // app_state.skills, which can't travel into the 'static spawned closure).
+    let planner_skills_block =
+        matched_skills_block(&input, &app_state.skills, MAX_MATCHED_SKILL_TOKENS);
+
     tracing::info!(
         "spawn_plan_then_execute: model={}, history_msgs={}, workspace={}, tools_chars={}",
         exec_model,
@@ -2240,12 +2220,16 @@ fn spawn_plan_then_execute(
             },
             input
         );
+        let mut planner_system = apply_plan_prompt(
+            agent::prompts::QUICK_PLAN_SYSTEM,
+            max_file_lines,
+            &tools_description,
+        );
+        // Auto-inject any skills whose trigger keywords match the user's input,
+        // so the plan reflects relevant domain rules (e.g. count-files methodology).
+        planner_system.push_str(&planner_skills_block);
         let messages = vec![
-            ollama::chat::ChatMessage::system(apply_plan_prompt(
-                agent::prompts::QUICK_PLAN_SYSTEM,
-                max_file_lines,
-                &tools_description,
-            )),
+            ollama::chat::ChatMessage::system(planner_system),
             ollama::chat::ChatMessage::user(&user_msg),
         ];
 
@@ -2305,8 +2289,15 @@ fn spawn_execution_with_plan(
     let config = app_state.config.clone();
     let tool_registry = tools::ToolRegistry::new(workspace.clone(), &config);
 
-    // Build system prompt via PromptBuilder (already updated before calling this function)
-    let coding_system = app_state.prompt_builder.build();
+    // Build system prompt via PromptBuilder (already updated before calling this function),
+    // then auto-inject any skills whose trigger keywords match the user's input so the
+    // executor and its final answer reflect relevant domain rules.
+    let mut coding_system = app_state.prompt_builder.build();
+    coding_system.push_str(&matched_skills_block(
+        &input,
+        &app_state.skills,
+        MAX_MATCHED_SKILL_TOKENS,
+    ));
 
     tracing::info!(
         "spawn_execution_with_plan: model={}, plan={} bytes, history_msgs={}, context_window={}, has_context_handle={}",
@@ -2530,9 +2521,35 @@ fn spawn_execution_with_plan(
                 s
             };
 
+            let final_step_directive = if step_num == total_steps {
+                "This is the FINAL step of the plan — your response here is the answer the \
+                 user sees. After any tool calls, give a concise natural-language answer to \
+                 the original request.\n\n"
+            } else {
+                ""
+            };
+
             let user_msg = format!(
-                "Original request: {}\n\nPlan:\n{}\n{}Now execute ONLY step {} of {}: {}\n\nWorkflow for this step:\n1. If previous steps created files, READ them first to recall their content\n2. Generate the content needed for THIS step\n3. Write the result to a file immediately using the format below\n\nOutput file content using this format:\n### FILE: relative/path/to/file\n### ACTION: create|modify\n```\nfile content\n```",
-                input, plan, prev_summary, step_num, total_steps, step_desc,
+                "Original request: {}\n\nPlan:\n{}\n{}Now execute ONLY step {} of {}: {}\n\n\
+                 {}Workflow for this step:\n\
+                 1. If previous steps created files, READ them first to recall their content\n\
+                 2. Use tools (exec_shell, read_file, web_reader, web_search, ...) as needed \
+                 for this step\n\
+                 3. If this step requires creating or modifying a file, output it using the \
+                 format below; otherwise skip the file format\n\
+                 4. ALWAYS end the step with a concise prose answer to what the user asked — \
+                 never end with only a tool call or empty output\n\n\
+                 Output a file ONLY when a file change is needed, using this format:\n\
+                 ### FILE: relative/path/to/file\n\
+                 ### ACTION: create|modify\n\
+                 ```\nfile content\n```",
+                input,
+                plan,
+                prev_summary,
+                step_num,
+                total_steps,
+                step_desc,
+                final_step_directive,
             );
 
             let prompt = if history_prompt.is_empty() {
@@ -2849,6 +2866,54 @@ fn stream_step_with_tools(
     let mut correction_retries = 0usize;
     let mut prev_signature = String::new();
     let mut transport_retries = 0usize;
+    let mut tools_dispatched = 0usize;
+
+    // Final-answer fallback: local models on /api/generate (chat template not applied)
+    // often end a tool-using step with empty or tool-only output — no prose answer to
+    // the user. If tools ran but no answer survived in the candidate content, do one
+    // more /api/generate call explicitly asking for a concise answer. Reuses the cached
+    // context handle so only the appended instruction is evaluated, and streams live
+    // via StreamChunk like any normal round. A no-op when no tools ran.
+    let finalize_with_answer =
+        |candidate: StepResult, ctx: Option<Vec<i64>>, prompt: &str, dispatched: usize| -> StepResult {
+            if dispatched > 0
+                && !crate::agent::tools_parser::has_final_answer(&candidate.content)
+            {
+                tracing::info!(
+                    "stream_step_with_tools: step ended after {} tool dispatch(es) with no \
+                     prose answer — running final-answer fallback",
+                    dispatched
+                );
+                let answer_prompt = format!(
+                    "{}\n\nuser: You have finished gathering information with the tools above. \
+                     Now answer the user's original request concisely in plain prose. \
+                     Do NOT call any tools. Do NOT write files. Just give the direct answer.",
+                    prompt
+                );
+                let answer = stream_single_step_generate(
+                    rt,
+                    http.clone(),
+                    endpoint,
+                    model,
+                    system_prompt.clone(),
+                    answer_prompt,
+                    ctx.clone(),
+                    num_ctx,
+                    think,
+                    tx,
+                );
+                if !answer.content.starts_with("ERROR:") && !answer.content.trim().is_empty() {
+                    return StepResult {
+                        content: answer.content,
+                        context_handle: answer.context_handle.clone().or(ctx),
+                        prompt_eval_count: answer.prompt_eval_count,
+                        eval_count: answer.eval_count,
+                        done_reason: answer.done_reason,
+                    };
+                }
+            }
+            candidate
+        };
 
     for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
         let step_result = stream_single_step_generate(
@@ -2979,7 +3044,12 @@ fn stream_step_with_tools(
                 round,
                 content.chars().count()
             );
-            return step_result;
+            return finalize_with_answer(
+                step_result,
+                current_context.clone(),
+                &current_prompt,
+                tools_dispatched,
+            );
         }
 
         // Valid tool calls — reset retry counter, check for infinite loop.
@@ -2995,7 +3065,12 @@ fn stream_step_with_tools(
                 "stream_step_with_tools round {}: repeating tool signature, finalizing step",
                 round
             );
-            return step_result;
+            return finalize_with_answer(
+                step_result,
+                current_context.clone(),
+                &current_prompt,
+                tools_dispatched,
+            );
         }
         prev_signature = current_sig;
 
@@ -3124,6 +3199,7 @@ fn stream_step_with_tools(
                     result: result.clone(),
                 });
                 tool_result_blocks.push(format_tool_result_block(&result));
+                tools_dispatched += 1;
             }
         } else {
             // validate_params itself errored (shouldn't happen in practice) —
@@ -3154,8 +3230,9 @@ fn stream_step_with_tools(
         }
         appended.push_str(
             "\nuser: Continue the step using the tool result above. Emit ONE <tool_call> block \
-             for the next tool you need (wait for its result before calling the next one), or \
-             finish the step.\n",
+             for the next tool you need (wait for its result before calling the next one). If you \
+             now have enough information to answer the user's request, give the final answer in \
+             plain prose — no more tool calls, no file markers, just answer what was asked.\n",
         );
         current_prompt = format!("{}{}", current_prompt, appended);
     }
@@ -3164,13 +3241,14 @@ fn stream_step_with_tools(
         "stream_step_with_tools: hit MAX_TOOL_ROUNDS_PER_STEP={}, returning last step result",
         MAX_TOOL_ROUNDS_PER_STEP
     );
-    last_step_result.unwrap_or(StepResult {
+    let candidate = last_step_result.unwrap_or(StepResult {
         content: String::new(),
-        context_handle: current_context,
+        context_handle: current_context.clone(),
         prompt_eval_count: None,
         eval_count: None,
         done_reason: None,
-    })
+    });
+    finalize_with_answer(candidate, current_context, &current_prompt, tools_dispatched)
 }
 
 /// Execute one plan step via Ollama's NATIVE tool-calling (`tools=` on `/api/chat`),
@@ -3205,6 +3283,59 @@ fn stream_step_native_tools(
     messages.push(serde_json::json!({ "role": "user", "content": user_message }));
 
     let mut prev_signature = String::new();
+    let mut tools_dispatched = 0usize;
+
+    // Final-answer fallback (mirrors stream_step_with_tools): if tools ran but the
+    // candidate has no prose answer, do one more /api/chat call with NO tool
+    // definitions and an explicit "answer now" instruction — with no tools available
+    // the model must respond in prose. `messages` is passed in (not captured) because
+    // the loop mutates it each round.
+    let finalize_native =
+        |msgs: &[serde_json::Value], candidate: String, dispatched: usize| -> StepResult {
+            if dispatched > 0 && !crate::agent::tools_parser::has_final_answer(&candidate) {
+                tracing::info!(
+                    "stream_step_native_tools: step ended after {} tool dispatch(es) with no \
+                     prose answer — running final-answer fallback",
+                    dispatched
+                );
+                let mut ans_messages = msgs.to_vec();
+                ans_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": "You have finished gathering information with the tools above. \
+                     Now answer the user's original request concisely in plain prose. Do NOT \
+                     call any tools. Do NOT write files. Just give the direct answer."
+                }));
+                let tx_chunk = tx.clone();
+                let answer = rt.block_on(client.chat_native_streaming(
+                    model,
+                    ans_messages,
+                    &[],
+                    |c: &str| {
+                        let _ = tx_chunk.send(agent::retry::PipelineResult::StreamChunk {
+                            content: c.to_string(),
+                        });
+                    },
+                ));
+                if let Ok(resp) = answer {
+                    if !resp.content.trim().is_empty() {
+                        return StepResult {
+                            content: resp.content,
+                            context_handle: None,
+                            prompt_eval_count: None,
+                            eval_count: None,
+                            done_reason: Some("stop".into()),
+                        };
+                    }
+                }
+            }
+            StepResult {
+                content: candidate,
+                context_handle: None,
+                prompt_eval_count: None,
+                eval_count: None,
+                done_reason: Some("stop".into()),
+            }
+        };
 
     for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
         let tx_chunk = tx.clone();
@@ -3236,13 +3367,7 @@ fn stream_step_native_tools(
                 round,
                 response.content.chars().count()
             );
-            return StepResult {
-                content: response.content,
-                context_handle: None,
-                prompt_eval_count: None,
-                eval_count: None,
-                done_reason: Some("stop".into()),
-            };
+            return finalize_native(&messages, response.content, tools_dispatched);
         }
 
         // Dispatch only the FIRST tool call (sequential agent loop — the model must
@@ -3258,13 +3383,7 @@ fn stream_step_native_tools(
                 "stream_step_native_tools round {}: repeating tool signature, finalizing step",
                 round
             );
-            return StepResult {
-                content: response.content,
-                context_handle: None,
-                prompt_eval_count: None,
-                eval_count: None,
-                done_reason: Some("stop".into()),
-            };
+            return finalize_native(&messages, response.content, tools_dispatched);
         }
         prev_signature = signature;
 
@@ -3319,6 +3438,7 @@ fn stream_step_native_tools(
         let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
             result: result.clone(),
         });
+        tools_dispatched += 1;
 
         // Append the tool result so the model can continue.
         messages.push(serde_json::json!({
@@ -3332,13 +3452,7 @@ fn stream_step_native_tools(
         "stream_step_native_tools: hit MAX_TOOL_ROUNDS_PER_STEP={}, returning empty content",
         MAX_TOOL_ROUNDS_PER_STEP
     );
-    StepResult {
-        content: String::new(),
-        context_handle: None,
-        prompt_eval_count: None,
-        eval_count: None,
-        done_reason: None,
-    }
+    finalize_native(&messages, String::new(), tools_dispatched)
 }
 
 /// Format a `ToolResult` as a `<tool_result>` block for inclusion in the next `/api/generate`
@@ -3354,6 +3468,44 @@ fn format_tool_result_block(result: &tools::ToolResult) -> String {
     format!(
         "\n<tool_result tool=\"{}\" call_id=\"{}\">{}</tool_result>",
         result.tool_name, result.call_id, payload
+    )
+}
+
+/// Token budget for auto-injected skill bodies. Keeps the prompt bounded even when
+/// several skills match the user's input.
+const MAX_MATCHED_SKILL_TOKENS: usize = 1500;
+
+/// Build a "## Relevant domain rules" block from skills whose trigger keywords
+/// appear in the user's input (see `SkillRegistry::match_triggers`). Returns an
+/// empty string when nothing matches, so callers can cheaply no-op. Cumulative
+/// body size is capped at `token_cap` (estimated) so a broad input that matches
+/// many skills can't unbounded-bloat the prompt.
+fn matched_skills_block(
+    input: &str,
+    skills: &skills::SkillRegistry,
+    token_cap: usize,
+) -> String {
+    let matched = skills.match_triggers(input);
+    if matched.is_empty() {
+        return String::new();
+    }
+    let mut total = 0usize;
+    let mut bodies: Vec<String> = Vec::new();
+    for s in matched {
+        let body = format!("### Skill: {} ({})\n{}", s.name, s.description, s.content);
+        let cost = util::text::estimate_tokens(&body);
+        if total + cost > token_cap {
+            break;
+        }
+        total += cost;
+        bodies.push(body);
+    }
+    if bodies.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Relevant domain rules (auto-injected from skills)\n{}",
+        bodies.join("\n\n")
     )
 }
 
@@ -3529,7 +3681,7 @@ fn render_retry_result(ui_state: &mut ui::UiState, result: agent::retry::RetryRe
     ui_state.add_output(OutputLine::Assistant(content.clone()));
 
     // If the response contains file changes, present them for review
-    let changes = agent::AgentPipeline::parse_file_changes(&content);
+    let changes = agent::parse_file_changes(&content);
     if !changes.is_empty() {
         tracing::info!(
             "retry path: detected {} file change(s) in response",
@@ -3726,159 +3878,6 @@ fn spawn_request_for_mode(
     // Edit modes all flow through here, with mode-specific behavior enforced inside
     // spawn_plan_then_execute / spawn_execution_with_plan.
     spawn_plan_then_execute(app_state, client, input, tx);
-}
-
-/// Spawn the full plan→implement→audit pipeline on a background thread.
-#[allow(dead_code)]
-fn spawn_auto_pipeline(
-    app_state: &AppState,
-    input: &str,
-    tx: mpsc::Sender<agent::retry::PipelineResult>,
-) {
-    let workspace = app_state.workspace.clone();
-    let endpoint = app_state.config.ollama_endpoint.clone();
-    let connect_timeout = app_state.config.connect_timeout;
-    let max_retries = app_state.config.max_retries;
-    let input = input.to_string();
-    let web_search_enabled = app_state.web_search_enabled;
-    let max_search_tokens = app_state.config.max_search_context_tokens;
-
-    // Clone config values needed by the background thread
-    let exec_model = app_state.config.exec_model.clone();
-    let eval_model = app_state.config.effective_eval_model().to_string();
-
-    tracing::info!(
-        "spawn_auto_pipeline: exec={}, eval={}, max_retries={}, web_search={}",
-        exec_model,
-        eval_model,
-        max_retries,
-        web_search_enabled
-    );
-
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = tx.send(agent::retry::PipelineResult::AutoFailed {
-                    error: format!("Runtime error: {}", e),
-                });
-                return;
-            }
-        };
-
-        // Run web search if enabled
-        let user_message = if web_search_enabled {
-            let search_ctx = rt.block_on(run_web_search(&input, max_search_tokens));
-            if !search_ctx.is_empty() {
-                let _ = tx.send(agent::retry::PipelineResult::SearchDone {
-                    count: search_ctx.lines().filter(|l| l.starts_with('[')).count(),
-                    context: search_ctx.clone(),
-                });
-            }
-            format!("{}\n{}", search_ctx, input)
-        } else {
-            input
-        };
-
-        let bg_config = config::Config {
-            ollama_endpoint: endpoint,
-            connect_timeout,
-            exec_model,
-            eval_model,
-            max_retries,
-            ..config::Config::default()
-        };
-        let bg_client = match ollama::OllamaClient::new(&bg_config) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(agent::retry::PipelineResult::AutoFailed {
-                    error: format!("Client error: {}", e),
-                });
-                return;
-            }
-        };
-        let sandbox = sandbox::Sandbox::new(workspace.clone());
-
-        let result = rt.block_on(agent::auto_run::run_auto_pipeline(
-            &bg_client,
-            &bg_config,
-            &sandbox,
-            workspace,
-            &user_message,
-            "",   // no project context for now
-            None, // no codebase for now
-        ));
-
-        match result {
-            Ok(changes) => {
-                tracing::info!("auto pipeline produced {} file change(s)", changes.len());
-                for c in &changes {
-                    tracing::info!(
-                        "  auto: {} {} ({} bytes)",
-                        c.action,
-                        c.path.display(),
-                        c.content.len()
-                    );
-                }
-                let applied: Vec<String> = changes
-                    .iter()
-                    .map(|c| format!("{} ({})", c.path.display(), c.action))
-                    .collect();
-                let _ = tx.send(agent::retry::PipelineResult::AutoSuccess { changes, applied });
-            }
-            Err(e) => {
-                tracing::error!("auto pipeline failed: {}", e);
-                let _ = tx.send(agent::retry::PipelineResult::AutoFailed {
-                    error: e.to_string(),
-                });
-            }
-        }
-    });
-}
-
-/// Render auto pipeline results in the chat panel.
-fn render_auto_result(
-    ui_state: &mut ui::UiState,
-    changes: &[agent::FileChange],
-    applied: &[String],
-) {
-    if changes.is_empty() {
-        ui_state.add_output(OutputLine::System(
-            "Pipeline completed but produced no changes.".into(),
-        ));
-        return;
-    }
-
-    ui_state.add_output(OutputLine::System(format!(
-        "Auto pipeline: {} file(s) generated and applied.",
-        applied.len()
-    )));
-    for path in applied {
-        ui_state.add_output(OutputLine::System(format!("  + {}", path)));
-    }
-    for change in changes {
-        // Show content summary
-        let line_count = change.content.lines().count();
-        ui_state.add_output(OutputLine::Assistant(format!(
-            "### FILE: {}\n### ACTION: {}\n```{}\n```\n",
-            change.path.display(),
-            change.action,
-            if line_count > 20 {
-                format!(
-                    "{} ({} lines)",
-                    &change
-                        .content
-                        .lines()
-                        .take(20)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    line_count
-                )
-            } else {
-                change.content.clone()
-            }
-        )));
-    }
 }
 
 /// Handle /run <command> — execute a shell command via the sandbox.
@@ -4752,6 +4751,50 @@ mod tests {
                 desc
             );
         }
+    }
+
+    #[test]
+    fn matched_skills_block_empty_when_no_match() {
+        let reg = skills::SkillRegistry::from_skills(vec![skills::Skill {
+            name: "review".into(),
+            description: "Review code".into(),
+            trigger: "review".into(),
+            content: "body".into(),
+        }]);
+        // No trigger keyword in input → empty block.
+        assert_eq!(matched_skills_block("count files please", &reg, 1500), "");
+    }
+
+    #[test]
+    fn matched_skills_block_includes_matching_skill() {
+        let reg = skills::SkillRegistry::from_skills(vec![skills::Skill {
+            name: "count-files".into(),
+            description: "Count files accurately".into(),
+            trigger: "count, how many".into(),
+            content: "Never count . or .. as files.".into(),
+        }]);
+        let block = matched_skills_block("count how many files", &reg, 1500);
+        assert!(block.contains("## Relevant domain rules"));
+        assert!(block.contains("count-files"));
+        assert!(block.contains("Never count . or .."));
+    }
+
+    #[test]
+    fn matched_skills_block_caps_total_tokens() {
+        // Two matching skills; a tiny token cap admits none (each body exceeds it).
+        let mk = |name: &str, body: &str| skills::Skill {
+            name: name.into(),
+            description: "d".into(),
+            trigger: "count".into(),
+            content: body.into(),
+        };
+        let reg = skills::SkillRegistry::from_skills(vec![
+            mk("a", "x".repeat(200).as_str()),
+            mk("b", "y".repeat(200).as_str()),
+        ]);
+        // token_cap so small neither body fits → empty (we break before adding any).
+        let block = matched_skills_block("count files", &reg, 1);
+        assert_eq!(block, "");
     }
 
     /// Phase D: routing helpers are gone. This test exists to fail loudly if anyone
