@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -16,10 +15,10 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
-    /// Omitted when false. Sending an explicit `think:false`/`think:true` crashes
-    /// some Ollama builds with thinking models (500 {"error":"EOF"}); omitting it
-    /// lets Ollama use the model default and avoids the crash. Set `enable_thinking`
-    // to send `think:true`.
+    /// Always false: sending `think:false`/`think:true` crashes some Ollama builds
+    /// with thinking models (500 {"error":"EOF"}); omitting it would let Ollama use
+    /// the model default, but we serialize as false and skip via
+    /// `skip_serializing_if`. Ollama's default behaviour applies.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     think: bool,
     options: ChatOptions,
@@ -566,16 +565,16 @@ impl OllamaClient {
         })
     }
 
-    /// Streaming `/api/chat` with native Ollama tool definitions, for the opt-in
-    /// native-tool executor path (`config.native_tool_calls`).
+    /// Streaming `/api/chat` with native Ollama tool definitions — the executor's
+    /// only tool path.
     ///
     /// Accepts raw `serde_json::Value` messages so the full tool conversation can
     /// be represented — including assistant turns carrying a `tool_calls` array and
     /// `tool`-role result turns, which the `ChatMessage` struct cannot express.
     ///
-    /// `think` is intentionally OMITTED: sending it (true or false) crashes some
-    /// Ollama builds with thinking models (500 {"error":"EOF"}), while native tool
-    /// calling works reliably with the field omitted.
+    /// `think` is intentionally OMITTED from the request body: sending it (true or
+    /// false) crashes some Ollama builds with thinking models (500 {"error":"EOF"}),
+    /// while native tool calling works reliably with the field omitted.
     pub async fn chat_native_streaming(
         &self,
         model: &str,
@@ -761,357 +760,6 @@ impl OllamaClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// /api/generate types — for KV cache context management
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize)]
-struct GenerateRequest {
-    model: String,
-    prompt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<Vec<i64>>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
-    /// Omitted when false. Sending an explicit `think:false`/`think:true` crashes
-    /// some Ollama builds with thinking models (500 {"error":"EOF"}); omitting it
-    /// lets Ollama use the model default and avoids the crash. Set `enable_thinking`
-    /// to send `think:true`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    think: bool,
-    options: ChatOptions,
-}
-
-/// A streaming chunk from `/api/generate`.
-#[derive(Debug, Clone)]
-pub struct GenerateChunk {
-    pub response: String,
-    /// Reasoning/thinking content from hybrid models. Emitted in the `thinking`
-    /// JSON field (separate from `response`) when thinking is enabled. Captured so
-    /// a thinking-only response is diagnosable rather than silently lost.
-    #[allow(dead_code)]
-    pub thinking: String,
-    pub done: bool,
-    pub done_reason: Option<String>,
-    #[allow(dead_code)]
-    pub model: String,
-    /// Only present on the final chunk (done=true)
-    pub context: Option<Vec<i64>>,
-    /// Tokens re-computed (cache miss) — only on final chunk
-    pub prompt_eval_count: Option<usize>,
-    /// Tokens generated — only on final chunk
-    pub eval_count: Option<usize>,
-}
-
-/// A non-streaming response from `/api/generate`.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct GenerateResponse {
-    pub response: String,
-    pub model: String,
-    pub context: Vec<i64>,
-    pub prompt_eval_count: usize,
-    pub eval_count: usize,
-}
-
-impl OllamaClient {
-    /// Streaming generation via `/api/generate` with optional KV cache context handle.
-    ///
-    /// The `system_prompt` is passed in the `system` field and `prompt` contains the
-    /// concatenated conversation text. When `context_handle` is `Some`, Ollama will
-    /// attempt prefix matching against the cached KV tensors.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_stream(
-        http: reqwest::Client,
-        endpoint: String,
-        model: String,
-        system_prompt: Option<String>,
-        prompt: String,
-        context_handle: Option<Vec<i64>>,
-        num_ctx: u64,
-        think: bool,
-        cancel: watch::Receiver<bool>,
-    ) -> impl futures::Stream<Item = Result<GenerateChunk>> {
-        let url = format!("{}/api/generate", endpoint);
-
-        tracing::info!(
-            "generate request: model={}, num_ctx={}, prompt_chars={}, system_chars={}, context_handle={}, think={}",
-            model,
-            num_ctx,
-            prompt.chars().count(),
-            system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0),
-            if context_handle.is_some() { format!("Some({} tokens)", context_handle.as_ref().unwrap().len()) } else { "None".into() },
-            think
-        );
-
-        let body = GenerateRequest {
-            model: model.clone(),
-            prompt,
-            context: context_handle,
-            stream: true,
-            system: system_prompt,
-            think,
-            options: ChatOptions {
-                num_ctx,
-                num_predict: -1,
-            },
-        };
-
-        async_stream::stream! {
-            let request_start = std::time::Instant::now();
-            let resp = match http.post(&url).json(&body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("generate connect failed: {} (latency_ms={})", e, request_start.elapsed().as_millis());
-                    yield Err(anyhow::anyhow!("Generate stream connect failed: {}", e));
-                    return;
-                }
-            };
-
-            let status = resp.status();
-            tracing::info!(
-                "generate response: status={} connect_ms={}",
-                status,
-                request_start.elapsed().as_millis()
-            );
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                tracing::error!("generate http error: status={} body={:.500}", status, text);
-                yield Err(anyhow::anyhow!("Ollama generate stream error: {}: {}", status, text));
-                return;
-            }
-
-            let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
-            let read_timeout = std::time::Duration::from_secs(300);
-
-            let mut total_bytes: usize = 0;
-            const MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024;
-            let start = std::time::Instant::now();
-            const MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-            let mut error_count: usize = 0;
-            const MAX_ERRORS: usize = 5;
-            let mut chunk_count: usize = 0;
-            let mut content_chars: usize = 0;
-            let mut thinking_chars: usize = 0;
-            let mut first_content_logged = false;
-
-            loop {
-                let cancelled = *cancel.borrow();
-                if cancelled {
-                    tracing::info!("generate cancelled by user (chunks={}, content_chars={})", chunk_count, content_chars);
-                    yield Ok(GenerateChunk {
-                        response: String::new(),
-                        thinking: String::new(),
-                        done: true,
-                        done_reason: Some("cancel".into()),
-                        model: model.clone(),
-                        context: None,
-                        prompt_eval_count: None,
-                        eval_count: None,
-                    });
-                    return;
-                }
-
-                if start.elapsed() > MAX_DURATION {
-                    tracing::error!("generate exceeded 30min cap (chunks={}, content_chars={})", chunk_count, content_chars);
-                    yield Err(anyhow::anyhow!(
-                        "Generate stream exceeded maximum duration (30 min)"
-                    ));
-                    return;
-                }
-
-                let chunk_result = match tokio::time::timeout(read_timeout, stream.next()).await {
-                    Ok(Some(result)) => result,
-                    Ok(None) => {
-                        tracing::warn!(
-                            "generate stream ended without done flag (chunks={}, content_chars={}, total_bytes={})",
-                            chunk_count, content_chars, total_bytes
-                        );
-                        yield Ok(GenerateChunk {
-                            response: String::new(),
-                            thinking: String::new(),
-                            done: true,
-                            done_reason: Some("stream_end".into()),
-                            model: model.clone(),
-                            context: None,
-                            prompt_eval_count: None,
-                            eval_count: None,
-                        });
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "generate stream timed out (no data for 300s, chunks={}, content_chars={})",
-                            chunk_count, content_chars
-                        );
-                        yield Err(anyhow::anyhow!("Generate stream timed out (no data for 300s)"));
-                        return;
-                    }
-                };
-
-                let bytes = match chunk_result {
-                    Ok(b) => b,
-                    Err(_) => {
-                        error_count += 1;
-                        if error_count >= MAX_ERRORS {
-                            tracing::error!("generate too many stream errors ({})", error_count);
-                            yield Err(anyhow::anyhow!(
-                                "Too many generate stream errors ({})",
-                                error_count
-                            ));
-                            return;
-                        }
-                        continue;
-                    }
-                };
-
-                total_bytes += bytes.len();
-                chunk_count += 1;
-                if total_bytes > MAX_CONTENT_BYTES {
-                    yield Err(anyhow::anyhow!(
-                        "Generate stream exceeded maximum content size (10 MB)"
-                    ));
-                    return;
-                }
-
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    match serde_json::from_str::<serde_json::Value>(&line) {
-                        Ok(val) => {
-                            let response = val.get("response")
-                                .and_then(|r| r.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let thinking = val.get("thinking")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if !thinking.is_empty() {
-                                thinking_chars += thinking.chars().count();
-                            }
-                            let done = val.get("done")
-                                .and_then(|d| d.as_bool())
-                                .unwrap_or(false);
-                            let done_reason = val.get("done_reason")
-                                .and_then(|d| d.as_str())
-                                .map(|s| s.to_string());
-                            let resp_model = val.get("model")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or(&model)
-                                .to_string();
-
-                            if !response.is_empty() {
-                                content_chars += response.chars().count();
-                                if !first_content_logged {
-                                    first_content_logged = true;
-                                    tracing::info!(
-                                        "generate first chunk: latency_ms={} len={}",
-                                        request_start.elapsed().as_millis(),
-                                        response.chars().count()
-                                    );
-                                }
-                                tracing::debug!(
-                                    "generate chunk: len={} cumulative_chars={}",
-                                    response.chars().count(),
-                                    content_chars
-                                );
-                            }
-
-                            // Extract eval stats (present on final chunk)
-                            let context = if done {
-                                val.get("context")
-                                    .and_then(|c| c.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|v| v.as_i64())
-                                            .collect()
-                                    })
-                            } else {
-                                None
-                            };
-                            let prompt_eval_count = if done {
-                                val.get("prompt_eval_count").and_then(|v| v.as_u64()).map(|v| v as usize)
-                            } else {
-                                None
-                            };
-                            let eval_count = if done {
-                                val.get("eval_count").and_then(|v| v.as_u64()).map(|v| v as usize)
-                            } else {
-                                None
-                            };
-
-                            if done {
-                                if content_chars == 0 {
-                                    tracing::warn!(
-                                        "generate done with EMPTY response: reason={} chunks={} total_bytes={} thinking_chars={} total_ms={}",
-                                        done_reason.as_deref().unwrap_or("(none)"),
-                                        chunk_count, total_bytes, thinking_chars,
-                                        request_start.elapsed().as_millis()
-                                    );
-                                    if thinking_chars > 0 {
-                                        tracing::warn!(
-                                            "generate EMPTY response had {} thinking chars — model produced only \
-                                             reasoning (thinking enabled?). Set think:false or check model config.",
-                                            thinking_chars
-                                        );
-                                    }
-                                } else {
-                                    tracing::info!(
-                                        "generate done: chars={} prompt_eval={:?} eval={:?} reason={} chunks={} total_ms={}",
-                                        content_chars,
-                                        prompt_eval_count,
-                                        eval_count,
-                                        done_reason.as_deref().unwrap_or("(none)"),
-                                        chunk_count,
-                                        request_start.elapsed().as_millis()
-                                    );
-                                }
-                            }
-
-                            yield Ok(GenerateChunk {
-                                response,
-                                thinking,
-                                done,
-                                done_reason,
-                                model: resp_model,
-                                context,
-                                prompt_eval_count,
-                                eval_count,
-                            });
-
-                            if done {
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            error_count += 1;
-                            if error_count >= MAX_ERRORS {
-                                yield Err(anyhow::anyhow!(
-                                    "JSON parse error in generate: {} in line: {}",
-                                    e, line
-                                ));
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,7 +889,6 @@ mod tests {
             name: tc.name.clone(),
             call_id: "native-0".into(),
             parameters: tc.arguments.clone(),
-            parse_error: None,
         };
         assert_eq!(tool_call.name, "exec_shell");
         assert_eq!(tool_call.call_id, "native-0");

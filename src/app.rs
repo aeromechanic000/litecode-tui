@@ -90,7 +90,11 @@ pub struct AppState {
     pub awaiting_other_input: bool,
     pub snapshot_manager: crate::snapshot::SnapshotManager,
     pub event_sink: crate::hooks::JsonlSink,
-    pub context_manager: crate::ollama::ContextManager,
+    /// Rough estimate of the last request's prompt token count, used to
+    /// compute `ctx:N%` against `config.context_window_limit`. Not a KV-cache
+    /// measurement — native tool calling goes through `/api/chat`, which does
+    /// not expose the KV-cache context handle.
+    pub total_prompt_tokens: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +158,7 @@ impl AppState {
             awaiting_destructive_confirm: false,
             awaiting_other_input: false,
             snapshot_manager: crate::snapshot::SnapshotManager::new(&workspace, &config_dir),
-            context_manager: crate::ollama::ContextManager::new(),
+            total_prompt_tokens: 0,
             event_sink: crate::hooks::JsonlSink::open(
                 &config_dir.join("logs").join("events.jsonl"),
             )

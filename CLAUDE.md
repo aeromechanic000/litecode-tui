@@ -22,7 +22,7 @@ src/
 │                        event loop with mpsc channel for non-blocking LLM calls,
 │                        message queue for buffered input during processing
 ├── app.rs               AppState: mode, config, processing state, pending queue,
-│                        ContextManager for KV cache context handle tracking
+│                        total_prompt_tokens (drives the ctx:% status indicator)
 ├── config.rs            Config struct (serde TOML), defaults, dir management,
 │                        project-local (.litepilot) + global (~/.litepilot) loading
 ├── context.rs           Message history management: build_messages (budget-aware),
@@ -37,13 +37,14 @@ src/
 │   └── theme.rs         Theme struct with configurable primary/accent/warning colors
 │
 ├── ollama/
-│   ├── mod.rs           OllamaClient + ContextManager (KV cache handle lifecycle,
-│   │                    cache hit rate, context usage tracking, static prefix hash)
-│   │                    tokenize() for accurate token counting via /api/tokenize
-│   ├── chat.rs          /api/chat (blocking, for skills) + /api/generate (streaming,
-│   │                    with KV cache context handle reuse) + chat_native_streaming
-│   │                    (native tool-calling path for thinking models). GenerateChunk
-│   │                    carries prompt_eval_count, eval_count, context on final chunk.
+│   ├── mod.rs           OllamaClient. tokenize() for accurate token counting via
+│   │                    /api/tokenize (currently unused).
+│   ├── chat.rs          /api/chat (non-streaming, for planner and skills) +
+│   │                    chat_native_streaming (the only executor path). The
+│   │                    `think` field is intentionally omitted from both request
+│   │                    types: sending it crashes some Ollama builds with thinking
+│   │                    models (500 {"error":"EOF"}). Ollama applies the model
+│   │                    default, which works reliably for native tool calling.
 │   └── model.rs         ModelInfo, ModelSize classification (Small/Medium/Large),
 │                        context window estimation, parameter count heuristics
 │
@@ -51,10 +52,11 @@ src/
 │   ├── mod.rs           Agent module root: FileChange + parse_file_changes() (extracts
 │   │                    ### FILE:/### ACTION: blocks). Submodules: diagnostics, prompts,
 │   │                    retry, summarizer, syntax, tools_parser
-│   ├── tools_parser.rs  Parse text/JSON tool calls from LLM output + sanitize_output()
-│   │                    scrubs forged tool call markers from display; ThinkStripper
-│   │                    removes inline <think> reasoning blocks from streamed responses;
-│   │                    has_final_answer() drives the final-answer fallback
+│   ├── tools_parser.rs  sanitize_output() scrubs forged tool-call markers from
+│   │                    display (native tool calls arrive via Ollama's structured
+│   │                    `tool_calls` array, but models can still echo forged markers
+│   │                    in their content); has_final_answer() drives the
+│   │                    final-answer fallback.
 │   ├── prompts.rs       System prompts per model tier, model-size-adaptive templates
 │   ├── retry.rs         chat_with_retry() with exponential backoff,
 │   │                    ErrorClass (Retryable/Permanent) error classification,
@@ -110,44 +112,23 @@ src/
 
 ---
 
-## KV Cache Context Management
+## Context Usage Tracking
 
-The streaming path uses `/api/generate` (not `/api/chat`) to gain manual control over the KV cache context handle. The `/api/chat` endpoint hides the `context` field internally, preventing cache reuse across turns.
+The executor uses `/api/chat` (native tool calling). That endpoint does not expose
+Ollama's KV-cache `context` handle, so LitePilot does not track KV-cache hit-rate or
+perform manual prefix reuse. What it *does* track:
 
-### Context Handle Lifecycle
+- `AppState.total_prompt_tokens` — rough heuristic estimate of the last request's
+  prompt size, fed from `PipelineResult::StreamMeta`.
+- Status bar shows `ctx:N%` where `N = total_prompt_tokens / context_window_limit * 100`,
+  warning-colored above 80%, red at 100%.
+- Context-overflow warnings emitted from the `StreamMeta` handler in `src/main.rs`:
+  - 80%: `Context NN% full (T/W tokens). Consider /clear to start fresh.`
+  - 100%: `Context OVERFLOW! NN% of window used (T/W tokens). Use /clear to reset.`
+- `/clear` resets `total_prompt_tokens = 0` and the conversation history.
 
-```
-First request (new session):
-  POST /api/generate { model, prompt, system, stream: true }
-  → Response final chunk: context=[114, 514, ...], prompt_eval_count=1024
-
-Subsequent requests:
-  POST /api/generate { model, prompt, system, context=[114,514,...], stream: true }
-  → Ollama prefix-matches against cached KV tensors
-  → Response final chunk: context=[999, 888, ...], prompt_eval_count=64
-  → Old handle discarded, new handle stored
-
-/clear:
-  ContextManager.clear() → handle = None, history cleared
-  Next request omits context field → fresh session
-```
-
-### ContextManager (`ollama/mod.rs`)
-
-Tracks: `context_handle`, `total_prompt_tokens`, `last_prompt_eval_count`, `last_model`, `static_prefix_hash`.
-
-- `context_handle_for_model(model)` — returns handle only if it matches the model (incompatible across models)
-- `update_from_response()` — stores new handle, replaces old, updates eval stats
-- `cache_hit_rate()` — `(total - prompt_eval_count) / total * 100%`
-- `context_usage_percent(window)` — current usage vs model's context window
-- `set_static_prefix_hash(hash)` — tracks static prompt prefix hash, warns on change (KV cache miss)
-
-### Display in UI
-
-- After each response: `KV cache: 94.2% hit (1920 cached, 128 recomputed, 256 generated)`
-- Warning at 80%: `Context 82% full (3328/4096 tokens). Consider /clear to start fresh.`
-- Error at 100%: `Context OVERFLOW! Use /clear to reset.`
-- Status bar shows `ctx:N%` with warning color when > 80%
+The estimate is approximate (heuristic token counter, not the model's tokenizer). It
+exists for at-a-glance context pressure, not for billing/precision.
 
 ---
 
@@ -157,129 +138,87 @@ There is **one** execution pipeline: plan-then-execute (`spawn_plan_then_execute
 `spawn_execution_with_plan`). Every free-text request flows through it, regardless of
 mode (Plan / Edit / Auto) or whether tools are needed.
 
-### Tool awareness via prompt engineering on `/api/generate` (default)
+### Tool awareness (native tool calling)
 
-By default, tool calls are enabled without native `/api/chat` tool-calling. Both phases
-are tool-aware through prompt text:
+The planner and executor both flow through `/api/chat`. The executor uses Ollama's
+**native tool-calling** (`tools=` field):
 
 - **Planner**: `QUICK_PLAN_SYSTEM` interpolates a `{TOOLS}` block — a prose listing of
   tool names + descriptions from `ToolRegistry::descriptions_text()`. The planner does
   not call tools; it emits text steps that reference them (e.g. "Use web_reader to
-  fetch https://…"). See `apply_plan_prompt()` in `src/main.rs`.
+  fetch https://…"). The planner's request does not include `tools=`.
 
-- **Executor** (text tool path, default): `base_identity_prompt()` (`src/prompt.rs`)
-  teaches the LLM to emit text-format `<tool_call name="…" call_id="…">{…}</tool_call>`
-  blocks. The wrapper `stream_step_with_tools` (`src/main.rs`) wraps the unchanged
-  `/api/generate` primitive (`stream_single_step_generate`), parsing each step's output
-  via `parse_tool_calls_with_diagnostics` and dispatching through `ToolRegistry`.
+- **Executor**: `spawn_execution_with_plan` calls `stream_step_native_tools`
+  (`src/main.rs`) → `OllamaClient::chat_native_streaming` (`src/ollama/chat.rs`) with
+  `ToolRegistry::ollama_tool_definitions()`. The model returns structured `tool_calls`
+  (parsed into `NativeToolCall`); the loop dispatches the first one, appends the
+  assistant turn (with its `tool_calls`) and a `tool`-role result message, then
+  re-calls `/api/chat` so the model sees the result. Terminates when the model returns
+  no tool calls (content is the step's final answer) or `MAX_TOOL_ROUNDS_PER_STEP = 5`
+  rounds elapse. Signature-repeat detection (same `name:arguments` as the previous
+  round) also terminates the loop.
 
-### Native tool calling (opt-in, for thinking models)
+- **Why native, not text-format:** thinking models (e.g. `qwen3.5`) put tool intent
+  into their reasoning and stop with empty content on `/api/generate`; they emit native
+  tool calls reliably. Non-thinking models also work — native tool calling is supported
+  on Ollama 0.4+ across model families.
 
-When `config.native_tool_calls = true`, the executor uses Ollama's **native**
-tool-calling (`tools=` field on `/api/chat`) instead of the text-format path:
+- **Tradeoff:** `/api/chat` does not expose the KV-cache `context` handle, so manual
+  prefix reuse is bypassed. Context usage is shown as a token estimate (see above).
 
-- `stream_step_native_tools` (`src/main.rs`) calls `OllamaClient::chat_native_streaming`
-  (`src/ollama/chat.rs`) with `ToolRegistry::ollama_tool_definitions()`. The model
-  returns structured `tool_calls` (parsed into `NativeToolCall`); the loop dispatches
-  the first, appends the assistant turn + `tool`-role result to the message history,
-  and re-calls until the model returns no tool calls.
-- **Why it exists:** thinking models (e.g. qwen3.5) will not emit text-format
-  `<tool_call>` blocks on `/api/generate` — they put tool intent in their reasoning and
-  stop with empty content, and on some Ollama builds sending the `think` field crashes
-  the runner (`500 {"error":"EOF"}`). They emit native tool calls reliably.
-- **Tradeoff:** this path uses `/api/chat`, which does NOT expose the KV-cache `context`
-  handle, so manual cache reuse is bypassed (the returned `StepResult.context_handle`
-  is always `None`). The default text path keeps the `/api/generate` KV-cache design.
-- The `think` field is **omitted** on both request types when `enable_thinking` is false
-  (sending it triggers the runner crash); `enable_thinking = true` sends `think: true`.
+### Per-step tool loop (`stream_step_native_tools`)
 
-### Per-step tool loop
+For each plan step, up to `MAX_TOOL_ROUNDS_PER_STEP = 5` rounds:
 
-For each plan step, `stream_step_with_tools` runs up to `MAX_TOOL_ROUNDS_PER_STEP = 5`
-rounds. Each round:
+1. Call `chat_native_streaming` with `tools = ollama_tool_definitions()`. Streamed
+   content tokens emit `PipelineResult::StreamChunk` for live display.
+2. If `response.tool_calls.is_empty()` → step done; the content is the answer
+   (subject to the final-answer fallback below).
+3. Else take the **first** tool call only (sequential agent loop — the model must see
+   a tool's result before emitting a dependent call).
+4. Echo the assistant turn + `tool_calls` to the message history.
+5. Dispatch the call via `ToolRegistry::execute` → emit `ToolStart` then
+   `ToolResultReady`.
+6. Append the `tool`-role result message and re-call.
 
-1. Call `stream_single_step_generate` (which itself owns truncation continuation and
-   KV-cache context-handle threading).
-2. Parse the assistant output for `<tool_call>` blocks.
-3. If no calls and not a failed-attempt → step done, return content.
-4. If no calls but `is_failed_attempt()` and `correction_retries < 2` → append a
-   correction prompt, retry the same round.
-5. If calls found → validate name and params per call → emit `PipelineResult::ToolStart`
-   → dispatch via `ToolRegistry::execute` → emit `PipelineResult::ToolResultReady`.
-6. Build the next-round prompt by appending the verbatim assistant output, one
-   `<tool_result tool="…" call_id="…">{…}</tool_result>` block per call, and a
-   `user: Continue the step…` instruction.
-7. Pass the previous round's `StepResult.context_handle` as input. Ollama prefix-matches
-   the cached KV tensors and only evaluates the delta.
-
-Termination caps: `MAX_TOOL_ROUNDS_PER_STEP = 5`, `MAX_TOOL_CORRECTION_RETRIES = 2`,
-plus signature-repeat detection (same tool name + params as previous round).
+**Final-answer fallback**: if tools ran but the candidate content lacks a prose answer
+(`tools_parser::has_final_answer()` returns false — fewer than 3 non-tool/file/code-fence
+words), one more `/api/chat` call is made with empty `tools=[]` and an explicit
+"answer now in prose" instruction. The model must respond in plain text. A no-op when
+no tools ran.
 
 ### Pipeline flow
 
 1. Exec model generates a numbered plan via `OllamaClient::chat` (with `{TOOLS}` in
-   the system prompt — no `tools=` field).
+   the system prompt, no `tools=` field).
 2. Plan displayed for approval (Edit mode) or auto-executed (Plan / Auto mode).
-3. Each step streamed via `/api/generate` with KV cache context handle.
-4. Steps carry the context handle forward between iterations.
-5. Within a step, tool rounds chain the context handle forward for cache reuse.
+3. Each step executed via `stream_step_native_tools`.
+4. `PipelineResult::StreamMeta` emitted at the end with a rough prompt-token estimate.
 
 ---
 
 ## Tool Call Sanitization
 
-`tools_parser::sanitize_output()` scrubs forged tool call markers from LLM text output
-before display. Incomplete `<tool_call` tags without closing markers are replaced with
-`[invalid tool call]`. Applied at the display layer in `StreamChunk` and `StreamDone`
-processing, so the parser still sees raw input for tool dispatch but the user never sees
-forged markers.
+`tools_parser::sanitize_output()` scrubs forged tool-call markers from LLM text output
+before display. Even with native tool calling, a model can echo forged
+`<tool_call>` markers in its content — incomplete `<tool_call` tags without closing
+markers are replaced with `[invalid tool call]`. Applied at the display layer
+(`StreamChunk` and `StreamDone` handling), so the structured dispatcher is unaffected.
 
 ---
 
-## Thinking Block Stripping (`enable_thinking`)
+## Thinking Field Handling
 
-Hybrid models (e.g. qwen3.5) can emit reasoning. Two channels are handled separately:
-
-- **Ollama's `thinking` field** (v0.9+): carried on `GenerateChunk.thinking` for
-  diagnostics/logging but never added to the response — so field-separated thinking
-  never reaches display or the tool parser.
-- **Inline `<think>…</think>` blocks** in the response text: stripped by
-  `tools_parser::ThinkStripper`, a stateful streaming parser used in
-  `stream_single_step_generate`. It handles tags split across chunks and, by design,
-  **keeps the content of any `<think>` left unclosed at stream end** as response
-  (dropping only the opener tag) so an incomplete thinking block never silently loses
-  data. Stray `</think>` closers are also removed. `<tool_call>` blocks are untouched.
-
-The request-level `think` flag is **omitted when false** (`#[serde(skip_serializing_if = "Not::not")]`
-on both `GenerateRequest` and `ChatRequest`). Sending an explicit `think:false`/`think:true`
-crashes some Ollama builds with thinking models (`500 {"error":"EOF"}`); omitting it lets
-Ollama use the model default and avoids the crash. `enable_thinking = true` is the only
-path that sends `think: true`. (The native tool path, `chat_native_streaming`, builds its
-body as raw JSON and also omits `think`.)
-
-`enable_thinking` (default `false`) in config threads through `spawn_execution_with_plan`
-and `spawn_llm_request` → `stream_step_with_tools` → `stream_single_step_generate` →
-`generate_stream`. With it off, no `<think>` tags appear and the stripper is a no-op.
-
-> Caveat: on `/api/generate` the model's chat template is not applied, so thinking is
-> unreliable here (the model may think briefly then emit an empty `response`), and thinking
-> models will not emit text-format tool calls on this path. For thinking models like
-> qwen3.5, set `native_tool_calls = true` to use the native tool-calling path (above),
-> which uses `/api/chat` with the chat template applied and works reliably. The default
-> `think:false` text path is unaffected and suits non-thinking models.
+Ollama's `think` field is **omitted** from every `/api/chat` request body.
+`ChatRequest` uses `#[serde(skip_serializing_if = "std::ops::Not::not")]` with the
+field always set to `false`, and `chat_native_streaming`'s raw JSON body omits the
+field entirely. Sending `think:true` or `think:false` explicitly crashes some Ollama
+builds with thinking models (`500 {"error":"EOF"}`); omitting it lets Ollama apply the
+model default, which works reliably for native tool calling. There is no
+`enable_thinking` config flag.
 
 ---
 
-## Layered System Prompt & KV Cache Stability
-
-`PromptBuilder` (`src/prompt.rs`) separates the system prompt into:
-
-- **Static layers** (byte-identical across turns): base identity → mode overlay → skills → project context
-- **Volatile tail** (rebuilt each turn): working set summary, conversation summary, completed tasks, current goal, environment block (date/time)
-
-The static prefix is hashed (`static_prefix_hash()`) and tracked by `ContextManager`. If the hash changes between turns, a warning is logged indicating a KV cache miss. `validate_for_kv_cache()` checks that no volatile data (e.g., date/time) has leaked into static layers.
-
----
 
 ## Event Processing Pipeline
 
@@ -297,10 +236,10 @@ Enter key
                                   → spawn_plan_then_execute()  (single pipeline)
   → OutputLine::User(msg) added immediately
   → app_state.is_processing = true
-  → background thread → /api/generate with context handle
+  → background thread → /api/chat with native tools
   → main loop receives: StreamChunk (tokens), StreamDone (content),
-    StreamMeta (context handle, eval stats)
-  → update ContextManager, display cache stats + context warnings
+    StreamMeta (prompt token count, model)
+  → update app_state.total_prompt_tokens, refresh ctx:% status bar
   → parse file changes → mode-dependent apply flow
   → drain pending_queue if non-empty
 ```
@@ -388,8 +327,6 @@ exec_model = "qwen3:8b"
 eval_model = "qwen3:14b"
 default_mode = "edit"
 max_retries = 3
-enable_thinking = false
-native_tool_calls = false
 enable_free_web_search = true
 search_cache_valid_days = 30
 max_search_context_tokens = 2048
@@ -449,14 +386,13 @@ This is enforced by prompt rules plus a fallback:
 - **Per-step workflow** (`spawn_execution_with_plan`): file output is conditional,
   the final step is flagged as the answer step, and every step must end with a
   prose answer.
-- **Tool-loop continuation** (`stream_step_with_tools`): after a tool result, the
-  model is told to either call the next tool or give the final answer in prose.
-- **Fallback** (both tool paths): a tool-using step that ends with no prose answer
-  — detected by `tools_parser::has_final_answer()` (≥3 words outside tool-call /
-  tool-result / `### FILE:` / fenced-code blocks) — triggers one more generation
-  that explicitly asks for the answer: `/api/generate` on the text path (reusing
-  the KV-cache context handle) and `/api/chat` with no `tools=` on the native
-  path. Streams live like a normal round; a no-op when no tools ran.
+- **Tool-loop continuation** (`stream_step_native_tools`): after a tool result,
+  the model is told to either call the next tool or give the final answer in prose.
+- **Fallback**: a tool-using step that ends with no prose answer — detected by
+  `tools_parser::has_final_answer()` (≥3 words outside tool-call / tool-result /
+  `### FILE:` / fenced-code blocks) — triggers one more `/api/chat` call with
+  empty `tools=[]` that explicitly asks for the answer. Streams live like a
+  normal round; a no-op when no tools ran.
 
 ## Naming Conventions
 

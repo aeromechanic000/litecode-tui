@@ -53,21 +53,6 @@ pub struct Config {
     pub search_cache_valid_days: u64,
     pub max_search_context_tokens: usize,
     pub max_retries: usize,
-    /// Enable model thinking/reasoning. When true, requests are sent with
-    /// `think: true` and inline `<think>…</think>` blocks are stripped from the
-    /// streamed response (their content kept as response if a block is left
-    /// unclosed). Default off — thinking is unreliable on the `/api/generate`
-    /// path without a chat template.
-    #[serde(default)]
-    pub enable_thinking: bool,
-    /// Use Ollama's native tool-calling (`tools=` on `/api/chat`) for the executor
-    /// instead of text-format `<tool_call>` blocks on `/api/generate`. Required for
-    /// thinking models (e.g. qwen3.5) that won't emit text tool-call blocks — they
-    /// emit native tool calls reliably. Tradeoff: this path uses `/api/chat`, which
-    /// does not expose the KV-cache `context` handle, so manual cache reuse is
-    /// bypassed. Default off (preserves the `/api/generate` KV-cache design).
-    #[serde(default)]
-    pub native_tool_calls: bool,
     #[serde(default = "default_context_window")]
     pub context_window_limit: u64,
     #[serde(default = "default_max_file_lines")]
@@ -97,8 +82,6 @@ impl Default for Config {
             search_cache_valid_days: 30,
             max_search_context_tokens: 2048,
             max_retries: 3,
-            enable_thinking: false,
-            native_tool_calls: false,
             context_window_limit: 262144,
             max_file_lines: 60,
             model_residency: "none".to_string(),

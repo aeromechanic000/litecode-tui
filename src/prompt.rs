@@ -246,25 +246,12 @@ When the user provides a URL or asks to fetch/read a webpage, ALWAYS use web_rea
 When the user asks to run a build, test, or git operation, use exec_shell.
 
 ## Tool calls
-To invoke a tool during a step, emit ONE <tool_call> block, then STOP and wait for its
-<tool_result> before emitting the next. Only the FIRST tool call in a response is executed;
-any further blocks in the same response are ignored. This is critical when one call depends
-on another's result — e.g. emit web_reader alone, read what it returned, and only THEN emit
-write_file with content drawn from that result (never invent the content yourself). The
-JSON inside the tag holds the tool's parameters at the TOP LEVEL — never wrap them under
-"param" or "parameters", and keep every string value properly quoted with no extra fields.
-
-Examples (each is its own response, followed by the tool's result):
-<tool_call name="read_file" call_id="1">{"path": "src/main.rs"}</tool_call>
-<tool_call name="write_file" call_id="2">{"path": "src/new.rs", "content": "fn main() {}"}</tool_call>
-<tool_call name="edit_file" call_id="3">{"path": "src/main.rs", "old_text": "fn old", "new_text": "fn new"}</tool_call>
-<tool_call name="web_reader" call_id="4">{"url": "https://example.com"}</tool_call>
-<tool_call name="exec_shell" call_id="5">{"command": "cargo test"}</tool_call>
-
-The "Available Tools" section below lists every tool and its required parameters. After a
-call, the executor appends a <tool_result> block and you may continue the same step (another
-call, more prose, or the step's final output). Do not invent tool names — only the tools
-listed below exist.
+Tools are exposed via the API's native tool-calling interface — call them with the provided
+tool schemas (do not emit `<tool_call>` blocks or attempt to invoke tools by name in prose).
+The executor dispatches the first tool call, returns its result, and lets you continue with
+the next call or your final answer. Only emit one tool call per turn — wait for the result
+before calling a dependent tool (e.g. call web_reader alone, read what it returned, and only
+then call write_file with content drawn from that result, never inventing content yourself).
 
 ## Always answer the user
 End EVERY turn with a concise natural-language answer to what the user asked. After your
@@ -458,9 +445,10 @@ Always validate changes before applying (syntax checks, tests)."#
             .join("\n\n")
     }
 
-    /// Hash of the static prefix for KV cache stability validation.
-    /// This hash should remain constant across turns as long as mode, skills,
-    /// and project context don't change.
+    /// Hash of the static prefix for cache-stability validation.
+    /// Retained for diagnostic use even though native tool calling no longer
+    /// exposes the KV-cache context handle.
+    #[allow(dead_code)]
     pub fn static_prefix_hash(&self) -> u64 {
         let prefix = self.static_prefix();
         let mut hasher = DefaultHasher::new();
@@ -541,7 +529,7 @@ mod tests {
         assert!(!builder.build().contains("Available Skills"));
 
         // Reload the builder to test non-empty case via the layer name check
-        let mut builder = PromptBuilder::new(&Config::default());
+        let builder = PromptBuilder::new(&Config::default());
         assert!(builder.static_layers.iter().all(|l| l.name != "skills"));
     }
 

@@ -256,8 +256,15 @@ fn draw_compact_status(f: &mut Frame, app: &AppState, ui: &UiState, area: Rect) 
     };
 
     let core_model = &app.config.exec_model;
-    let context_window = crate::ollama::model::estimate_context_window(core_model);
-    let usage_pct = app.context_manager.context_usage_percent(context_window);
+    let context_window = crate::ollama::model::estimate_context_window(core_model).max(1);
+    // Native tool calling uses `/api/chat`, which does not expose the KV-cache
+    // context handle — `ctx:N%` here is a rough prompt-token estimate, not a
+    // cache-hit measurement.
+    let usage_pct = if context_window == 0 {
+        0.0
+    } else {
+        (app.total_prompt_tokens as f64 / context_window as f64 * 100.0).min(100.0)
+    };
     let usage_color = if usage_pct >= 100.0 {
         Color::Red
     } else if usage_pct >= 80.0 {

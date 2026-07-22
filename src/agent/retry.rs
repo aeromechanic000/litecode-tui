@@ -347,11 +347,9 @@ pub enum PipelineResult {
     StreamChunk { content: String },
     /// Streaming finished — contains the full accumulated content
     StreamDone { content: String },
-    /// KV cache metadata from a completed /api/generate stream
+    /// Prompt metadata from a completed stream — used to drive the
+    /// `ctx:N%` token-estimate indicator and overflow warnings.
     StreamMeta {
-        context_handle: Option<Vec<i64>>,
-        prompt_eval_count: Option<usize>,
-        eval_count: Option<usize>,
         total_prompt_tokens: usize,
         model: String,
     },

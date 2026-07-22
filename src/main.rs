@@ -972,43 +972,15 @@ fn run_app(
                     ui_state.add_output(OutputLine::Separator);
                 }
                 agent::retry::PipelineResult::StreamMeta {
-                    context_handle,
-                    prompt_eval_count,
-                    eval_count,
                     total_prompt_tokens,
                     model,
+                    ..
                 } => {
-                    // Update context manager with KV cache metadata
-                    if let Some(ctx) = context_handle {
-                        app_state.context_manager.update_from_response(
-                            ctx,
-                            prompt_eval_count,
-                            eval_count,
-                            total_prompt_tokens,
-                            &model,
-                        );
-                    } else {
-                        app_state.context_manager.set_total_prompt_tokens(total_prompt_tokens);
-                    }
-
+                    app_state.total_prompt_tokens = total_prompt_tokens;
                     let context_window =
-                        ollama::model::estimate_context_window(&model);
-
-                    // Display KV cache hit rate
-                    if let Some(rate) = app_state.context_manager.cache_hit_rate() {
-                        let cached = total_prompt_tokens
-                            .saturating_sub(prompt_eval_count.unwrap_or(0));
-                        let recomputed = prompt_eval_count.unwrap_or(0);
-                        let gen = eval_count.unwrap_or(0);
-                        ui_state.add_output(OutputLine::System(format!(
-                            "KV cache: {:.1}% hit ({} cached, {} recomputed, {} generated)",
-                            rate, cached, recomputed, gen
-                        )));
-                    }
-
-                    // Context overflow warnings
+                        ollama::model::estimate_context_window(&model).max(1);
                     let usage_pct =
-                        app_state.context_manager.context_usage_percent(context_window);
+                        total_prompt_tokens as f64 / context_window as f64 * 100.0;
                     if usage_pct >= 100.0 {
                         ui_state.add_output(OutputLine::Error(format!(
                             "Context OVERFLOW! {:.0}% of window used ({}/{} tokens). Use /clear to reset.",
@@ -1448,7 +1420,7 @@ fn run_app(
                                 // Handle slash commands (instant, no LLM call)
                                 let trimmed = input.trim();
                                 if trimmed == "/clear" {
-                                    app_state.context_manager.clear();
+                                    app_state.total_prompt_tokens = 0;
                                     app_state.conversation_history.clear();
                                     app_state.conversation_summary = None;
                                     ui_state.clear_output();
@@ -1890,10 +1862,6 @@ fn run_app(
                                     // Record in session
                                     app_state.current_session.add_message("user", &input);
                                     ui_state.start_thinking();
-                                    // Track KV cache prefix hash before spawning
-                                    app_state.context_manager.set_static_prefix_hash(
-                                        app_state.prompt_builder.static_prefix_hash()
-                                    );
                                     spawn_request_for_mode(
                                         &mut app_state,
                                         &ollama_client,
@@ -1977,146 +1945,6 @@ fn flush_pending_output(
         ui::inline::render_output_lines(buf, &lines, &theme);
     })?;
     Ok(())
-}
-
-/// Spawn a streaming generate request on a background thread (direct, no plan step).
-#[allow(dead_code)]
-fn spawn_llm_request(
-    app_state: &AppState,
-    _client: &ollama::OllamaClient,
-    input: &str,
-    tx: mpsc::Sender<agent::retry::PipelineResult>,
-) {
-    let model = match router::classify_request(input) {
-        router::ModelTier::Exec => app_state.config.exec_model.clone(),
-        router::ModelTier::Eval => app_state.config.effective_eval_model().to_string(),
-    };
-    if model.is_empty() {
-        let _ = tx.send(agent::retry::PipelineResult::Retry(
-            agent::retry::RetryResult::Failed {
-                last_error: "No exec model configured. Run setup or edit ~/.litepilot/config.toml"
-                    .into(),
-                attempts: 0,
-            },
-        ));
-        return;
-    }
-
-    let endpoint = app_state.config.ollama_endpoint.clone();
-    let connect_timeout = app_state.config.connect_timeout;
-    let context_window_limit = app_state.config.context_window_limit;
-    let enable_thinking = app_state.config.enable_thinking;
-    let input = input.to_string();
-    let web_search_enabled = app_state.web_search_enabled;
-    let max_search_tokens = app_state.config.max_search_context_tokens;
-
-    // Build system prompt via PromptBuilder (already updated before calling this function)
-    let system_with_workspace = app_state.prompt_builder.build();
-
-    // Build generate prompt from conversation history
-    let (history_system, history_prompt) =
-        build_generate_prompt(&app_state.conversation_history, &input);
-    let combined_system = if history_system.is_some() {
-        Some(format!(
-            "{}\n\n{}",
-            system_with_workspace,
-            history_system.unwrap_or_default()
-        ))
-    } else {
-        Some(system_with_workspace.clone())
-    };
-    let context_handle = app_state.context_manager.context_handle_for_model(&model).cloned();
-    let total_prompt_tokens = estimate_prompt_tokens(combined_system.as_deref(), &history_prompt);
-
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = tx.send(agent::retry::PipelineResult::Retry(
-                    agent::retry::RetryResult::Failed {
-                        last_error: format!("Runtime error: {}", e),
-                        attempts: 0,
-                    },
-                ));
-                return;
-            }
-        };
-
-        // Run web search if enabled
-        let final_prompt = if web_search_enabled {
-            let search_ctx = rt.block_on(run_web_search(&input, max_search_tokens));
-            if !search_ctx.is_empty() {
-                let _ = tx.send(agent::retry::PipelineResult::SearchDone {
-                    count: search_ctx.lines().filter(|l| l.starts_with('[')).count(),
-                    context: search_ctx.clone(),
-                });
-            }
-            if history_prompt.is_empty() {
-                format!("{}\n{}", search_ctx, input)
-            } else {
-                format!("{}\nuser: {}\n{}", history_prompt, search_ctx, input)
-            }
-        } else {
-            history_prompt
-        };
-
-        // Build streaming request — use a client without overall deadline
-        let http =
-            match ollama::OllamaClient::streaming_http_client(Duration::from_secs(connect_timeout))
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(agent::retry::PipelineResult::Retry(
-                        agent::retry::RetryResult::Failed {
-                            last_error: format!("Client error: {}", e),
-                            attempts: 0,
-                        },
-                    ));
-                    return;
-                }
-            };
-
-        tracing::info!(
-            "spawn_llm_generate: model={}, context_window={}, web_search={}, has_context_handle={}",
-            model,
-            context_window_limit,
-            web_search_enabled,
-            context_handle.is_some()
-        );
-
-        let step = stream_single_step_generate(
-            &rt,
-            http,
-            &endpoint,
-            &model,
-            combined_system,
-            final_prompt,
-            context_handle,
-            context_window_limit,
-            enable_thinking,
-            &tx,
-        );
-
-        if step.content.starts_with("ERROR:") {
-            let _ = tx.send(agent::retry::PipelineResult::Retry(
-                agent::retry::RetryResult::Failed {
-                    last_error: step.content,
-                    attempts: 0,
-                },
-            ));
-        } else {
-            let _ = tx.send(agent::retry::PipelineResult::StreamDone {
-                content: step.content,
-            });
-            let _ = tx.send(agent::retry::PipelineResult::StreamMeta {
-                context_handle: step.context_handle,
-                prompt_eval_count: step.prompt_eval_count,
-                eval_count: step.eval_count,
-                total_prompt_tokens,
-                model,
-            });
-        }
-    });
 }
 
 /// Plan-then-execute: runs a quick plan step on the exec model, sends PlanReady,
@@ -2271,21 +2099,16 @@ fn spawn_execution_with_plan(
         return;
     }
 
-    let endpoint = app_state.config.ollama_endpoint.clone();
-    let connect_timeout = app_state.config.connect_timeout;
     let input = input.to_string();
     let plan = plan.to_string();
     let history = app_state.conversation_history.clone();
     let workspace = app_state.workspace.clone();
     let context_window_limit = app_state.config.context_window_limit;
-    let enable_thinking = app_state.config.enable_thinking;
-    let native_tool_calls = app_state.config.native_tool_calls;
     let now = current_datetime();
-    let context_handle = app_state.context_manager.context_handle_for_model(&model).cloned();
 
     // Tool registry for per-step tool dispatch. Built once outside the step loop and
-    // shared across all steps in this execution. The LLM emits text-format
-    // `<tool_call>` blocks mid-step; `stream_step_with_tools` parses and dispatches.
+    // shared across all steps in this execution. Native tool calls (`tools=[…]` on
+    // `/api/chat`) are dispatched through this registry by `stream_step_native_tools`.
     let config = app_state.config.clone();
     let tool_registry = tools::ToolRegistry::new(workspace.clone(), &config);
 
@@ -2300,12 +2123,11 @@ fn spawn_execution_with_plan(
     ));
 
     tracing::info!(
-        "spawn_execution_with_plan: model={}, plan={} bytes, history_msgs={}, context_window={}, has_context_handle={}",
+        "spawn_execution_with_plan: model={}, plan={} bytes, history_msgs={}, context_window={}",
         model,
         plan.len(),
         history.len(),
         context_window_limit,
-        context_handle.is_some()
     );
 
     std::thread::spawn(move || {
@@ -2322,9 +2144,7 @@ fn spawn_execution_with_plan(
             }
         };
 
-        let http = match ollama::OllamaClient::streaming_http_client(
-            std::time::Duration::from_secs(connect_timeout),
-        ) {
+        let client = match ollama::OllamaClient::new(&config) {
             Ok(c) => c,
             Err(e) => {
                 let _ = tx.send(agent::retry::PipelineResult::Retry(
@@ -2337,25 +2157,7 @@ fn spawn_execution_with_plan(
             }
         };
 
-        // Native-tool client (/api/chat) — only needed on the native path.
-        let native_client: Option<ollama::OllamaClient> = if native_tool_calls {
-            match ollama::OllamaClient::new(&config) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    let _ = tx.send(agent::retry::PipelineResult::Retry(
-                        agent::retry::RetryResult::Failed {
-                            last_error: format!("Native client error: {}", e),
-                            attempts: 0,
-                        },
-                    ));
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-
-        // Conversation history as native chat messages (for the /api/chat path).
+        // Conversation history as native chat messages for /api/chat.
         let native_history: Vec<serde_json::Value> = history
             .iter()
             .filter(|m| m.role != "system")
@@ -2381,14 +2183,6 @@ fn spawn_execution_with_plan(
             })
             .collect();
 
-        // Build history prompt for /api/generate
-        let history_prompt = history
-            .iter()
-            .filter(|m| m.role != "system")
-            .map(|m| format!("{}: {}", m.role, m.content))
-            .collect::<Vec<_>>()
-            .join("\n");
-
         if steps.is_empty() {
             tracing::info!(
                 "no parseable steps in plan, executing as single request (plan: {} bytes)",
@@ -2403,51 +2197,21 @@ fn spawn_execution_with_plan(
                 output_budget,
                 output_budget / 4,
             );
-            let prompt = if history_prompt.is_empty() {
-                format!("[Plan]\n{}\n\nuser: {}", plan, input)
-            } else {
-                format!("{}\n[Plan]\n{}\n\nuser: {}", history_prompt, plan, input)
-            };
-            let total_tokens = estimate_prompt_tokens(Some(&system_prompt), &prompt);
+            let user_message = format!("[Plan]\n{}\n\n{}", plan, input);
+            let total_tokens = estimate_prompt_tokens(Some(&system_prompt), &user_message);
 
-            let step = if let Some(nc) = native_client.as_ref() {
-                let user_message = if history_prompt.is_empty() {
-                    format!("[Plan]\n{}\n\n{}", plan, input)
-                } else {
-                    format!("{}\n[Plan]\n{}\n\n{}", history_prompt, plan, input)
-                };
-                stream_step_native_tools(
-                    &rt,
-                    nc,
-                    &model,
-                    system_prompt,
-                    native_history.clone(),
-                    user_message,
-                    &tool_registry,
-                    &tx,
-                )
-            } else {
-                stream_step_with_tools(
-                    &rt,
-                    http,
-                    &endpoint,
-                    &model,
-                    Some(system_prompt),
-                    prompt,
-                    context_handle,
-                    context_window_limit,
-                    enable_thinking,
-                    &tool_registry,
-                    &tx,
-                )
-            };
-            let _ = tx.send(agent::retry::PipelineResult::StreamDone {
-                content: step.content,
-            });
+            let content = stream_step_native_tools(
+                &rt,
+                &client,
+                &model,
+                system_prompt,
+                native_history.clone(),
+                user_message,
+                &tool_registry,
+                &tx,
+            );
+            let _ = tx.send(agent::retry::PipelineResult::StreamDone { content });
             let _ = tx.send(agent::retry::PipelineResult::StreamMeta {
-                context_handle: step.context_handle,
-                prompt_eval_count: step.prompt_eval_count,
-                eval_count: step.eval_count,
                 total_prompt_tokens: total_tokens,
                 model,
             });
@@ -2472,8 +2236,6 @@ fn spawn_execution_with_plan(
             per_step_budget / 4,
         );
 
-        let mut current_context = context_handle;
-
         for (i, step_desc) in steps.iter().enumerate() {
             let step_num = i + 1;
 
@@ -2484,9 +2246,9 @@ fn spawn_execution_with_plan(
             });
 
             // Note: `[SEARCH]` plan steps were previously special-cased to invoke
-            // run_web_search directly. That behavior is now subsumed by the executor's
-            // tool loop: the LLM emits a `<tool_call name="web_search">` block mid-step
-            // and `stream_step_with_tools` dispatches it via the ToolRegistry.
+            // run_web_search directly. That behavior is now subsumed by native tool
+            // calling: the LLM emits a `web_search` tool call and `stream_step_native_tools`
+            // dispatches it via the ToolRegistry.
 
             let prev_summary = if step_results.is_empty() {
                 String::new()
@@ -2552,80 +2314,42 @@ fn spawn_execution_with_plan(
                 final_step_directive,
             );
 
-            let prompt = if history_prompt.is_empty() {
-                format!("user: {}", user_msg)
-            } else {
-                format!("{}\nuser: {}", history_prompt, user_msg)
-            };
-
-            let step_result = if let Some(nc) = native_client.as_ref() {
-                let user_message = if history_prompt.is_empty() {
-                    user_msg.clone()
-                } else {
-                    format!("{}\n{}", history_prompt, user_msg)
-                };
-                stream_step_native_tools(
-                    &rt,
-                    nc,
-                    &model,
-                    system_prompt.clone(),
-                    native_history.clone(),
-                    user_message,
-                    &tool_registry,
-                    &tx,
-                )
-            } else {
-                stream_step_with_tools(
-                    &rt,
-                    http.clone(),
-                    &endpoint,
-                    &model,
-                    Some(system_prompt.clone()),
-                    prompt,
-                    current_context.clone(),
-                    context_window_limit,
-                    enable_thinking,
-                    &tool_registry,
-                    &tx,
-                )
-            };
+            let content = stream_step_native_tools(
+                &rt,
+                &client,
+                &model,
+                system_prompt.clone(),
+                native_history.clone(),
+                user_msg.clone(),
+                &tool_registry,
+                &tx,
+            );
 
             tracing::info!(
                 "step {}/{} complete: {} bytes, {} lines",
                 step_num,
                 total_steps,
-                step_result.content.len(),
-                step_result.content.lines().count()
+                content.len(),
+                content.lines().count()
             );
 
-            if step_result.content.starts_with("ERROR:") {
+            if content.starts_with("ERROR:") {
                 let _ = tx.send(agent::retry::PipelineResult::Retry(
                     agent::retry::RetryResult::Failed {
-                        last_error: step_result.content,
+                        last_error: content,
                         attempts: step_num,
                     },
                 ));
                 return;
             }
 
-            // Carry the context handle forward for cache reuse between steps
-            if let Some(ctx) = &step_result.context_handle {
-                current_context = Some(ctx.clone());
-            }
-
-            all_content.push_str(&step_result.content);
+            all_content.push_str(&content);
             all_content.push('\n');
-            step_results.push(step_result.content);
+            step_results.push(content);
         }
 
-        // Send final StreamMeta with the last step's context handle
-        // We estimate total tokens from the last step's prompt
-        let last_prompt = if history_prompt.is_empty() {
-            format!("user: {}", input)
-        } else {
-            format!("{}\nuser: {}", history_prompt, input)
-        };
-        let total_tokens = estimate_prompt_tokens(Some(&system_prompt), &last_prompt);
+        // Final StreamMeta: token estimate for the last step's prompt.
+        let total_tokens = estimate_prompt_tokens(Some(&system_prompt), &input);
 
         tracing::info!(
             "all {} steps complete: total {} bytes, {} lines",
@@ -2637,635 +2361,30 @@ fn spawn_execution_with_plan(
             content: all_content,
         });
         let _ = tx.send(agent::retry::PipelineResult::StreamMeta {
-            context_handle: current_context,
-            prompt_eval_count: None, // per-step, not easily aggregated
-            eval_count: None,
             total_prompt_tokens: total_tokens,
             model,
         });
     });
 }
 
-/// Stream a single step's LLM call, returning the accumulated content.
-/// On error, returns a string starting with "ERROR:".
-/// Maximum number of auto-continuations when a response is truncated (done_reason: "length").
-const MAX_TRUNCATION_CONTINUATIONS: usize = 3;
-
-/// Result of a single streaming step, including KV cache metadata.
-#[derive(Clone)]
-struct StepResult {
-    content: String,
-    context_handle: Option<Vec<i64>>,
-    prompt_eval_count: Option<usize>,
-    eval_count: Option<usize>,
-    /// Ollama `done_reason` from the terminating chunk (e.g. "stop", "length",
-    /// "stream_end"). "stream_end" means the remote closed the connection without
-    /// a `done:true` chunk — used to detect dropped/empty responses.
-    done_reason: Option<String>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stream_single_step_generate(
-    rt: &tokio::runtime::Runtime,
-    http: reqwest::Client,
-    endpoint: &str,
-    model: &str,
-    system_prompt: Option<String>,
-    prompt: String,
-    context_handle: Option<Vec<i64>>,
-    num_ctx: u64,
-    think: bool,
-    tx: &mpsc::Sender<agent::retry::PipelineResult>,
-) -> StepResult {
-    let tx = tx.clone();
-    let mut full_content = String::new();
-    let mut current_prompt = prompt;
-    let mut current_context = context_handle;
-    let mut final_context_handle: Option<Vec<i64>> = None;
-    let mut final_prompt_eval_count: Option<usize> = None;
-    let mut final_eval_count: Option<usize> = None;
-    let mut final_done_reason: Option<String> = None;
-    // Statefully strips inline `<think>…</think>` reasoning blocks from the
-    // streamed response. No-op when thinking is off (no tags present). When on,
-    // it hides complete reasoning blocks and — per the robustness rule — keeps
-    // the content of any block left unclosed at stream end.
-    let mut think_stripper = agent::tools_parser::ThinkStripper::new();
-
-    for attempt in 0..=MAX_TRUNCATION_CONTINUATIONS {
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let stream = ollama::OllamaClient::generate_stream(
-            http.clone(),
-            endpoint.to_string(),
-            model.to_string(),
-            system_prompt.clone(),
-            current_prompt.clone(),
-            current_context.clone(),
-            num_ctx,
-            think,
-            cancel_rx,
-        );
-        let mut pin = std::pin::pin!(stream);
-
-        let chunk_result: Result<Option<String>, String> = rt.block_on(async {
-            use futures::StreamExt;
-            while let Some(chunk_result) = pin.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        if !chunk.response.is_empty() {
-                            // Strip inline `<think>` reasoning before display,
-                            // parsing, or accumulation. `chunk.thinking` (Ollama's
-                            // separate field) is intentionally ignored here — it
-                            // never enters the response.
-                            let clean = think_stripper.feed(&chunk.response);
-                            if !clean.is_empty() {
-                                let _ = tx.send(agent::retry::PipelineResult::StreamChunk {
-                                    content: clean.clone(),
-                                });
-                                full_content.push_str(&clean);
-                            }
-                        }
-                        if chunk.done {
-                            // Capture metadata from final chunk
-                            if let Some(ctx) = chunk.context {
-                                final_context_handle = Some(ctx);
-                            }
-                            if chunk.prompt_eval_count.is_some() {
-                                final_prompt_eval_count = chunk.prompt_eval_count;
-                            }
-                            if chunk.eval_count.is_some() {
-                                final_eval_count = chunk.eval_count;
-                            }
-                            final_done_reason = chunk.done_reason.clone();
-                            return Ok(chunk.done_reason);
-                        }
-                    }
-                    Err(e) => {
-                        return Err(format!("Stream error: {}", e));
-                    }
-                }
-            }
-            Ok(None)
-        });
-
-        drop(cancel_tx);
-
-        match chunk_result {
-            Ok(done_reason) => {
-                let reason = done_reason.as_deref().unwrap_or("unknown");
-                if reason == "length" && attempt < MAX_TRUNCATION_CONTINUATIONS {
-                    tracing::warn!(
-                        "response truncated (done_reason: length), continuing (attempt {}/{}, {} bytes so far)",
-                        attempt + 1, MAX_TRUNCATION_CONTINUATIONS, full_content.len()
-                    );
-                    // Extend the prompt with the truncated response + continuation request
-                    current_prompt = format!(
-                        "{}\nassistant: {}\nuser: Your previous response was cut off due to length. Continue exactly from where you left off. Do not repeat what you already wrote.",
-                        current_prompt, full_content
-                    );
-                    // Keep the context handle for cache reuse on continuation
-                    current_context = final_context_handle.clone();
-                    continue;
-                }
-                // Flush any buffered (unclosed-think) content as response.
-                let tail = think_stripper.finish();
-                if !tail.is_empty() {
-                    let _ = tx.send(agent::retry::PipelineResult::StreamChunk {
-                        content: tail.clone(),
-                    });
-                    full_content.push_str(&tail);
-                }
-                tracing::info!(
-                    "stream done: reason={}, {} bytes",
-                    reason,
-                    full_content.len()
-                );
-                return StepResult {
-                    content: full_content,
-                    context_handle: final_context_handle,
-                    prompt_eval_count: final_prompt_eval_count,
-                    eval_count: final_eval_count,
-                    done_reason: final_done_reason.clone(),
-                };
-            }
-            Err(e) => {
-                return StepResult {
-                    content: format!("ERROR: {}", e),
-                    context_handle: None,
-                    prompt_eval_count: None,
-                    eval_count: None,
-                    done_reason: None,
-                };
-            }
-        }
-    }
-
-    let tail = think_stripper.finish();
-    if !tail.is_empty() {
-        let _ = tx.send(agent::retry::PipelineResult::StreamChunk {
-            content: tail.clone(),
-        });
-        full_content.push_str(&tail);
-    }
-    tracing::warn!(
-        "max continuations reached, returning {} bytes",
-        full_content.len()
-    );
-    StepResult {
-        content: full_content,
-        context_handle: final_context_handle,
-        prompt_eval_count: final_prompt_eval_count,
-        eval_count: final_eval_count,
-        done_reason: final_done_reason.clone(),
-    }
-}
 
 /// Maximum number of tool-call rounds within a single plan step. Each round is one
-/// `/api/generate` call (which itself may chain up to `MAX_TRUNCATION_CONTINUATIONS`
-/// sub-calls for length-truncated responses). Five rounds covers a reasonable
-/// fetch→inspect→decide sequence without risking runaway loops.
+/// `/api/chat` call. Five rounds covers a reasonable fetch→inspect→decide sequence
+/// without risking runaway loops.
 const MAX_TOOL_ROUNDS_PER_STEP: usize = 5;
 
-/// Maximum retries when the LLM emits something that *looks* like a tool call but
-/// fails to parse (e.g. missing closing tag, malformed JSON). Mirrors agent loop.
-const MAX_TOOL_CORRECTION_RETRIES: usize = 2;
-
-/// Maximum retries on a transient transport error from `/api/generate` (500 EOF
-/// from a runner crash under memory pressure, connection drop, timeout). The
-/// generate path has no built-in retry, so without this a single transient
-/// failure aborts the whole turn. Mirrors the chat path's `chat_with_retry`.
-const MAX_TRANSPORT_RETRIES: usize = 3;
-
-/// Execute one plan step with optional tool calls. Repeatedly calls
-/// `stream_single_step_generate` (the `/api/generate` primitive that owns truncation
-/// continuation and KV-cache context-handle threading). After each round, parses the
-/// assistant output for text-format `<tool_call>` blocks. If found, dispatches them via
-/// the `ToolRegistry`, appends `<tool_result>` blocks to the prompt, and re-calls with
-/// the same context handle so Ollama prefix-matches the cached KV tensors and only
-/// evaluates the delta. Terminates when the LLM emits no tool calls (and no failed
-/// attempts), or when the round / retry / signature-repeat caps are hit.
+/// Execute one plan step via Ollama's native tool-calling (`tools=` on `/api/chat`).
 ///
-/// The low-level primitive `stream_single_step_generate` stays unchanged — this
-/// wrapper orchestrates tool round-trips on top of it.
-#[allow(clippy::too_many_arguments)]
-fn stream_step_with_tools(
-    rt: &tokio::runtime::Runtime,
-    http: reqwest::Client,
-    endpoint: &str,
-    model: &str,
-    system_prompt: Option<String>,
-    initial_prompt: String,
-    context_handle: Option<Vec<i64>>,
-    num_ctx: u64,
-    think: bool,
-    tools: &tools::ToolRegistry,
-    tx: &mpsc::Sender<agent::retry::PipelineResult>,
-) -> StepResult {
-    let mut current_prompt = initial_prompt;
-    let mut current_context = context_handle;
-    let mut last_step_result: Option<StepResult> = None;
-    let mut correction_retries = 0usize;
-    let mut prev_signature = String::new();
-    let mut transport_retries = 0usize;
-    let mut tools_dispatched = 0usize;
-
-    // Final-answer fallback: local models on /api/generate (chat template not applied)
-    // often end a tool-using step with empty or tool-only output — no prose answer to
-    // the user. If tools ran but no answer survived in the candidate content, do one
-    // more /api/generate call explicitly asking for a concise answer. Reuses the cached
-    // context handle so only the appended instruction is evaluated, and streams live
-    // via StreamChunk like any normal round. A no-op when no tools ran.
-    let finalize_with_answer =
-        |candidate: StepResult, ctx: Option<Vec<i64>>, prompt: &str, dispatched: usize| -> StepResult {
-            if dispatched > 0
-                && !crate::agent::tools_parser::has_final_answer(&candidate.content)
-            {
-                tracing::info!(
-                    "stream_step_with_tools: step ended after {} tool dispatch(es) with no \
-                     prose answer — running final-answer fallback",
-                    dispatched
-                );
-                let answer_prompt = format!(
-                    "{}\n\nuser: You have finished gathering information with the tools above. \
-                     Now answer the user's original request concisely in plain prose. \
-                     Do NOT call any tools. Do NOT write files. Just give the direct answer.",
-                    prompt
-                );
-                let answer = stream_single_step_generate(
-                    rt,
-                    http.clone(),
-                    endpoint,
-                    model,
-                    system_prompt.clone(),
-                    answer_prompt,
-                    ctx.clone(),
-                    num_ctx,
-                    think,
-                    tx,
-                );
-                if !answer.content.starts_with("ERROR:") && !answer.content.trim().is_empty() {
-                    return StepResult {
-                        content: answer.content,
-                        context_handle: answer.context_handle.clone().or(ctx),
-                        prompt_eval_count: answer.prompt_eval_count,
-                        eval_count: answer.eval_count,
-                        done_reason: answer.done_reason,
-                    };
-                }
-            }
-            candidate
-        };
-
-    for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
-        let step_result = stream_single_step_generate(
-            rt,
-            http.clone(),
-            endpoint,
-            model,
-            system_prompt.clone(),
-            current_prompt.clone(),
-            current_context.clone(),
-            num_ctx,
-            think,
-            tx,
-        );
-
-        // Transport-level errors surface as content starting with "ERROR:". The
-        // generate path has no built-in retry (unlike /api/chat's chat_with_retry),
-        // so a single transient runner crash — common with local Ollama under
-        // memory pressure (500 {"error":"EOF"}) or a brief connection drop — would
-        // abort the whole turn. Retry retryable classes with backoff; re-calling
-        // stream_single_step_generate gives a fresh generation (clean state).
-        if step_result.content.starts_with("ERROR:") {
-            if transport_retries < MAX_TRANSPORT_RETRIES
-                && agent::retry::classify_error(&step_result.content)
-                    == agent::retry::ErrorClass::Retryable
-            {
-                transport_retries += 1;
-                let delay = agent::retry::backoff_delay(transport_retries - 1);
-                tracing::warn!(
-                    "stream_step_with_tools round {}: transient generate error, retrying {}/{} after {:?}: {}",
-                    round,
-                    transport_retries,
-                    MAX_TRANSPORT_RETRIES,
-                    delay,
-                    step_result.content
-                );
-                std::thread::sleep(delay);
-                // Re-run this round from scratch (same prompt/context) → fresh generation.
-                continue;
-            }
-            return step_result;
-        }
-
-        let content = step_result.content.clone();
-        let parse_result =
-            crate::agent::tools_parser::parse_tool_calls_with_diagnostics(&content);
-
-        // Orphan `<tool_call>` openers (no matching close before the next
-        // opener) signal the model's output is malformed — and unlike a plain
-        // failed attempt, this can happen even when some valid calls parsed.
-        // Retry the whole round so the model re-emits cleanly, dropping any
-        // partially-parsed calls from this round. The cached prefix still
-        // matches; only the appended correction text is new.
-        if parse_result.has_orphan_opens() && correction_retries < MAX_TOOL_CORRECTION_RETRIES {
-            correction_retries += 1;
-            tracing::warn!(
-                "stream_step_with_tools round {}: response had {} orphan <tool_call> opener(s), retrying ({}/{}) — diagnostics: {}",
-                round,
-                parse_result.diagnostics.orphan_opens,
-                correction_retries,
-                MAX_TOOL_CORRECTION_RETRIES,
-                parse_result.diagnostics.format_for_correction()
-            );
-            current_prompt = format!(
-                "{}\n\nuser: Your previous response contained an unclosed <tool_call> block \
-                 (opening tag without a matching </tool_call> close before the next opener). \
-                 {}. Re-emit any tools you intended to call with proper closing tags, or \
-                 finish the step without a tool call.",
-                content,
-                parse_result.diagnostics.format_for_correction()
-            );
-            continue;
-        }
-
-        // No parseable tool calls — decide whether to retry or finalize.
-        if parse_result.calls.is_empty() {
-            let reason = step_result.done_reason.as_deref().unwrap_or("");
-            // An empty response (no content at all) usually means the model emitted
-            // only thinking tokens or the stream was dropped mid-generation
-            // (done_reason="stream_end"). Unlike a malformed-tool attempt, this
-            // produces zero parseable signal, so without a retry the step would
-            // silently "complete" with nothing and collapse to an empty answer.
-            // Re-prompt up to MAX_TOOL_CORRECTION_RETRIES before giving up.
-            let is_empty_response = content.trim().is_empty();
-            if parse_result.is_failed_attempt() && correction_retries < MAX_TOOL_CORRECTION_RETRIES
-            {
-                correction_retries += 1;
-                tracing::warn!(
-                    "stream_step_with_tools round {}: malformed tool call, retrying ({}/{}) — diagnostics: {}",
-                    round,
-                    correction_retries,
-                    MAX_TOOL_CORRECTION_RETRIES,
-                    parse_result.diagnostics.format_for_correction()
-                );
-                // Re-prompt for correction without changing context_handle. The cached
-                // prefix still matches; only the appended text is new.
-                current_prompt = format!(
-                    "{}\n\nuser: Your previous tool call could not be parsed. {}. \
-                     Emit a valid <tool_call name=\"...\" call_id=\"...\">{{...}}</tool_call> block, \
-                     or finish the step without a tool call.",
-                    content,
-                    parse_result.diagnostics.format_for_correction()
-                );
-                continue;
-            } else if is_empty_response && correction_retries < MAX_TOOL_CORRECTION_RETRIES {
-                correction_retries += 1;
-                tracing::warn!(
-                    "stream_step_with_tools round {}: empty response (done_reason={}, likely \
-                     thinking-only output or dropped stream), retrying ({}/{})",
-                    round,
-                    if reason.is_empty() { "(none)" } else { reason },
-                    correction_retries,
-                    MAX_TOOL_CORRECTION_RETRIES
-                );
-                current_prompt = format!(
-                    "{}\n\nuser: Your previous response contained no content (done_reason={}). \
-                     If you intended to call a tool, emit a valid \
-                     <tool_call name=\"...\" call_id=\"...\">{{...}}</tool_call> block. Otherwise, \
-                     produce the actual response text for this step. Do not emit an empty reply.",
-                    content,
-                    if reason.is_empty() { "(none)" } else { reason }
-                );
-                continue;
-            }
-            // No tool calls and not a recoverable failed attempt — step complete.
-            tracing::info!(
-                "stream_step_with_tools round {}: no tool calls, step complete (chars={})",
-                round,
-                content.chars().count()
-            );
-            return finalize_with_answer(
-                step_result,
-                current_context.clone(),
-                &current_prompt,
-                tools_dispatched,
-            );
-        }
-
-        // Valid tool calls — reset retry counter, check for infinite loop.
-        correction_retries = 0;
-        let tool_calls = parse_result.calls;
-        let current_sig = tool_calls
-            .iter()
-            .map(|c| format!("{}:{}", c.name, c.parameters))
-            .collect::<Vec<_>>()
-            .join("|");
-        if current_sig == prev_signature {
-            tracing::warn!(
-                "stream_step_with_tools round {}: repeating tool signature, finalizing step",
-                round
-            );
-            return finalize_with_answer(
-                step_result,
-                current_context.clone(),
-                &current_prompt,
-                tools_dispatched,
-            );
-        }
-        prev_signature = current_sig;
-
-        // Preserve this round's metadata in case we exhaust MAX_TOOL_ROUNDS_PER_STEP.
-        last_step_result = Some(step_result.clone());
-        current_context = step_result.context_handle.clone();
-
-        // If the first call's JSON params failed to parse, retry the round for
-        // correction rather than dispatching empty params. Local models often
-        // corrupt large JSON content blobs (unquoted values, stray trailing
-        // commas); a generic "missing params" validation error gives the model
-        // no signal about the actual syntax problem, so it re-emits the same
-        // broken payload and the step dead-ends. The targeted parse error lets
-        // it self-correct. Only retries over the first call, since later calls
-        // are dropped this round anyway (see "one call per round" below).
-        if let Some(err) = tool_calls
-            .first()
-            .and_then(|c| c.parse_error.clone())
-            .filter(|_| correction_retries < MAX_TOOL_CORRECTION_RETRIES)
-        {
-            correction_retries += 1;
-            let first_name = tool_calls[0].name.clone();
-            tracing::warn!(
-                "stream_step_with_tools round {}: malformed JSON params for '{}', retrying ({}/{}) — {}",
-                round,
-                first_name,
-                correction_retries,
-                MAX_TOOL_CORRECTION_RETRIES,
-                err
-            );
-            current_prompt = format!(
-                "{}\n\nuser: Your last <tool_call name=\"{}\"> had malformed JSON parameters \
-                 and was NOT executed. {}. Re-emit the call with valid JSON — keys at the top \
-                 level (not nested under \"param\"/\"parameters\"), every string value properly \
-                 quoted, no trailing commas, no extra fields. Alternatively, finish the step \
-                 without a tool call.",
-                content, first_name, err
-            );
-            continue;
-        }
-
-        // Dispatch only the FIRST tool call this round. The agent loop is
-        // sequential: the model must see a tool's result before emitting a call
-        // that depends on it (e.g. write_file after web_reader). When the model
-        // batches dependent calls in one message, it hallucinates the dependent
-        // call's content before the prerequisite returns — and a giant inline
-        // content blob next to another call is far more likely to corrupt the
-        // JSON. Dropping the extra calls here and re-soliciting them next round
-        // (after the first result is visible) forces genuine sequencing. The
-        // signature check above is computed over ALL emitted calls, so a model
-        // that keeps re-emitting the same batch still terminates.
-        let dropped_count = tool_calls.len().saturating_sub(1);
-        let call = tool_calls
-            .into_iter()
-            .next()
-            .expect("non-empty calls verified above");
-        if dropped_count > 0 {
-            tracing::info!(
-                "stream_step_with_tools round {}: model emitted {} tool calls; dispatching only \
-                 the first ('{}'), {} deferred to later rounds",
-                round,
-                dropped_count + 1,
-                call.name,
-                dropped_count
-            );
-        }
-        let mut tool_result_blocks: Vec<String> = Vec::new();
-
-        tracing::info!(
-            "stream_step_with_tools round {}: dispatching tool={} params={:?}",
-            round,
-            call.name,
-            call.parameters
-        );
-        // Validate name.
-        if !tools.has_tool(&call.name) {
-            let err = tools::ToolResult::err(
-                &call.name,
-                &call.call_id,
-                format!(
-                    "Unknown tool '{}'. Available tools: {}",
-                    call.name,
-                    tools.list_names().join(", ")
-                ),
-            );
-            let _ = tx.send(agent::retry::PipelineResult::ToolStart {
-                tool_name: call.name.clone(),
-                call_id: call.call_id.clone(),
-            });
-            let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
-                result: err.clone(),
-            });
-            tool_result_blocks.push(format_tool_result_block(&err));
-        } else if let Ok(validation) = tools.validate_params(&call.name, &call.parameters) {
-            if !validation.is_empty() {
-                let err = tools::ToolResult::err(&call.name, &call.call_id, validation);
-                let _ = tx.send(agent::retry::PipelineResult::ToolStart {
-                    tool_name: call.name.clone(),
-                    call_id: call.call_id.clone(),
-                });
-                let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
-                    result: err.clone(),
-                });
-                tool_result_blocks.push(format_tool_result_block(&err));
-            } else {
-                // Dispatch.
-                let _ = tx.send(agent::retry::PipelineResult::ToolStart {
-                    tool_name: call.name.clone(),
-                    call_id: call.call_id.clone(),
-                });
-                let result = tools
-                    .get(&call.name)
-                    .unwrap()
-                    .execute(call.parameters.clone(), call.call_id.clone())
-                    .unwrap_or_else(|e| {
-                        tools::ToolResult::err(&call.name, &call.call_id, format!("{}", e))
-                    });
-                tracing::info!(
-                    "stream_step_with_tools round {}: tool {} result success={} output_chars={}",
-                    round,
-                    call.name,
-                    result.success,
-                    result.output.chars().count()
-                );
-                let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
-                    result: result.clone(),
-                });
-                tool_result_blocks.push(format_tool_result_block(&result));
-                tools_dispatched += 1;
-            }
-        } else {
-            // validate_params itself errored (shouldn't happen in practice) —
-            // surface as a failed tool result so the model can react.
-            let err = tools::ToolResult::err(
-                &call.name,
-                &call.call_id,
-                "Could not validate tool parameters.".to_string(),
-            );
-            let _ = tx.send(agent::retry::PipelineResult::ToolStart {
-                tool_name: call.name.clone(),
-                call_id: call.call_id.clone(),
-            });
-            let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
-                result: err.clone(),
-            });
-            tool_result_blocks.push(format_tool_result_block(&err));
-        }
-
-        // Build next-round prompt: append verbatim assistant output + tool_result blocks
-        // + continuation instruction. Ollama prefix-matches the cached KV tensors against
-        // the prior (prompt + assistant output) and evaluates only the tool_result delta.
-        let mut appended = String::new();
-        appended.push('\n');
-        appended.push_str(&content);
-        for block in &tool_result_blocks {
-            appended.push_str(block);
-        }
-        appended.push_str(
-            "\nuser: Continue the step using the tool result above. Emit ONE <tool_call> block \
-             for the next tool you need (wait for its result before calling the next one). If you \
-             now have enough information to answer the user's request, give the final answer in \
-             plain prose — no more tool calls, no file markers, just answer what was asked.\n",
-        );
-        current_prompt = format!("{}{}", current_prompt, appended);
-    }
-
-    tracing::warn!(
-        "stream_step_with_tools: hit MAX_TOOL_ROUNDS_PER_STEP={}, returning last step result",
-        MAX_TOOL_ROUNDS_PER_STEP
-    );
-    let candidate = last_step_result.unwrap_or(StepResult {
-        content: String::new(),
-        context_handle: current_context.clone(),
-        prompt_eval_count: None,
-        eval_count: None,
-        done_reason: None,
-    });
-    finalize_with_answer(candidate, current_context, &current_prompt, tools_dispatched)
-}
-
-/// Execute one plan step via Ollama's NATIVE tool-calling (`tools=` on `/api/chat`),
-/// the opt-in path used when `config.native_tool_calls` is set.
+/// Loops: call `/api/chat` with the tool definitions → if the model returns native
+/// tool calls, dispatch the first via the `ToolRegistry`, append the assistant turn
+/// (with its `tool_calls`) and the `tool`-role result to the message history, and
+/// re-call so the model sees the result and continues. Terminates when the model
+/// returns no tool calls (content is the step's final answer) or
+/// `MAX_TOOL_ROUNDS_PER_STEP` is hit.
 ///
-/// Thinking models (e.g. qwen3.5) will not emit text-format `<tool_call>` blocks on
-/// `/api/generate` — they put tool intent in their reasoning and stop with empty
-/// content — but they emit native tool calls reliably. This loops: call
-/// `/api/chat` with the tool definitions → if the model returns native tool calls,
-/// dispatch the first via the `ToolRegistry`, append the assistant turn (with its
-/// `tool_calls`) and the `tool`-role result to the message history, and re-call so
-/// the model sees the result and continues. Terminates when the model returns no
-/// tool calls (content is the step's final answer) or `MAX_TOOL_ROUNDS_PER_STEP` is hit.
-///
-/// Unlike `stream_step_with_tools`, this uses `/api/chat`, which does NOT expose the
-/// KV-cache `context` handle — so the returned `StepResult.context_handle` is always
-/// `None` (no manual cache reuse on this path).
+/// Uses `/api/chat`, which does NOT expose the KV-cache `context` handle — there is
+/// no manual cache reuse on this path. The status bar's `ctx:N%` indicator is fed
+/// from the rough prompt-token estimate computed by the caller.
 fn stream_step_native_tools(
     rt: &tokio::runtime::Runtime,
     client: &ollama::OllamaClient,
@@ -3275,7 +2394,7 @@ fn stream_step_native_tools(
     user_message: String,
     tools: &tools::ToolRegistry,
     tx: &mpsc::Sender<agent::retry::PipelineResult>,
-) -> StepResult {
+) -> String {
     let tool_defs = tools.ollama_tool_definitions();
     let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history_messages.len() + 2);
     messages.push(serde_json::json!({ "role": "system", "content": system_prompt }));
@@ -3285,13 +2404,12 @@ fn stream_step_native_tools(
     let mut prev_signature = String::new();
     let mut tools_dispatched = 0usize;
 
-    // Final-answer fallback (mirrors stream_step_with_tools): if tools ran but the
-    // candidate has no prose answer, do one more /api/chat call with NO tool
-    // definitions and an explicit "answer now" instruction — with no tools available
-    // the model must respond in prose. `messages` is passed in (not captured) because
-    // the loop mutates it each round.
+    // Final-answer fallback: if tools ran but the candidate has no prose answer,
+    // do one more /api/chat call with NO tool definitions and an explicit "answer
+    // now" instruction — with no tools available the model must respond in prose.
+    // `messages` is passed in (not captured) because the loop mutates it each round.
     let finalize_native =
-        |msgs: &[serde_json::Value], candidate: String, dispatched: usize| -> StepResult {
+        |msgs: &[serde_json::Value], candidate: String, dispatched: usize| -> String {
             if dispatched > 0 && !crate::agent::tools_parser::has_final_answer(&candidate) {
                 tracing::info!(
                     "stream_step_native_tools: step ended after {} tool dispatch(es) with no \
@@ -3318,23 +2436,11 @@ fn stream_step_native_tools(
                 ));
                 if let Ok(resp) = answer {
                     if !resp.content.trim().is_empty() {
-                        return StepResult {
-                            content: resp.content,
-                            context_handle: None,
-                            prompt_eval_count: None,
-                            eval_count: None,
-                            done_reason: Some("stop".into()),
-                        };
+                        return resp.content;
                     }
                 }
             }
-            StepResult {
-                content: candidate,
-                context_handle: None,
-                prompt_eval_count: None,
-                eval_count: None,
-                done_reason: Some("stop".into()),
-            }
+            candidate
         };
 
     for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
@@ -3350,15 +2456,7 @@ fn stream_step_native_tools(
             },
         )) {
             Ok(r) => r,
-            Err(e) => {
-                return StepResult {
-                    content: format!("ERROR: Native chat failed: {}", e),
-                    context_handle: None,
-                    prompt_eval_count: None,
-                    eval_count: None,
-                    done_reason: None,
-                };
-            }
+            Err(e) => return format!("ERROR: Native chat failed: {}", e),
         };
 
         if response.tool_calls.is_empty() {
@@ -3455,22 +2553,6 @@ fn stream_step_native_tools(
     finalize_native(&messages, String::new(), tools_dispatched)
 }
 
-/// Format a `ToolResult` as a `<tool_result>` block for inclusion in the next `/api/generate`
-/// prompt. The JSON payload shape mirrors what the agent loop uses; the closing-tag
-/// escape handles the rare case where fetched HTML/Markdown contains the literal sequence.
-fn format_tool_result_block(result: &tools::ToolResult) -> String {
-    let escaped_output = result.output.replace("</tool_result>", "</tool_result_");
-    let payload = if result.success {
-        serde_json::json!({ "success": true, "output": escaped_output })
-    } else {
-        serde_json::json!({ "success": false, "output": escaped_output, "error": "tool execution failed" })
-    };
-    format!(
-        "\n<tool_result tool=\"{}\" call_id=\"{}\">{}</tool_result>",
-        result.tool_name, result.call_id, payload
-    )
-}
-
 /// Token budget for auto-injected skill bodies. Keeps the prompt bounded even when
 /// several skills match the user's input.
 const MAX_MATCHED_SKILL_TOKENS: usize = 1500;
@@ -3507,34 +2589,6 @@ fn matched_skills_block(
         "\n\n## Relevant domain rules (auto-injected from skills)\n{}",
         bodies.join("\n\n")
     )
-}
-
-/// Build a flat prompt string from conversation history for `/api/generate`.
-/// Extracts system messages and returns (system_prompt, user_prompt).
-fn build_generate_prompt(
-    history: &[ConversationMessage],
-    current_input: &str,
-) -> (Option<String>, String) {
-    let mut system_parts: Vec<String> = Vec::new();
-    let mut conversation_parts: Vec<String> = Vec::new();
-
-    for msg in history {
-        if msg.role == "system" {
-            system_parts.push(msg.content.clone());
-        } else {
-            conversation_parts.push(format!("{}: {}", msg.role, msg.content));
-        }
-    }
-    conversation_parts.push(format!("user: {}", current_input));
-
-    let system = if system_parts.is_empty() {
-        None
-    } else {
-        Some(system_parts.join("\n\n"))
-    };
-    let prompt = conversation_parts.join("\n");
-
-    (system, prompt)
 }
 
 /// Estimate total tokens in a generate prompt.
