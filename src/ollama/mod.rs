@@ -35,6 +35,10 @@ impl OllamaClient {
     }
 
     /// Build an HTTP client suitable for streaming (no overall deadline, only connect timeout).
+    ///
+    /// Retained for a future streaming caller; unused after the native
+    /// tool-calling migration.
+    #[allow(dead_code)]
     pub fn streaming_http_client(connect_timeout: Duration) -> Result<Client> {
         Client::builder()
             .connect_timeout(connect_timeout)

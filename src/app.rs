@@ -70,6 +70,9 @@ pub struct AppState {
     pub mode: AppMode,
     pub config: Config,
     pub workspace: PathBuf,
+    /// Mirrors `config.enable_free_web_search`; gating now happens at the tool
+    /// layer, so this is currently set-but-unread.
+    #[allow(dead_code)]
     pub web_search_enabled: bool,
     pub think_enabled: bool,
     pub pending_confirmations: Vec<PendingAction>,

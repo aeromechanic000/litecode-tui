@@ -1,326 +1,423 @@
-# LitePilot-TUI 完整详细技术方案 V1.3 最终定稿
-## 文档说明
-本文为 **LitePilot-TUI** 终端智能编程助手完整落地技术方案，整合全部需求：命名规范、UI视觉、交互逻辑、快捷键模式切换、Ollama连接配置、三级模型分工、本地工程能力、语法校验、UV工程支持、无密钥全网搜索、沙盒安全机制、内置代码资源库、Agent规划逻辑，所有规则、流程、功能、配置全部固化，可直接用于开发落地。
+# Design Idea of Global Instruction
+
+Consider the best_skill.md introduced from https://github.com/microsoft/SkillOpt. Here are some final best skills
+
+# DocVQA Skill
+
+## Visual Evidence Discipline
+- Read the document carefully before answering.
+- Prefer the smallest exact text span that answers the question.
+
+- For questions asking for a value, count, page number, date, or graph reading, return only the requested value span; omit nearby labels, category names, units, or explanatory words unless the question explicitly asks for them.
+- When several nearby strings look similar, choose the one whose surrounding labels or layout best match the question.
+
+## Exact Answer Discipline
+- Copy names, numbers, and dates exactly from the document whenever possible.
+
+- Preserve the document's exact spelling and punctuation for names and quoted phrases; do not substitute similar letters or change straight/curly quotes, spacing, or parentheses when the visible text provides them.
+- Prefer direct extraction over paraphrase.
+- Before finalizing, compare the answer against nearby alternatives and keep the best-supported exact span.
+
+## Structured Layout Lookup
+- For tables, first find the row or entry named in the question, then read the value under the requested column, header, date, or category; answer with that cell only.
+- For forms, receipts, or labeled fields, locate the exact role, party, or field label mentioned in the question, then copy the filled-in value from the same line, box, block, or immediately adjacent field.
+- For table-of-contents, indexed, numbered, or bulleted lists, match the requested title, entry, or point number, then follow the same line or list item to the associated value; do not take a nearby value from another item.
+
+## Anchored Handwriting / Nearby Text
+- For handwritten or list/table questions with an anchor term, first locate the anchor, then inspect the immediately adjacent text in the same row, column, or nearby margin. If legible, provide the best-supported nearby span rather than leaving the answer blank.
+
+# ALFWorld Embodied Agent Skill
+
+## Overview
+This skill guides agents operating in the ALFWorld text-based embodied environment.
+The agent must complete household tasks by navigating rooms, interacting with objects,
+and using appliances. Actions must be chosen from the admissible action list provided
+at each step.
+
+**Output format**: Always output `<think>...</think>` for reasoning, then `<action>...</action>` for the chosen action.
 
 ---
 
-# 一、项目基础信息
-## 1.1 项目定名
-- 项目全称：**LitePilot-TUI**
-- NPM 发布包名：`litepilot-tui`
-- 终端启动命令：`litepilot`
-- 用户专属目录：`~/.litepilot/`
-- 全局统一禁用冗余竞品词汇，保持产品独立命名体系
+## Task Types
 
-## 1.2 安装与启动
-```bash
-# 全局安装
-npm install -g litepilot-tui
-# 任意项目目录启动
-litepilot
+| Type | Goal | Key Steps |
+|------|------|-----------|
+| Pick & Place | Put object X in/on receptacle Y | Find X -> take X -> go to Y -> put X in/on Y |
+| Pick Two & Place | Put two instances of X in/on Y | Find X1 -> take -> place -> find X2 -> take -> place |
+
+### Pick Two Object Bookkeeping
+For `pick_two_obj_and_place`, choose one destination receptacle instance once it is opened/usable, and remember it as the target. Both object instances should be placed into that same remembered receptacle. After placing the first object, do not remove it again; if the second object was already seen, return directly to its remembered location rather than searching randomly. If the two objects are accidentally split across different receptacles, consolidate them into the chosen target receptacle.
+| Examine in Light | Examine object X under desklamp | Find X -> take X -> find desklamp -> use desklamp |
+
+| Examine in Light detail | Final interaction | While holding X where a desklamp is visible, use the desklamp; do not try to place X on the lamp first. |
+| Clean & Place | Clean object X and put in/on Y | Find X -> take X -> go to sink -> clean X -> go to Y -> put X |
+| Heat & Place | Heat object X and put in/on Y | Find X -> take X -> go to microwave -> heat X -> go to Y -> put X |
+| Cool & Place | Cool object X and put in/on Y | Find X -> take X -> go to fridge -> cool X -> go to Y -> put X |
+
+---
+
+## General Principles
+
+1. **Decompose the task**: Parse the goal into ordered sub-goals (locate, acquire, transform, deliver). Complete each before moving to the next.
+2. **Systematic exploration**: Search each surface and container exactly once before revisiting. Open closed containers (drawers, cabinets, fridge) before judging them empty.
+
+- Prioritize semantically likely locations first, then broaden systematically: food in fridges/on countertops or dining tables; dishes/utensils/cookware on countertops, dining tables, stoveburners, cabinets, or drawers; office/bedroom items on desks, shelves, dressers, sidetables, or in drawers; newspapers on coffeetables, sidetables, sofas, or tvstands; toiletries/cleaning items near sinks, bathroom counters, shelves, carts, or cabinets.
+
+- For portable kitchen targets such as bread, mugs, cups, plates, bowls, and utensils, check broad exposed surfaces early: after one or two empty countertops, try dining tables or other open surfaces before opening many cabinets/drawers. For small office/bedroom targets, alternate drawers with exposed desks, shelves, sidetables, and dressers rather than exhausting drawers first.
+
+- Keep a persistent **searched set** of receptacle instances, e.g. `drawer 1`, `shelf 3`, `countertop 2`. Once an observation shows no needed target object there, mark it searched and do not call it “unexplored” later.
+   - If all locations in the current preferred class are searched, **broaden to any unvisited admissible `go to ...` location** instead of restarting the same sequence. Search broadly across surfaces, furniture, containers, and appliances when relevant.
+   - If a visible object is itself an openable/container-like object, such as a box, and opening/examining it is admissible, inspect it before leaving the area.
+3. **Grab immediately**: When a required object is visible and reachable, take it right away before moving elsewhere.
+
+- Pick up only the exact requested object type. Similar or related objects, such as a cup when the task asks for a mug, a spoon when it asks for a knife, or a pot when it asks for a pan, are distractors; leave them in place and mark that location searched for the target.
+4. **Transform before placing**: If the task requires cleaning, heating, or cooling, perform the state change at the appropriate appliance before heading to the final destination.
+
+- Do not repeatedly revisit the sink, microwave, fridge, or final destination before holding the target object. If you find the appliance early, remember its location, then resume searching unvisited object locations until the target object is acquired.
+
+- Use direct admissible appliance/tool commands immediately when available, such as `clean X with sinkbasin`, `heat X with microwave`, `cool X with fridge`, or `use desklamp`. Do not waste steps opening, closing, toggling, or examining the appliance unless the needed action is unavailable or opening is required for searching/placing.
+5. **Direct delivery**: Once holding the transformed (or untransformed) goal object, navigate straight to the target receptacle and place it.
+
+- Remember known destination receptacles and return directly to the same instance after pickup/transformation. If the destination is also a semantically likely source location, check/open it early rather than only after exhaustive search: food may already be in the fridge, utensils may be on the diningtable, newspapers may be on/near the sofa, and a target drawer can be opened early for pick-two tasks. If the object starts at the destination but needs cleaning/heating/cooling, take it out, transform it, then return to that same instance and place it back.
+6. **Track progress**: Maintain an internal count of how many objects still need to be found and placed. Only stop searching when the count reaches zero.
+7. **Avoid loops**: Never repeat the same action more than twice in a row. If stuck, move to a different unexplored location.
+8. **Only choose admissible actions**: Always pick an action from the admissible action list. Do not invent actions.
+
+---
+
+## Common Mistakes to Avoid
+
+- **Revisiting searched locations**: Keep track of which surfaces/containers have been checked; do not re-examine them.
+- **Ignoring visible objects**: If the target object appears in the observation, pick it up immediately.
+- **Skipping state changes**: Do not place an object at the destination without first cleaning/heating/cooling it when required.
+- **Premature termination**: Do not stop the episode until all goal conditions are verified as met.
+- **Action loops**: Repeatedly toggling or examining the same object wastes steps. Move on to new locations instead.
+
+### Hard Search-Loop Recovery
+
+- **Exact-instance lockout before pickup**: once a receptacle/surface instance has been observed and does not contain the target object, do not go back to that exact instance while still searching for the object. A phase change, such as holding the object or needing final delivery, is the only reason to return.
+- **Fast broadening threshold**: after 3-4 misses in the same receptacle class, switch to a different likely class or any unvisited admissible location instead of continuing or restarting that class, unless the target has already been seen there.
+- **No search reset by recency**: do not say a location is "unsearched" merely because it was not in the last few observations. The searched set is global for the whole episode.
+- **Finite-class exhaustion**: if all visible instances of a small class have been checked once, such as all stoveburners, diningtables, countertops, or shelves, mark that class exhausted for object search and do not start a second pass. Remember a usable destination instance, then search different receptacle classes.
+- **Unvisited beats likely-but-searched**: after several misses, prefer any admissible unvisited `go to`, `open`, or `examine` target over revisiting a semantically likely but already-searched location.
+- **Destination surfaces before pickup**: if the destination receptacle is also a likely object location, inspect each instance at most once before pickup. If it lacks the object, remember it as the final destination but stop using it as a search target until the object has been transformed and is ready to place.
+- **Kitchen item fallback**: for cookware and dishware, after checking obvious burners/tables/counters once, broaden to unsearched cabinets, drawers, shelves, sinkbasins, and other kitchen storage/surfaces rather than cycling among the obvious locations.
+
+### Strict Search Ledger Action Filter
+
+Before every empty-handed search action, apply this hard filter:
+
+1. If a required target object is visible, take it immediately.
+2. Otherwise choose an exact receptacle/surface/container instance whose contents have not yet been observed in the current object-search phase.
+3. Reject any `go to`, `examine`, or `open` action for an exact instance already observed to lack the target, even if it is semantically likely, nearby, recently mentioned, or the final destination type.
+4. If all likely instances are rejected by the ledger, broaden to any unvisited admissible location/class instead of restarting from instance 1 of a searched class.
+
+The searched ledger survives inventory checks, appliance visits, placing the first object in a pick-two task, and putting down an irrelevant inspected object/container. These events are not permission to rescan shelves, drawers, cabinets, tables, counters, or destination receptacles from the beginning.
+
+### Destination-as-Source Lockout
+
+When the final receptacle type is also a plausible source location, inspect each visible destination instance at most once before pickup. After it lacks the target, remember a usable destination instance and lock that exact instance out of object search until you are holding the required object ready for delivery. Do not alternate between destination instances and other searched source instances while still empty-handed.
+
+### Pick-Two Phase Memory
+
+After placing the first object in a pick-two task, do not begin a fresh room/class search. If another required instance was previously seen, return directly to that remembered source location for the second pickup. If no second instance is remembered, continue from the existing unsearched-location ledger rather than revisiting locations already checked before the first placement.
+
+<!-- SLOW_UPDATE_START -->
+Preserve the successful pattern: when the exact requested object is visible, take it immediately; perform the required clean/heat/cool/use action as soon as the correct command is admissible; then deliver directly to the remembered destination.
+
+Treat tool locations as tools, not repeated search targets. If a sinkbasin, fridge, microwave, desklamp, or destination receptacle has already been checked and does not contain the target while you are empty-handed, remember it for later but do not revisit it until you are holding the required object or ready to place/use it.
+
+Use a next-unsearched-instance pointer for every numbered class. If you leave cabinets, drawers, shelves, countertops, or stoveburners and later return to that class, resume at the lowest exact instance not yet observed; never restart at instance 1 and never revisit an instance already observed to lack the target.
+
+For pan-to-stoveburner tasks, search in a step-efficient order: make one quick pass over stoveburners only to find a pan or remember an empty destination, then leave stoveburners until delivery. Next check countertops/islands and sinkbasins. Then prioritize cabinets in numeric order, opening each closed cabinet and observing its contents, before low-yield drawers. Do not abandon cabinet search to revisit searched stoveburners, countertops, or drawers.
+
+For kettle/teapot clean-and-place tasks, after checking obvious countertops/islands, check stoveburners and sinkbasins once, then cabinets in numeric order. If several cabinets are empty, continue to the next unsearched cabinet or broaden to unvisited shelves/carts/dining tables; do not return to already searched countertops. Remember one open/empty cabinet as the final destination, but do not keep using searched cabinets as search targets.
+
+For dishsponge clean-and-place tasks, check sinkbasin and nearby countertops once, then search unvisited cabinets, drawers, shelves, carts, and other storage/surfaces. Because the sink is needed for cleaning, remember it after the first visit; do not go back to the sink while empty-handed just because the sponge is likely near it. Because shelf is the destination, remember a usable shelf after inspecting it once; after a shelf lacks the sponge, search only unvisited shelves or other unvisited locations until the sponge is found.
+
+When the step budget is running and you are still empty-handed, prefer any unvisited admissible location over any searched likely location. A location being semantically likely, useful later, or recently mentioned is never a reason to rescan it before acquisition.
+
+Do not let the broadening threshold cause class restarts. Broadening means move to a different unvisited class or continue at the next unsearched instance of a promising storage class; it never means cycling back through exact instances already observed.
+
+# Live Mathematical MCQ Heuristics
+
+## Option Comparison
+
+### Meta-Options About Stronger Results
+- Treat options of the form “one of the remaining options is correct, but a stronger result can be proven” as serious candidates, especially when the question asks for the strongest statement.
+- If a concrete option is true but your theorem or derivation gives a strictly stronger conclusion not exactly listed, choose the meta-option rather than the weaker concrete statement.
+- When options are nested by strength, rank them explicitly before answering: e.g. finite-time blowup is stronger than merely “not globally bounded”; positive stable growth is stronger than ordinary unboundedness; sharper constants, rates, exceptional-set bounds, endpoint inclusion, or full equivalences are stronger than weaker asymptotic versions.
+- Compare all options before committing. The correct choice is often the strongest statement justified by the question, while nearby distractors are weaker, overstrong, or miss an equality case.
+- Track exact quantifiers such as "there exists", "for every", "if and only if", and "exactly when".
+
+## Theorem-Level Precision
+
+- Do not add converse, realization, or classification claims unless the theorem explicitly proves them. Phrases such as “conversely,” “every such parameter occurs,” “if and only if,” or “exactly all” add strength beyond a one-way implication.
+- Check whether an option weakens the conclusion by dropping a characterization, equality clause, or full equivalence.
+- Check whether an option overstates the theorem by upgrading regularity, removing scale restrictions, or changing an existential statement into a universal one.
+
+## Hypotheses
+
+### Exact Conditions and Thresholds
+- For biconditional/equivalence questions, reject conditions that are merely necessary or merely sufficient. A broader condition, such as congruence modulo a divisor instead of modulo the full modulus, is usually weaker and not equivalent unless the domain collapses the extra cases.
+- For threshold conditions, verify the exact sign and endpoint: distinguish \(\mu_0\) from \(-\mu_0\), \(<\) from \(\le\), and whether the equality case belongs to the positive, zero, or negative parameter regime.
+- When options differ by “for every” vs “for sufficiently large,” local vs global domains, strict vs non-strict inequalities, or dependence of constants, rank them by logical strength and match the sharpest justified version.
+- Verify the hypotheses and domain carefully. Distractors often keep the theorem shape but alter the required assumptions.
+- Pay close attention to equality cases, extremal conditions, and whether a result applies to the full family or only a restricted subfamily.
+
+## Final Answer
+- Output the final answer as the single option label only.
+
+## Exact Scope and Quantitative Wording
+- Distinguish global conclusions from localized or completed ones. Equivalence after localization, completion, or at each prime/scale is usually weaker than an unqualified equivalence.
+- In estimate-heavy options, compare every quantitative detail: exponent, derivative index range, constants and their parameter dependence, log factors, additive terms, one-sided vs two-sided notation, and pointwise vs uniform convergence.
+
+# OfficeQA Skill
+
+## Retrieval Discipline
+
+- When an external official time-series observation is needed, prefer the source's series/data-download/table page once identified. If exact-date or guessed-value searches return empty results, stop repeating them; broaden to the official series name/code plus `data` or `download` and use the table values.
+
+- Treat provided/oracle parsed pages as primary evidence: if they contain the relevant table and period, extract directly from them before searching elsewhere; search only for missing continuation pages, missing periods, or an official actual value not present.
+- Start by narrowing to the most likely candidate file before reading long passages.
+- Prefer targeted search terms that name the exact entity, period, measure, or table concept from the question.
+- After a promising match, read only a small surrounding span and verify it matches the requested year, basis, and unit.
+
+- If the requested date range extends beyond the provided/oracle page, first enumerate the required periods and verify that every period is present in evidence. Do not compute from a partial ledger or fill missing periods from memory; retrieve continuation pages, adjacent issues, or a later issue of the same table that contains the missing dates/revisions.
+
+## Evidence Discipline
+- Extract the exact value from the retrieved text before doing any arithmetic.
+- Keep track of each operand's period, unit, and semantic role so nearby proxy values are not mixed in.
+
+- For Treasury financing narratives, label each amount by transaction role before calculating: offered amount, tenders/subscriptions received, tenders accepted, competitive/noncompetitive accepted, foreign or Government-account exchange tenders, refunding, and **new cash** are not interchangeable.
+- When converting currencies or scales, make a direction ledger first: source table unit, source currency, exchange-rate orientation (foreign currency per U.S. dollar means divide by the rate; U.S. dollars per foreign unit means multiply), and requested final unit.
+
+- For tables, align values by row label and exact column header, not proximity alone; watch for continued or unlabeled columns, footnotes, adjacent amount-versus-percent columns, fiscal-year versus calendar-year sections, and repeated month rows under different year blocks.
+- If the question asks for a transformed or derived quantity, compute only after confirming every operand.
+
+- For derived comparisons, preserve the direction and sign implied by the wording: “change from A to B” means B minus A; “former than latter” means former minus latter; “share accounted for by X” means X divided by the stated total; paired “gap” questions require computing each within-row difference before ranking.
+- For statistical, regression, correlation, and growth-rate questions, write a formula ledger before calculating: confirm the exact series/endpoints, ordered vector, elapsed intervals, and requested convention such as continuously compounded rate, CAGR, Pearson correlation, or OLS index/year choice.
+- For multi-stage questions where one table determines the period/entity used in another lookup, freeze that derived key with evidence first, then retrieve the second measure only for that exact month/year/reporting date/entity.
+
+- For inclusive time-series ranges, make a period-by-period ledger covering every requested month/year exactly once, preserving calendar versus fiscal basis, end-of-month or end-of-fiscal-month status, source units, and any specified adjustments.
+
+- For statistical transforms over time-series windows, confirm endpoint inclusion/exclusion exactly as worded, use consecutive time indices for trend regressions when appropriate, sort values before medians, and for logarithmic growth use ln(final/initial) before converting to the requested percentage format.
+
+## Final Answer Discipline
+
+- Before finalizing, enforce the requested unit and format: convert thousands/millions/billions or full nominal dollars as needed, then apply no-comma, fixed-decimal, whole-number, or nearest-tenth/thousandth formatting exactly as asked.
+- Return the final answer only after one last consistency check against the retrieved evidence.
+- Copy the final answer from a checked value, not from an unverified intermediate guess.
+
+## Statistical and Time-Series Calculation Checks
+
+- Before computing any statistic, write the intended formula and denominator convention. If the prompt explicitly says **population standard deviation**, divide by `n`; if it says **sample**, divide by `n-1`; for a z-score comparing one observation against a small set of comparison months/periods and no population convention is stated, estimate dispersion with the **sample** standard deviation of the comparison set. Do not round intermediate operands, weighted averages, logs, exchange-rate conversions, or standard deviations before the final requested rounding.
+- For long inclusive ranges, first enumerate the expected count of observations and the first/last period, then verify the ledger has exactly that count. Exclude totals, cumulative-to-date columns, comparable-period columns, estimates, and extra latest-month columns outside the requested calendar or fiscal range.
+- When a page contains multiple nearby sections with similar labels, use only the section whose title and row label match the requested measure exactly; do not compute from the first visible table if the requested measure/table title is absent or only partially shown.
+- For Treasury security quotations, obey the table's quote basis. If the table states that price decimals are 32nds, convert quotes such as `99.27` as `99 + 27/32`, not as decimal `99.27`. If a task asks for smoothing, averaging, or forecasting in a target currency using period-specific exchange rates, convert each period's observation to the target currency first unless the prompt explicitly says to compute in the source currency and convert only the final result.
+
+## Stricter Final Formatting
+
+- Match any requested output template exactly. Unless the prompt explicitly asks for unit words or explanatory text, return only the numeric value or requested list; do not append words such as `million`, `dollars`, `percent`, or `percentage points`. Include symbols/commas only when the prompt requests currency-formatted output or the answer format clearly requires them.
+
+# Question Answering Skill
+
+(No learned rules yet. Rules will be added through the reflection process.)
+
+## Concise Answer Normalization
+- Prefer the shortest unambiguous answer that directly satisfies the question. Do not include generic descriptors, legal suffixes, or expanded formal names unless the question specifically asks for the full official name or the descriptor is necessary to identify the entity.
+
+- If the answer appears inside a longer descriptive phrase, strip words that merely repeat the clue's requested type or modifiers already stated in the clue. For short-answer trivia, return the distinctive core entity or headword rather than role titles, product flavor adjectives, or place/facility designators, even when those words are part of a fuller official phrase, unless the full official name is explicitly requested.
+- For place/name-etymology questions asking for “the name” or “the word” that means something, answer the distinctive name/word itself rather than a larger phrase with a generic type label.
+
+- For natural geographic features, preserve conventional feature designators such as “Lake,” “River,” “Bay,” “Gorge,” “Mount,” or “Island” when they are part of the proper name or match the requested feature type. Do not shorten “Lake Okeechobee,” “Tampa Bay,” or “Olduvai Gorge” to an ambiguous base name merely to be concise.
+- For companies, brands, and organizations, answer the common distinctive name when sufficient; omit additions such as “Company,” “Corporation,” “Inc.,” etc. unless explicitly required.
+
+- Preserve the answer surface form supported by the strongest evidence when exact variants differ: spelling, capitalization, punctuation, and word order can matter. Do not substitute an equivalent official/common variant such as an alternate spelling or inverted institution name if a direct title/snippet/answer field gives the expected form.
+
+- When copying titles or quoted names, preserve ordinary ASCII punctuation from the evidence, especially straight apostrophes (`'`). Do not replace them with typographic curly quotes/apostrophes unless that exact stylized form is explicitly shown as the supported answer.
+
+- For nicknames, epithets, saints, and quoted titles, copy the supported surface form exactly, including spacing, capitalization, and conventional abbreviations such as “St.” Do not normalize a stylized or quoted form into a lowercase dictionary word or an expanded spelling when the clue/evidence points to the stylized answer.
+
+- For person answers in trivia or crossword-style clues, prefer the conventional supported name. Use just a surname, first name, or saint/regnal name only when the clue/source clearly expects that short form; otherwise use the canonical full personal name from the strongest evidence or answer field, especially when a lone given name would be ambiguous.
+- Return the grammatical base form expected by the clue. Do not add a plural `s` merely because a crossword source pluralizes a shared name or category; if the clue lists people sharing a first name, answer the singular given name.
+
+- For common-noun category answers, default to the singular dictionary headword in trivia/crossword-style clues, even if the clue uses plural words like “these,” “those,” “places,” or “items” for grammar. Use a plural only when the term is inherently plural or an answer field/source clearly gives a plural phrase.
+
+- For common-noun clues about things being replaced, used in place of, or substituted by another system/item, answer the broad headword for the thing replaced unless a narrowing modifier is required by the clue or answer field. Do not add adjectives such as “letter,” “regular,” or “standard” merely because they appear in explanatory context.
+- For fill-in-the-blank or definitional clues using words like “this” or “that,” provide a standalone noun phrase. Avoid context-dependent pronouns or possessives from the source text; use a natural article such as “the” when needed (e.g., answer “the highest point,” not “its highest point”).
+
+## Context-Grounded Evidence Matching
+- Start by identifying the most distinctive terms in the question: proper names, dates, titles, quoted phrases, unusual words, roles, relationships, and category descriptors.
+- Prioritize passages or document titles where several distinctive clue terms occur together, especially if the wording directly repeats or closely paraphrases the question.
+- Treat document titles as useful evidence: the answer is often named in a title while the snippet confirms the clue facts.
+
+- Do not assume the document title itself is the answer. If the requested type differs from the title entity, use the title as context and extract the matching typed entity from the snippet or clue relationship.
+
+- For “known as,” “called,” “defined as,” or category/type clues, choose the canonical term explicitly used in the strongest matching title/snippet or scraped answer field rather than inventing a related derivative or near-synonym from the clue wording. When multiple plausible candidates appear, prefer the candidate whose evidence directly states the requested relationship and repeats the most distinctive clue facts.
+- Ignore noisy results that only match generic words; prefer evidence that directly connects the clue facts to one specific entity.
+
+## Clue Interpretation and Answer Type
+- For Jeopardy-style wording such as “this man,” “this group,” “this film,” “this country,” “this system,” “he,” or “his wife,” infer the expected answer type before choosing the answer.
+- Use that expected type to validate candidates: answer with the concise person, place, title, organization, object, term, or phrase requested by the clue.
+
+- Treat modifiers attached to the requested type as hard filters, not background flavor: constraints like dates, “largest,” “2-letter-named,” “1978 remake,” “hot dog brand,” “dual throne,” or “on this company’s board” must all fit the candidate before you answer.
+- For clues centered on creative works such as books, films, plays, songs, poems, or other media, first determine whether the clue asks for the work itself, its creator, a performer or cast member, a character, a quotation source, or a setting. Verbs such as “wrote,” “directed,” “stars,” “played,” and “set in,” plus pronouns like “he” or “her,” usually determine the target.
+
+- For fill-in-style clues with placeholders such as “this,” “these,” or “one of these,” substitute each candidate back into the clue and choose the concise answer that makes the full phrase, title, or fact read correctly.
+- For terse clues that are just examples or names separated by commas, slashes, or “or,” infer the shared category, class, or synonym that links them, then answer with that concise common term.
+
+- For crossword-style clues, treat parenthetical numbers or stated letter counts as hard constraints on the answer length, and omit generic labels that would violate them. In dual-definition clues using wording like “X, or what Y does,” choose the single word that satisfies both senses and preserve the required inflected form.
+- If the clue references an unavailable image or link with wording like “seen here,” “pictured,” or parenthetical visual hints, rely on the textual clues and context to infer the answer; do not treat the missing image as necessary evidence.
+- If multiple snippets support the same entity, use that corroboration to choose the canonical/common form of the answer.
+
+## Trivia / Jeopardy Snippet Formats
+- Retrieved trivia snippets may contain the clue and answer in scraped formats such as `CATEGORY | clue | answer`, `clue. ANSWER`, or labels like `right:`.
+- When the question text matches the clue in such a snippet, extract the answer field or adjacent answer name, not the category or the whole clue sentence.
+
+## Common Clue Traps
+- Watch for inverse relationships: if the clue says “His third wife was Jiang Qing,” the requested answer is the husband, not Jiang Qing.
+
+- More generally, preserve relation direction in clues: “A is evidence of this B,” “A is related to this language,” or “home to these characters” asks for the target of the relationship, not the entity already named in the clue.
+
+- When a clue says examples, models, breeds, members, or items “include,” “like,” or “such as” named entities, treat those names as evidence for the requested parent class or entity. Answer the encompassing brand, animal, category, place, or term requested by “this,” not one of the examples already given.
+- If the question gives the start of a quotation or phrase, answer with the exact missing continuation from the context.
+
+- For song, poem, nursery-rhyme, or quotation clues, first decide whether the question asks for a missing word or phrase from the quote or for the associated creator, performer, or work; use pronouns and answer-type signals to choose the right target.
+- When a clue asks for a constrained form such as a first name, abbreviation, acronym, or lyric word, return that exact form rather than the fuller person, title, or explanation; preserve conventional punctuation or spelling when it is part of the requested form.
+- If the clue contains wordplay, quotation marks, or puns, treat them as hints, but answer with the real entity supported by the evidence.
+
+- If a clue includes a quoted title, quoted narration or lyric, named event, slogan, or other distinctive phrase but asks for an associated “this” entity, treat the quote or name as evidence to identify the requested person, work, place, group, category, source, or term; do not return the quoted anchor unless the clue explicitly asks for it.
+
+# Spreadsheet Manipulation Skill (xlsx)
+
+## Overview
+This skill guides agents in manipulating Excel (.xlsx) spreadsheets using Python.
+
+**Primary libraries**: `openpyxl` (structure-preserving read/write), `pandas` (data transformation).
+Never use any other third-party libraries.
+
+---
+
+## Common Workflow
+
+1. **Explore** the input file: list sheets, inspect headers, check dimensions.
+
+- Inspect actual workbook data beyond the preview, including nearby rows/columns, sample outputs, formulas, labels, headers, and any reference/example sheets such as `Output`, `Manual Result`, or `Desired...` tabs.
+
+- Treat existing filled cells in the requested output area or adjacent example tables as semantic examples for edge cases and expected formats, but still recompute and write the complete requested target range.
+   - Scan the used range for complete header groups, not just row 1. Tables may start in later rows/columns, have title rows above them, or have multiple source/result tables on the same sheet; use nearby labels and the requested output range to distinguish sources from destinations.
+   - Locate tables, fields, and target ranges by header text, nearby labels, and surrounding nonblank structure rather than fixed coordinates. Build header maps from actual cells when useful, e.g. `{str(cell.value).strip(): cell.column}`.
+2. **Write `solution.py`** with `INPUT_PATH` and `OUTPUT_PATH` defined at the top.
+3. **Execute** `python solution.py` and verify the output file was created.
+4. **Confirm** the target cells/range contain the expected values.
+
+---
+
+## Library Selection
+
+| Use case | Library |
+|----------|---------|
+| Preserve formulas, formatting, named ranges | `openpyxl` |
+| Bulk data transformation, aggregation, sorting | `pandas` → write back with `openpyxl` |
+| Simple cell read/write | `openpyxl` |
+
+**Warning**: `pandas.to_excel()` silently destroys existing formulas and named ranges.
+When writing back to a spreadsheet that contains formulas, always use `openpyxl.save()`.
+
+**Formula evaluation caution**: `openpyxl` can write formulas but does **not** calculate them or update cached results. If the requested output will be checked as cell values, compute the result in Python and write literal values unless the user explicitly requires live formulas. When existing formulas are inputs to your logic, load a second workbook with `data_only=True` to read cached values while saving changes through the normal workbook:
+
+```python
+wb = openpyxl.load_workbook(INPUT_PATH)
+wb_values = openpyxl.load_workbook(INPUT_PATH, data_only=True)
+ws = wb["Sheet1"]
+ws_values = wb_values["Sheet1"]
 ```
 
-## 1.3 核心定位
-1. **视觉风格**：沿用 DeepSeek-TUI 经典冷蓝色终端配色、面板布局、代码高亮样式
-2. **交互逻辑**：完全对齐 Claude Code 操作习惯、文件编辑流程、任务交互逻辑
-3. **Agent规划逻辑**：参考 DeepSeek TUI Agent 分层任务拆解、项目整体规划设计
-4. **模型底层**：原生深度对接 Ollama，支持所有本地开源大模型，优先极致优化 5B 以内轻量化编码模型
-5. **运行环境**：纯本地离线优先，无强制云端依赖，支持内网/断网使用
-6. **能力边界**：终端内完成项目规划、代码编写、语法自检、依赖管理、命令行调试、技术资料检索全流程
+Treat wording such as “write/fix a formula,” “SUMIFS/COUNTIFS,” “VBA,” or “macro” as a description of the spreadsheet logic unless the deliverable explicitly requires live formula text, an `.xlsm`, or a preserved VBA project. For normal `.xlsx` outputs, implement the equivalent logic in Python/openpyxl and write the computed final values to the requested cells so verification does not depend on Excel recalculation or macros.
 
-## 1.4 核心技术栈
-- 主开发语言：**Rust**（高性能、低内存、跨平台静态编译）
-- TUI渲染框架：`ratatui` + `crossterm`
-- 异步运行时：`tokio`
-- 网络请求：`reqwest`（对接Ollama流式接口、内置网页搜索）
-- 配置解析：`serde` + `toml`
-- 文件遍历与扫描：`walkdir`
-- 代码标签解析：`regex`
-- 跨平台打包：编译 Windows / Mac / Linux 三平台二进制
-- 分发方案：二进制封装 NPM 壳包，实现一行命令全局安装
+When the user provides an existing or broken formula, use it as a semantic specification: honor its referenced lookup ranges, criteria ranges, return ranges, aggregation intent, and error-handling behavior, then write the resulting values rather than guessing different source columns or leaving unevaluated formulas.
 
 ---
 
-# 二、初始化引导流程（首次启动强制执行）
-## 2.1 第一步：Ollama 服务连接配置
-1. 默认预设地址：`http://127.0.0.1:11434`
-2. 支持用户自定义填写 **IP + 端口**，支持局域网内网Ollama、远程自建Ollama服务
-3. 内置连通性心跳测试：
-   - 连接成功：蓝色提示服务正常
-   - 连接失败：提示排查方向（端口占用、服务未启动、网络不通）
-4. 连接正常后**自动拉取当前Ollama已部署全部模型列表**，可视化展示
+## solution.py Template
 
-## 2.2 第二步：三级职能模型可视化配置
-用户从本地模型列表中，分别选定三类分工模型，为空则自动降级复用已有模型：
-1. **Fast Model 速思规划模型**
-    适用：3B~5B轻量小模型
-    职责：需求理解、项目架构拆分、任务分步规划、文档注释撰写、思路梳理
-2. **Core Model 主力编写模型**
-    适用：6B~7B主流编码模型
-    职责：项目主体文件编写、业务逻辑实现、前端页面、后端接口、游戏架构落地、引用本地资源库模板
-3. **Audit Model 精审校验模型**
-    适用：7B~14B高精度模型
-    职责：语法错误修正、代码逻辑审查、多文件联动一致性优化、代码规范统一、运行问题修复
+```python
+import openpyxl
+import pandas as pd
 
-## 2.3 第三步：自动生成本地运行目录
-首次启动自动创建完整目录结构：
-```
-~/.litepilot/
-├── config.toml          # 全局核心配置文件
-├── sessions/            # 历史对话会话持久化存储
-├── cache/               # 检索缓存、网页搜索缓存、代码片段缓存
-└── code_base/           # 出厂内置离线通用代码参考库
+INPUT_PATH  = "..."   # set to the actual input path
+OUTPUT_PATH = "..."   # set to the actual output path
+
+wb = openpyxl.load_workbook(INPUT_PATH)
+ws = wb.active  # or wb["SheetName"]
+
+# --- perform manipulation ---
+
+wb.save(OUTPUT_PATH)
 ```
 
 ---
 
-# 三、界面视觉与布局规范
-## 3.1 配色体系（严格沿用 DeepSeek-TUI 蓝调主题）
-- 主题主色：深空蓝 #165DFF（选中项、状态栏高亮、功能按钮）
-- 辅助色：雾蓝 #4080FF（分割线、边框、状态标识）
-- 主面板背景：深炭灰 #1E2228
-- 侧边栏背景：暗蓝灰 #232733
-- 普通文本：浅灰白色
-- 模型思考流文本：浅青蓝色
-- 代码语法高亮：统一沿用DeepSeek原生蓝色系高亮规则
-- 警告提示：浅黄色
-- 错误提示：浅红色
-- 沙盒权限提示：冰蓝色高亮
+## Output Requirements
 
-## 3.2 整体界面布局（对齐 Claude Code）
-1. **顶部全局状态栏**
-    展示内容：LitePilot标识、Ollama连接地址、当前三级模型名称、当前运行模式、工作目录路径、网络检索开关状态
-2. **左侧面板**
-    分区1：当前本地项目文件树
-    分区2：内置`code_base`参考资源库目录树
-    支持文件夹折叠、展开、快速插入参考代码
-3. **中央主输出面板**
-    流式思维推演展示、结构化规划文档、代码块展示、命令行执行日志、差异修改预览
-4. **底部交互区域**
-    用户指令输入框、操作确认提示、快捷键功能提示
+- Save the result to `OUTPUT_PATH`.
+- Do not hardcode row counts or column letters — iterate over actual rows in the workbook.
+- Preserve sheets and cells not mentioned in the instruction.
 
-## 3.3 全局核心快捷键
-- **Shift + Tab**：循环切换三大工作模式（Plan → Edit → Auto）
+## Matching and Target Range Hygiene
 
----
+- Choose the comparison operator from the instruction and examples: use `startswith` for “begins with”, substring search for “contains/search/occurrence”, and exact normalized equality only when a whole-cell match is implied.
+- Create small helper functions for comparisons and numeric parsing. Normalize text by trimming, collapsing repeated spaces/NBSPs, and casefolding; when names or labels have punctuation/spacing inconsistencies, consider punctuation-insensitive keys. Parse numeric text after removing commas/currency symbols while preserving signs and decimal points; skip `None`/blank and booleans for numeric tests, and handle placeholders such as `"-"`, `"$"`, `"$0"`, blanks, and numeric zero deliberately.
+- Normalize date keys deliberately: handle `datetime`/`date` objects, Excel serial numbers, and date-like strings, then compare at the granularity implied by the task, such as exact date, month, month/year, fiscal period, or year. For workday/date-window logic, compute the range in Python and exclude weekends/holidays as specified.
 
-# 四、三大核心工作模式（对齐Claude Code权限逻辑）
-## 4.1 Plan 规划模式
-1. 权限规则：**纯只读模式，无任何文件写入权限**
-2. 执行行为
-    - 仅解析用户需求
-    - 输出完整项目规划方案
-    - 梳理目录结构、文件清单、开发顺序、依赖清单、测试方案
-    - 调取内置代码库参考架构，输出设计思路
-3. 禁止操作：不创建文件、不修改代码、不删除文件、不执行落地写入操作
-4. 适用场景：项目前期架构设计、需求评审、教学备课、方案预推演
+- For monthly or period summary grids, canonicalize period labels from all sources: sheet names, title text, row/column headers, text months such as `March`, and actual date cells. Match summaries by normalized period plus the other stated criteria rather than by fixed month offsets or existing formulas.
+- For date ranges and rolling windows, infer endpoint inclusivity from wording and examples. Phrases like `X to Y`, `through`, and `up to`, or examples such as `2 to 5` meaning `4 days`, usually require inclusive boundary handling.
+- For time extraction or time-threshold logic, parse `datetime`, `time`, Excel serial/fractional times, and time-like strings into real Python `time`/`datetime` values. Write real time values with an Excel `number_format` such as `hh:mm:ss AM/PM`; do not write text substrings when the result should behave as a time.
+- For joins, deduplication, grouping, interval lookups, lookup grids, and ordered outputs, build explicit normalized keys, including composite keys when the task refers to multiple fields. Preserve original source order within each group unless sorting is explicitly requested.
+- For outputs that depend on other rows or lookup grids, make a first pass to build normalized dictionaries/groups/range structures, then a second pass to write results. Avoid nested full-sheet scans per row; split delimited tokens and ignore empty tokens, and treat error literals such as `#N/A` as meaningful sentinel values when the task refers to them.
 
-## 4.2 Edit 编辑确认模式（默认启动模式）
-1. 权限规则：**支持生成代码与文件修改，所有落地操作必须人工确认 Approve**
-2. 标准执行流程
-    1. Agent生成新增/修改/删除文件内容
-    2. 终端展示代码差异预览
-    3. 等待用户手动确认
-    4. 确认通过后正式写入本地磁盘
-    5. 高危文件操作、跨目录操作触发二次确认
-3. 支持全部内置能力：三级模型流水线、语法自动校验、UV工程管理、免费网页搜索
-4. 适用场景：日常开发、项目迭代、可控代码编写、调试优化
+- For lookups, filters, joins, and label/header matching, normalize comparison keys consistently: trim whitespace, skip blanks explicitly, use case-insensitive text matching when appropriate, and treat numeric-looking IDs consistently (`330`, `330.0`, and `"330"`). Keep numeric outputs numeric; use `number_format` for display formatting instead of converting numbers to strings unless text is explicitly required.
+- When replacing a generated output area, clear only the instructed target range before writing new results so stale values/formulas do not remain. Preserve formatting, column widths, borders, formulas, and unrelated cells unless the instruction explicitly asks to change them.
 
-## 4.3 Auto 全自动执行模式
-1. 启动前置强制安全弹窗提示
-```
-【安全风险提醒】已进入全自动执行模式
-1. 程序将自主完成规划、编写、修改、自检、调试全流程
-2. 无需用户任何人工确认，自动执行所有代码操作
-3. 严格沙盒限制：仅允许操作当前 litepilot 启动目录及所有下级子目录
-4. 禁止访问上级目录、系统目录、配置目录、外部项目文件
-```
-2. 强制沙盒安全规则
-    - 目录访问严格锁定启动工作区，越界读写直接拦截并告警
-    - 命令行执行启用黑白名单，禁止系统高危删除、权限篡改、全局修改指令
-    - 仅放行代码运行、语法检测、依赖安装、接口测试、项目启动等开发安全指令
-3. 运行逻辑
-    - 取消所有人机确认节点，全自动走完完整开发流程
-    - 完整保留语法自检、UV项目管理、全网技术检索、代码优化全部能力
-4. 退出方式：再次按下 `Shift+Tab` 切换至其他模式
+- If the instruction includes formatting changes, apply them exactly after writing values and only to the requested cells/range. Use `openpyxl` styles for fills, alignment, fonts, borders, and number formats; convert hex colors to ARGB when needed, for example `#FFC000` → `FFFFC000`. For “format as text,” set `number_format = '@'` and write string values when the expected cell values are text.
 
----
+- When the instruction names a destination range or columns, write derived results directly there. Do not insert rows/columns, relocate the source table, or sort/delete source records unless that structural change is explicitly requested.
+- For filtered lists, summaries, and aggregations, first collect all source records/results in memory, preserving the required order, then write from the first output row and clear leftover cells below the new results in the target columns. When adding rows, copy style/alignment/number format from an existing template row when appropriate; when deleting rows, delete from bottom to top to avoid row-index shifts.
+- Preserve intended blanks as empty cells (`None`) rather than placeholder text or `0` unless the task specifies otherwise.
 
-# 五、内置离线 CodeBase 参考资源库（出厂预装）
-## 5.1 资源库存放路径
-`~/.litepilot/code_base/`
+- For numeric aggregation, crosstab, SUMIFS-like, and INDEX/MATCH-style summary outputs, infer missing-match behavior from table semantics and examples: numeric summary grids usually require literal `0` for no matching records, while filtered lists or “show only once” outputs usually require blanks (`None`).
+- For blank-sensitive logic such as “if input is blank, output blank,” evaluate the driving input with `data_only=True` when it may itself be a formula, and write `None` for truly blank outputs rather than relying on a new formula returning `""`.
 
-## 5.2 预置完整模板分类
-1. **个人网站类**
-    蓝调响应式静态个人主页、Flask动态个人主页、作品集展示网站完整骨架
-2. **Python Flask 全栈后端**
-    标准项目分层架构、GET/POST接口、跨域处理、用户登录、文件上传、数据查询模板
-3. **前端蓝调布局模板**
-    蓝调全屏登录页、后台管理侧边布局、数据仪表盘、深浅双主题、移动端自适应布局
-4. **联机游戏工程骨架**
-    多人FPS射击游戏（Canvas+WebSocket联机架构）、多人联机赛车游戏（帧同步+房间机制）
-5. **休闲小游戏**
-    贪吃蛇、俄罗斯方块、消除类前端完整可运行源码
-6. **通用工具脚本**
-    Python批量处理脚本、Shell运维脚本、Node工具函数等
+## Robustness for Simple Fill Tasks
 
-## 5.3 统一代码规范
-所有内置代码头部统一携带检索标签，用于本地轻量RAG精准匹配注入上下文
-```
-# @LIGHT_DESC: 功能简述
-# @LIGHT_SCENE: 使用场景
-# @LIGHT_TAGS: 标签分类
-```
-作用：大幅补齐小模型架构设计能力，快速仿写成熟项目结构。
+- Prefer simple, auditable row/column loops over complex workbook XML parsing unless the task truly requires unsupported workbook internals. Before returning, run the script once to catch syntax/indentation errors and verify that representative target rows were actually written.
 
----
+<!-- SLOW_UPDATE_START -->
+When the user asks for a formula, macro, VBA code, or a fix to an Excel formula, still deliver the completed workbook state: compute the intended results in Python and write literal final values into the requested cells. Do not write formula strings unless the task explicitly says the output must contain live formulas.
 
-# 六、内置工程自动化核心能力
-## 6.1 标准化项目规划能力（参考 DeepSeek TUI Agent）
-1. 接收需求优先输出分层规划文档
-2. 规划层级：整体项目定位 → 目录结构划分 → 核心文件职责 → 依赖环境 → 开发顺序 → 自测流程
-3. 小模型自动拆分超细粒度子任务，中大模型使用全局整体规划
-4. 规划阶段优先匹配本地code_base同类项目架构作为参照标准
+After writing, reload or inspect the saved workbook and verify that every requested/evaluated target cell contains a non-formula literal where a value is expected. If a target cell is still `None` unexpectedly, fix the script before finishing.
 
-## 6.2 全语言本地语法自动校验体系
-代码编写完成后**自动调用本地命令行完成静态语法检测**，不依赖模型主观判断正误
-| 编程语言 | 本地自检命令 |
-| ---- | ---- |
-| Python | python -m py_compile 文件名 |
-| JavaScript / Node | node -c 文件名 |
-| Shell / Bash | bash -n 脚本名 |
-| Rust | rustc --check |
-| Go | go vet + 编译预检 |
-| C/C++ | gcc / g++ 语法筛查 |
-1. 自动捕获错误日志
-2. 推送错误信息至精审模型完成定向修复
-3. 修复完成二次复检，消除基础语法错误
+Use existing formulas in the workbook as examples/specifications, not as output. If a cell contains a reference formula such as `=A25` or an INDEX/MATCH/SUMIFS pattern, parse what source cells/ranges/criteria it refers to, compute those results yourself, and overwrite the destination with the referenced or calculated value.
 
-## 6.3 深度集成 Python UV 工程管理体系
-Agent默认优先使用`uv`作为Python项目标准工程工具，固化全套使用逻辑：
-1. `uv init` 快速初始化全新Python项目
-2. `uv venv` 创建独立虚拟隔离环境
-3. `uv add` 一键安装项目依赖包
-4. `uv run` 执行项目脚本、启动后端服务
-5. 项目完成自动生成UV环境部署与启动流程
+For blank-sensitive formula tasks, compute the branch explicitly: if the driving source cell is truly blank, write `None`; otherwise write the actual result such as `0`, `1`, a category label, or a lookup value. Never rely on `IF(...,"",...)` formulas to be recalculated later.
 
-## 6.4 命令行问题解决思维固化（对齐Claude Code）
-系统全局Prompt固定行为准则：
-1. 功能实现优先结合终端命令行组合方案完成
-2. 文件批量处理、日志筛选、进程管理、端口调试优先使用终端指令
-3. 接口测试优先使用curl快速验证
-4. 完整开发固定流程：规划→建文件→编写代码→语法自检→命令行试运行→迭代优化
+For lookup/category tasks, locate both the input rows and the lookup table by headers and nearby labels. Support exact keys, numeric-looking keys, and interval/range tables; then fill every destination row that has a driving input, not just the first visible example.
 
----
+For “every nth row” or OFFSET-style tasks, infer the source column, first source row, and step from the provided examples or formulas, then copy the actual source values into the requested output range as literals.
 
-# 七、无密钥跨区通用全网搜索能力
-## 7.1 核心特性
-1. **零API Key、零付费接口、无需任何第三方授权**
-2. 自动识别国内/海外网络环境，智能切换检索源，全网无障碍访问
-3. Rust底层原生实现，无额外第三方依赖
-4. 轻量化正文提取，自动过滤广告、冗余资讯，仅保留代码示例、文档用法、报错解决方案
+For schedule/calendar fill tasks, build a cycle-day-to-periods mapping from the schedule/template area first, then fill the daily rows across all requested class columns based on each row’s cycle day. Preserve repeated/double periods exactly as shown by the template; do not leave formulas in the schedule cells.
 
-## 7.2 运行机制
-1. 聚合多组全球免费公开技术检索入口
-2. 启动检索前自动探测网络连通状态与区域限制
-3. 检索结果自动精简压缩，适配小模型有限上下文长度
-4. 本地缓存机制：高频技术资料存入`~/.litepilot/cache/web_search`，重复需求优先读取本地缓存
+For INDEX/MATCH problems where the first row works but subsequent rows fail, treat row labels, column/year headers, region/type criteria, and expense/category labels as a multi-key lookup. Fill the whole result matrix with values from the source data table, using cached `data_only` values when source cells are formulas.
 
-## 7.3 调用管控规则
-1. 自动触发场景：项目规划缺方案、语法报错修复、新技术框架用法查阅、开源工具使用查询
-2. 基础通用代码优先使用本地code_base，减少联网请求
-3. 支持用户手动开启/关闭全网搜索功能
-4. Auto全自动模式仅限定检索编程技术类内容，严格限制检索范围
+For multi-step macro/VBA-style requests, implement every stated operation in the workbook, not just the first deletion/filtering step. Re-read the numbered requirements before saving and verify later computed columns, totals, and derived fields as well as the obvious filtered rows.
 
----
+When a target range includes special rows such as `Total`, `Grand Total`, `min`, `max`, constraints, headers, or blank separators, do not apply ordinary row logic blindly to those rows. Compute totals as aggregates when indicated, and leave constraint/header/blank cells untouched unless explicitly requested.
 
-# 八、Ollama 深度适配与消息处理机制
-## 8.1 模型自动适配策略
-1. 程序自动读取Ollama模型信息：参数量、上下文窗口大小、量化精度
-2. 小模型（≤5B）：强制任务拆分、高权重引用本地代码库、精简对话上下文
-3. 中模型（7B~14B）：标准均衡流程，适度任务拆分
-4. 大模型（≥30B）：弱化拆分与知识库依赖，启用原生强推理模式
+For residual-balancing tasks, identify data rows separately from min/max constraint rows. Add positive residuals from unit 1 toward unit 5 without exceeding max values; subtract negative residuals from unit 5 toward unit 1 without going below min values; update only the unit cells in actual data rows.
 
-## 8.2 Ollama 消息分级解析
-1. 普通输出信息：白色正常展示
-2. 推理性能警告、上下文不足、显存偏高提示：浅黄色提醒
-3. 模型加载失败、显存溢出、接口报错：红色错误提示并给出解决方案
-4. 支持流式输出断点续传、推理中断自动重连重试
+For time-threshold rows, decide per row whether it is a normal data row or a summary row. Normal rows use the before/after threshold rule; summary rows should aggregate the computed normal-row results if the workbook labels or examples indicate a total.
 
----
+Keep scripts simple enough to run cleanly. Avoid unnecessary dynamic code generation and fragile f-strings with regex expressions inside them. Always execute the final `solution.py`; fix any syntax, indentation, or runtime error, then verify representative target cells.
 
-# 九、全局完整配置文件 config.toml
-```toml
-# Ollama 服务连接配置
-ollama_endpoint = "http://127.0.0.1:11434"
-connect_timeout = 15
-
-# 三级分工模型配置
-fast_model = ""
-core_model = ""
-audit_model = ""
-
-# 本地代码参考库路径
-code_base_path = "~/.litepilot/code_base"
-
-# 默认启动工作模式 plan / edit / auto
-default_mode = "edit"
-
-# 全自动模式沙盒强制限制
-auto_mode_only_workspace = true
-
-# 工程自动化功能开关
-enable_auto_syntax_check = true
-prefer_uv_toolchain = true
-auto_run_after_fix = false
-
-# 免费无密钥全网搜索配置
-enable_free_web_search = true
-auto_switch_network_region = true
-search_cache_valid_days = 30
-max_search_context_tokens = 2048
-```
-
----
-
-# 十、整体业务运行全流程
-1. 终端进入目标项目文件夹，执行 `litepilot` 启动程序
-2. 首次启动配置Ollama连接地址，完成连通测试
-3. 从本地模型列表选定速思、主力、精审三类编排模型
-4. 默认进入 **Edit编辑确认模式**，编写修改代码需用户手动确认写入
-5. 使用 `Shift+Tab` 自由循环切换 Plan / Edit / Auto 三大模式
-6. 编写代码自动触发多语言语法自检，自动调用UV管理Python项目环境
-7. 遇到技术难点自动启用内置免费全网搜索补充最新技术资料
-8. Auto模式下全程自主完成开发，严格锁定当前启动目录，杜绝越权文件操作
-9. 全程依托本地离线代码库补齐小模型短板，兼容全尺寸Ollama模型流畅运行
-
----
-
-# 十一、项目版本迭代规划
-## V1.0 基础稳定版
-1. 蓝调风格完整TUI界面
-2. Ollama连接配置、三级模型选择功能
-3. Shift+Tab三模式切换（Plan/Edit/Auto）
-4. 基础文件编辑与差异预览
-5. 内置code_base基础代码资源库
-6. 基础会话持久化
-
-## V1.1 工程能力增强版
-1. 全语言本地语法自动校验
-2. Python UV全套工程管理流程
-3. DeepSeek风格标准化项目规划逻辑
-4. Ollama告警消息分级处理
-5. 模型大小自动适配推理策略
-
-## V1.2 全网检索完整版
-1. 内置无密钥跨区免费网页搜索功能
-2. 搜索本地缓存机制
-3. Auto模式沙盒权限严格加固
-4. 命令行开发思维逻辑完善
-5. 预置全套多人游戏、全栈项目高阶模板
-
-## V1.3 正式发布版
-1. 全平台二进制编译打包
-2. NPM一键全局安装分发
-3. 功能全面收敛、BUG闭环修复
-4. 完整使用文档与配置教程
+If workbook cells contain arbitrary sample text that could be sensitive or trigger content filters, do not quote large raw cell contents in your response. Process them locally in Python with neutral variable names and output only the completed script/workbook changes.

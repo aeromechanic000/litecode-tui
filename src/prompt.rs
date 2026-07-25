@@ -68,6 +68,67 @@ impl EnvironmentBlock {
     }
 }
 
+/// Default body written to the global `instructions.md` when it is missing.
+/// Seeded once at startup via [`ProjectInstructions::ensure_global_instructions`];
+/// an existing file is never overwritten, so user edits are always preserved.
+pub const DEFAULT_GLOBAL_INSTRUCTIONS: &str = r##"# Global conventions for LitePilot
+
+These apply to every project and every turn. Edit freely — this file is always
+included in the assistant's context.
+
+## Grounding: read before you act
+
+- Before editing or referencing a file, read its actual current content. Never
+  invent, guess, or rely on memory for file contents, paths, line numbers, or
+  values.
+- If a path, symbol, or value is uncertain, verify it (`read_file` / `search` /
+  run a command) before using it. One verification beats a confident mistake.
+- Quote command and tool output truthfully; never paraphrase a result as
+  something it wasn't.
+
+## Verify after you act
+
+- After a write or edit, confirm the outcome before claiming success: re-read
+  the changed region, or run the build / tests / typecheck.
+- Report what actually happened. If a step failed, the output was empty, or you
+  don't know — say so plainly rather than asserting success.
+
+## Answer discipline
+
+- End every turn with a concise prose answer grounded in what you actually did
+  and observed.
+- Prefer the shortest precise answer that satisfies the request; omit filler.
+
+## Filesystem & shell accuracy
+
+- `.` (current directory) and `..` (parent) are directory entries, NOT files.
+  `ls -a` and `ls -la` list them; never count them.
+- "Files", "directories", and "entries" mean different things — be precise. A
+  directory is not a file.
+- **Hidden files are real files — count them by default.** Regular files in the
+  current directory (hidden included; `.`/`..` and subdirectories excluded):
+  `find . -maxdepth 1 -type f | wc -l`
+  Add `! -name '.*'` only if asked to ignore hidden/dot files. Use `-type d` for
+  directories.
+- `.DS_Store` (macOS), `Thumbs.db` (Windows), `*.swp` (vim) are editor/OS noise,
+  not project files.
+- When a command's output is ambiguous, run a second precise command rather than
+  guessing from the first.
+
+## Before destructive actions
+
+- For irreversible operations (delete, overwrite, force, `rm`), confirm the
+  target is exactly what you intend before running.
+
+## Common mistakes to avoid
+
+- Guessing file contents instead of reading them.
+- Using a path that doesn't exist or sits in the wrong directory — verify first.
+- Counting `.`/`..` or directories as files.
+- Inventing command output or test results.
+- Declaring a change "done" without verifying it.
+"##;
+
 /// Project instructions discovered from workspace files.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectInstructions {
@@ -94,18 +155,27 @@ impl ProjectInstructions {
             readme: None,
         };
 
-        // If no instruction files found, use README.md and auto-generate instructions
-        if instructions.agents_md.is_none()
-            && instructions.claude_md.is_none()
-            && instructions.custom_instructions.is_none()
-        {
+        // README as project context when the workspace has no dedicated
+        // instruction file. Gated only on AGENTS.md/CLAUDE.md absence —
+        // independent of the global `instructions.md`, which is always seeded
+        // at startup, so a project still gets README context even though the
+        // global conventions file exists.
+        if instructions.agents_md.is_none() && instructions.claude_md.is_none() {
             if let Some(readme) = read_file(&workspace.join("README.md")) {
                 // Use first 100 lines of README as context
                 let truncated: String = readme.lines().take(100).collect::<Vec<_>>().join("\n");
                 instructions.readme = Some(truncated);
             }
+        }
 
-            // Auto-generate instructions from project structure
+        // If NO instruction files exist at all, auto-generate a stub from
+        // project structure. Normally a no-op because startup seeds the global
+        // `instructions.md`; this only fires when startup seeding did not run
+        // (e.g. read-only config dir).
+        if instructions.agents_md.is_none()
+            && instructions.claude_md.is_none()
+            && instructions.custom_instructions.is_none()
+        {
             if let Some(generated) = Self::auto_generate(workspace) {
                 // Save for user editing
                 if std::fs::create_dir_all(config_dir).is_ok() {
@@ -173,6 +243,22 @@ impl ProjectInstructions {
         }
 
         Some(instructions)
+    }
+
+    /// Seed the global `instructions.md` with default conventions if it is
+    /// missing. Called once at startup (alongside skill population). Never
+    /// overwrites an existing file. The path is the effective config dir
+    /// (project-local `.litepilot/` if present, else global `~/.litepilot/`),
+    /// matching what [`ProjectInstructions::discover`] reads.
+    pub fn ensure_global_instructions(config_dir: &Path) -> std::io::Result<()> {
+        let path = config_dir.join("instructions.md");
+        if path.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(config_dir)?;
+        std::fs::write(&path, DEFAULT_GLOBAL_INSTRUCTIONS)?;
+        tracing::info!("seeded global instructions at {}", path.display());
+        Ok(())
     }
 
     pub fn format(&self) -> String {
@@ -583,6 +669,31 @@ mod tests {
         let instructions = ProjectInstructions::discover(workspace, &config_dir);
         let formatted = instructions.format();
         assert!(formatted.contains("README"));
+    }
+
+    #[test]
+    fn ensure_global_instructions_seeds_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path().join(".litepilot");
+        // File absent → seeded with default conventions (dir created too).
+        ProjectInstructions::ensure_global_instructions(&config_dir).unwrap();
+        let path = config_dir.join("instructions.md");
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Global conventions for LitePilot"));
+        assert!(content.contains("Grounding"));
+    }
+
+    #[test]
+    fn ensure_global_instructions_preserves_existing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path().join(".litepilot");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("instructions.md"), "my custom rules").unwrap();
+        // Existing file → must not be overwritten.
+        ProjectInstructions::ensure_global_instructions(&config_dir).unwrap();
+        let content = std::fs::read_to_string(config_dir.join("instructions.md")).unwrap();
+        assert_eq!(content, "my custom rules");
     }
 
     #[test]

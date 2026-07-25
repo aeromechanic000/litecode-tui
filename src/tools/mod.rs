@@ -99,6 +99,10 @@ impl ToolRegistry {
     }
 
     /// Validate that required parameters exist for a tool call.
+    ///
+    /// Currently exercised only by tests; retained for callers that want to
+    /// pre-check native tool calls before dispatch.
+    #[allow(dead_code)]
     pub fn validate_params(&self, name: &str, params: &serde_json::Value) -> Result<String> {
         let tool = match self.tools.get(name) {
             Some(t) => t,

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 /// A tool call parsed from an LLM response. The native tool path populates this
 /// from Ollama's `message.tool_calls` array; the field is kept for compatibility
 /// with `parse_file_changes` and history types.
+///
+/// Currently constructed only inside tests; retained for the history/compat path.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub name: String,

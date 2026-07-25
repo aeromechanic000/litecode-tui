@@ -97,6 +97,18 @@ Use `/clear` to reset my context and start a fresh session.
 
 I tailor my prompts to what the model can handle. Small models get short, directive instructions — no fluff. Medium models get examples. Large models get full, nuanced guidance. My code generation protocol (`### FILE:`, `### ACTION:`) is simple enough that even the smallest tier can produce it reliably.
 
+### How I learn your rules (instructions + skills)
+
+I have two editable knowledge channels. Both load from disk at runtime, so you teach me new rules without recompiling.
+
+**1. Instructions — always on.** Drop universal conventions (filesystem and shell accuracy, how to count files, what `.`/`..` mean, your team's coding style) into `~/.litepilot/instructions.md`, or into `AGENTS.md`, `CLAUDE.md`, or `README.md` at your project root. I inject these as a static prompt layer on every turn — byte-identical across turns, so they stay cache-friendly.
+
+**2. Skills — methodologies that attach when they matter.** Skills are Markdown + YAML frontmatter files in `~/.litepilot/skills/`, each with a `name`, `description`, and `trigger: keyword1, keyword2`. Invoke one explicitly (`/skill_name args`), or let me auto-attach it: any skill whose trigger keywords appear in your request is injected into my planner and executor prompts for that turn — no `/` needed. A `/review` methodology surfaces the moment you say "review"; a spreadsheet skill attaches when you touch `.xlsx` files. Skill bodies are token-capped and only included when matched, so they don't bloat the prompt when they're irrelevant.
+
+The two compose: **instructions carry universal rules; skills carry task-specific methodologies that attach when the task matches.**
+
+The shape of this — skills as small, portable, trigger-scoped natural-language files you can refine and reuse across agents — is inspired by [Microsoft SkillOpt](https://github.com/microsoft/SkillOpt), a text-space optimizer that trains reusable `best_skill.md` skills for frozen LLM agents through trajectory-driven edits, with no model weight updates. We adopt the *format*; the offline skill-optimization itself is left to you.
+
 ## Key Bindings
 
 | Key | What happens |

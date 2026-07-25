@@ -1,5 +1,9 @@
 // Heuristic request router: selects model tier based on request content.
 // Routes: code & Q&A -> exec_model, reviews & analysis -> eval_model.
+//
+// Currently unwired: the two-tier pipeline routes by model size, not request
+// keywords. Kept (with its tests) for a future caller.
+#![allow(dead_code)]
 
 /// Which model tier to route a request to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

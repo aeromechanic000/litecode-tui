@@ -132,6 +132,10 @@ impl Config {
         let global_dir = Self::config_dir()?;
         let _ = crate::skills::builtin::populate_skills(&global_dir.join("skills"));
 
+        // Seed global instructions.md (effective dir) with default conventions
+        // if missing — never overwrites user edits.
+        let _ = crate::prompt::ProjectInstructions::ensure_global_instructions(&dir);
+
         Ok(dir)
     }
 

@@ -3208,6 +3208,10 @@ fn execute_bash_blocks(app_state: &AppState, ui_state: &mut ui::UiState, content
 /// Write a FileChange to disk, with sandbox validation.
 /// Run web search and return formatted context string.
 /// Returns empty string if search fails or is disabled.
+///
+/// Unused: web search now flows through the native `web_search` tool instead of
+/// a pipeline event; retained for a future non-tool caller.
+#[allow(dead_code)]
 async fn run_web_search(query: &str, max_tokens: usize) -> String {
     tracing::info!("web search: query={:?}, max_tokens={}", query, max_tokens);
     let config = config::Config::default();

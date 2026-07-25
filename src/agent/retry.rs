@@ -337,7 +337,12 @@ pub enum RetryResult {
 pub enum PipelineResult {
     /// Direct chat or skill invocation result (non-streaming fallback)
     Retry(RetryResult),
-    /// Web search completed — results will be prepended to LLM context
+    /// Web search completed — results will be prepended to LLM context.
+    ///
+    /// No longer constructed: web search is now delivered via the native
+    /// `web_search` tool rather than a pipeline event. The match arms in
+    /// `main.rs` remain; the variant is retained for the event contract.
+    #[allow(dead_code)]
     SearchDone {
         count: usize,
         #[allow(dead_code)]
