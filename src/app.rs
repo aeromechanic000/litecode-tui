@@ -94,6 +94,11 @@ pub struct AppState {
     /// Last execution output (exec content) — input to the eval step and to the
     /// `[Previous attempt]` context injected on a redo.
     pub last_exec_output: Option<String>,
+    /// Transcript of the native tool calls dispatched during the last execution
+    /// (name, arguments, result). The assistant text (`last_exec_output`) is
+    /// often empty for a tool-only step, so this carries the actual tool
+    /// results to the Eval step and the redo `[Previous attempt]` block.
+    pub last_exec_tool_log: Option<String>,
     /// The original user request for the current turn (drives eval + redo).
     pub last_user_request: Option<String>,
     /// The plan that was executed for the current turn (drives eval + redo).
@@ -171,6 +176,7 @@ impl AppState {
             pending_redo_proposal: None,
             redo_count: 0,
             last_exec_output: None,
+            last_exec_tool_log: None,
             last_user_request: None,
             last_plan: None,
             prompt_builder,

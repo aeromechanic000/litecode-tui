@@ -41,15 +41,17 @@ impl ModelSlot {
     fn description(&self) -> &'static str {
         match self {
             ModelSlot::Exec => "Step-by-step execution (required)",
-            ModelSlot::Plan => "Planning — generates the plan (Tab to reuse Exec)",
+            ModelSlot::Plan => "Planning — generates the plan (Tab to skip, falls back to Exec)",
             ModelSlot::Eval => "Review & reflection (Tab to reuse Exec)",
         }
     }
 
+    /// Selection order: Plan → Exec → Eval. Matches the pipeline's conceptual
+    /// flow (plan the work, execute it, review it) and the startup header order.
     fn next(self) -> Option<Self> {
         match self {
-            ModelSlot::Exec => Some(ModelSlot::Plan),
-            ModelSlot::Plan => Some(ModelSlot::Eval),
+            ModelSlot::Plan => Some(ModelSlot::Exec),
+            ModelSlot::Exec => Some(ModelSlot::Eval),
             ModelSlot::Eval => None,
         }
     }
@@ -104,7 +106,7 @@ impl WizardState {
             models: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
-            current_slot: ModelSlot::Exec,
+            current_slot: ModelSlot::Plan,
             exec_model: None,
             plan_model: None,
             eval_model: None,
@@ -299,7 +301,7 @@ fn try_connect(state: &mut WizardState) {
                 state.models = models;
                 state.selected_index = 0;
                 state.scroll_offset = 0;
-                state.current_slot = ModelSlot::Exec;
+                state.current_slot = ModelSlot::Plan;
                 state.jump_to_existing_model();
             }
             state.step = WizardStep::ContextSelect;
@@ -482,7 +484,7 @@ fn handle_residency_select(
             Action::Continue
         }
         (KeyModifiers::NONE, KeyCode::Esc) => {
-            state.current_slot = ModelSlot::Exec;
+            state.current_slot = ModelSlot::Plan;
             state.selected_index = 0;
             state.scroll_offset = 0;
             state.jump_to_existing_model();
@@ -918,6 +920,7 @@ fn draw_confirm(f: &mut ratatui::Frame, state: &WizardState, theme: &Theme, area
     ];
 
     for (slot, model) in &[
+        (ModelSlot::Plan, &state.plan_model),
         (ModelSlot::Exec, &state.exec_model),
         (ModelSlot::Eval, &state.eval_model),
     ] {
@@ -965,8 +968,8 @@ mod tests {
 
     #[test]
     fn model_slot_order() {
-        assert_eq!(ModelSlot::Exec.next(), Some(ModelSlot::Plan));
-        assert_eq!(ModelSlot::Plan.next(), Some(ModelSlot::Eval));
+        assert_eq!(ModelSlot::Plan.next(), Some(ModelSlot::Exec));
+        assert_eq!(ModelSlot::Exec.next(), Some(ModelSlot::Eval));
         assert_eq!(ModelSlot::Eval.next(), None);
     }
 
@@ -983,7 +986,7 @@ mod tests {
         let state = WizardState::new(&config);
         assert_eq!(state.step, WizardStep::UrlInput);
         assert_eq!(state.url, "http://127.0.0.1:11434");
-        assert_eq!(state.current_slot, ModelSlot::Exec);
+        assert_eq!(state.current_slot, ModelSlot::Plan);
         assert!(state.exec_model.is_none());
         assert!(state.plan_model.is_none());
         assert!(state.eval_model.is_none());

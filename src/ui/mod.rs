@@ -26,6 +26,9 @@ pub struct UiState {
     pub is_thinking: bool,
     /// Tick counter for animating the thinking indicator dots
     pub thinking_tick: u8,
+    /// Label shown beside the animated dots — reflects the active pipeline phase
+    /// ("planning", "executing", "evaluating", or the generic "thinking").
+    pub thinking_label: String,
     pub workspace_hint: PathBuf,
     /// Stores full multi-line paste content; input_text shows the summary
     paste_buffer: Option<String>,
@@ -70,6 +73,7 @@ impl Default for UiState {
             streaming_buffer: String::new(),
             is_thinking: false,
             thinking_tick: 0,
+            thinking_label: "thinking".into(),
             workspace_hint: PathBuf::new(),
             paste_buffer: None,
             last_user_input: String::new(),
@@ -122,10 +126,18 @@ impl UiState {
         self.streaming_partial = self.streaming_buffer.clone();
     }
 
-    /// Show the thinking indicator in the viewport.
+    /// Show the thinking indicator in the viewport with the default "thinking"
+    /// label. Use `start_thinking_phase` for a phase-specific label
+    /// ("planning" / "executing" / "evaluating").
     pub fn start_thinking(&mut self) {
+        self.start_thinking_phase("thinking");
+    }
+
+    /// Show the thinking indicator with a phase-specific label.
+    pub fn start_thinking_phase(&mut self, label: &str) {
         self.is_thinking = true;
         self.thinking_tick = 0;
+        self.thinking_label = label.to_string();
     }
 
     /// Hide the thinking indicator. Returns true if thinking was active.
@@ -317,7 +329,7 @@ fn draw_activity_row(f: &mut Frame, ui: &mut UiState, area: Rect) {
         ui.thinking_tick = ui.thinking_tick.wrapping_add(1);
         let dots = ".".repeat(((ui.thinking_tick / 4) % 3 + 1) as usize);
         let line = Line::from(Span::styled(
-            format!("\u{2234} thinking{}", dots), // ∴
+            format!("\u{2234} {}{}", ui.thinking_label, dots), // ∴ <phase>...
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::ITALIC),

@@ -368,7 +368,7 @@ fn run_headless(
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
-            agent::retry::PipelineResult::StreamDone { content } => {
+            agent::retry::PipelineResult::StreamDone { content, tool_log } => {
                 let sanitized = agent::tools_parser::sanitize_output(&content);
                 println!();
                 println!("---");
@@ -386,10 +386,14 @@ fn run_headless(
 
                 // Stash exec context for the eval step.
                 app_state.last_exec_output = Some(sanitized.clone());
+                app_state.last_exec_tool_log = Some(tool_log.clone());
                 app_state.last_user_request = Some(prompt.clone());
 
+                // Eval runs when there is anything to reflect on — assistant text OR
+                // tool results (a tool-only step may have empty prose but a real
+                // answer in the tool log).
                 let eval_will_run = reached_total
-                    && !sanitized.is_empty()
+                    && (!sanitized.is_empty() || !tool_log.is_empty())
                     && !app_state.config.eval_model.is_empty();
                 if eval_will_run {
                     // Eval reflection owns the final answer; EvalReady finalizes.
@@ -399,6 +403,7 @@ fn run_headless(
                         &prompt,
                         app_state.last_plan.as_deref().unwrap_or(""),
                         &sanitized,
+                        &tool_log,
                         app_state.redo_count,
                         tx.clone(),
                     );
@@ -875,7 +880,7 @@ fn run_app(
                     ui_state.append_stream_chunk(&sanitized);
                     continue;
                 }
-                agent::retry::PipelineResult::StreamDone { content } => {
+                agent::retry::PipelineResult::StreamDone { content, tool_log } => {
                     ui_state.stop_thinking();
                     ui_state.finish_stream();
                     // Sanitize output for display.
@@ -893,6 +898,7 @@ fn run_app(
 
                     // Stash exec context for the eval step + redo loop.
                     app_state.last_exec_output = Some(content.clone());
+                    app_state.last_exec_tool_log = Some(tool_log.clone());
                     // Preserve the ORIGINAL user request across redos so a "plan"
                     // redo re-runs the original request, not a [Previous attempt]-
                     // augmented redo_input. Only the first attempt of a turn sets it.
@@ -903,8 +909,11 @@ fn run_app(
                     let mode = app_state.mode;
                     // Eval owns the final answer when a distinct eval model runs;
                     // otherwise (single-model / Plan) exec content stands as the answer.
+                    // Fires when there is anything to reflect on — assistant text OR
+                    // tool results (a tool-only step may have empty prose but a real
+                    // answer in the tool log).
                     let eval_will_run = mode != AppMode::Plan
-                        && !content.is_empty()
+                        && (!content.is_empty() || !tool_log.is_empty())
                         && !app_state.config.eval_model.is_empty();
 
                     // Execute bash blocks (Auto) / show hint (Edit). Exec content is
@@ -1004,11 +1013,13 @@ fn run_app(
                         // Eval reflection owns the final answer. Keep processing so
                         // queued input is not drained mid-eval; EvalReady finalizes.
                         ui_state.add_output(OutputLine::Phase("Eval".into()));
+                        ui_state.start_thinking_phase("evaluating");
                         spawn_eval_reflection(
                             &app_state,
                             &ui_state.last_user_input,
                             app_state.last_plan.as_deref().unwrap_or(""),
                             &content,
+                            &tool_log,
                             app_state.redo_count,
                             result_tx.clone(),
                         );
@@ -1059,7 +1070,7 @@ fn run_app(
                         ui_state.add_output(OutputLine::System(
                             format!("Plan skipped ({}). Executing directly...", error_detail),
                         ));
-                        ui_state.start_thinking();
+                        ui_state.start_thinking_phase("executing");
                         app_state.last_plan = Some(String::new());
                         spawn_execution_with_plan(
                             &app_state,
@@ -1071,7 +1082,7 @@ fn run_app(
                         ui_state.add_output(OutputLine::Plan(plan.clone()));
                         if app_state.mode == AppMode::Auto || app_state.mode == AppMode::Plan {
                             // Auto/Plan mode: auto-execute
-                            ui_state.start_thinking();
+                            ui_state.start_thinking_phase("executing");
                             app_state.last_plan = Some(plan.clone());
                             spawn_execution_with_plan(
                                 &app_state,
@@ -1103,7 +1114,7 @@ fn run_app(
                         "Step {}/{}: {}",
                         step, total, description
                     )));
-                    ui_state.start_thinking();
+                    ui_state.start_thinking_phase("executing");
                 }
                 agent::retry::PipelineResult::SummaryReady {
                     summary,
@@ -1168,6 +1179,7 @@ fn run_app(
                     }
                 }
                 agent::retry::PipelineResult::EvalReady { verdict, model } => {
+                    ui_state.stop_thinking();
                     tracing::info!(
                         "eval reflection ({}): satisfied={} summary={} bytes proposal={}",
                         model,
@@ -1242,7 +1254,7 @@ fn run_app(
                     "Processing queued message...".to_string(),
                 ));
                 ui_state.add_output(OutputLine::User(next.clone()));
-                ui_state.start_thinking();
+                ui_state.start_thinking_phase("planning");
                 spawn_request_for_mode(&mut app_state, &ollama_client, &next, result_tx.clone());
                 app_state.is_processing = true;
             }
@@ -1409,7 +1421,7 @@ fn run_app(
                             KeyCode::Char('y') => {
                                 if let Some(plan) = app_state.pending_plan.take() {
                                     ui_state.add_output(OutputLine::System("Executing plan...".into()));
-                                    ui_state.start_thinking();
+                                    ui_state.start_thinking_phase("executing");
                                     app_state.is_processing = true;
                                     app_state.last_plan = Some(plan.clone());
                                     spawn_execution_with_plan(
@@ -1553,7 +1565,7 @@ fn run_app(
                                             tokens: 0,
                                         },
                                     );
-                                    ui_state.start_thinking();
+                                    ui_state.start_thinking_phase("planning");
                                     spawn_request_for_mode(
                                         &mut app_state,
                                         &ollama_client,
@@ -2036,7 +2048,7 @@ fn run_app(
                                     });
                                     // Record in session
                                     app_state.current_session.add_message("user", &input);
-                                    ui_state.start_thinking();
+                                    ui_state.start_thinking_phase("planning");
                                     spawn_request_for_mode(
                                         &mut app_state,
                                         &ollama_client,
@@ -2376,7 +2388,7 @@ fn spawn_execution_with_plan(
             let user_message = format!("[Plan]\n{}\n\n{}", plan, input);
             let total_tokens = estimate_prompt_tokens(Some(&system_prompt), &user_message);
 
-            let content = stream_step_native_tools(
+            let (content, tool_log) = stream_step_native_tools(
                 &rt,
                 &client,
                 &model,
@@ -2386,7 +2398,7 @@ fn spawn_execution_with_plan(
                 &tool_registry,
                 &tx,
             );
-            let _ = tx.send(agent::retry::PipelineResult::StreamDone { content });
+            let _ = tx.send(agent::retry::PipelineResult::StreamDone { content, tool_log });
             let _ = tx.send(agent::retry::PipelineResult::StreamMeta {
                 total_prompt_tokens: total_tokens,
                 model,
@@ -2401,6 +2413,7 @@ fn spawn_execution_with_plan(
             plan.len()
         );
         let mut all_content = String::new();
+        let mut all_tool_log = String::new();
         let mut step_results: Vec<String> = Vec::new();
         let per_step_budget = context_window_limit / (4 * total_steps.max(1) as u64);
         let system_prompt = format!(
@@ -2482,7 +2495,7 @@ fn spawn_execution_with_plan(
                 step_desc,
             );
 
-            let content = stream_step_native_tools(
+            let (content, step_tool_log) = stream_step_native_tools(
                 &rt,
                 &client,
                 &model,
@@ -2513,6 +2526,7 @@ fn spawn_execution_with_plan(
 
             all_content.push_str(&content);
             all_content.push('\n');
+            all_tool_log.push_str(&step_tool_log);
             step_results.push(content);
         }
 
@@ -2527,6 +2541,7 @@ fn spawn_execution_with_plan(
         );
         let _ = tx.send(agent::retry::PipelineResult::StreamDone {
             content: all_content,
+            tool_log: all_tool_log,
         });
         let _ = tx.send(agent::retry::PipelineResult::StreamMeta {
             total_prompt_tokens: total_tokens,
@@ -2550,6 +2565,12 @@ const MAX_TOOL_ROUNDS_PER_STEP: usize = 5;
 /// returns no tool calls (the step's content becomes exec output for the Eval
 /// step) or `MAX_TOOL_ROUNDS_PER_STEP` is hit.
 ///
+/// Returns `(assistant_content, tool_log)`. The assistant text is the file source
+/// (parsed by `parse_file_changes`); `tool_log` is a transcript of every tool call
+/// dispatched this step (name, arguments, success/error, output). The Eval step and
+/// the redo `[Previous attempt]` block read `tool_log` because the assistant text
+/// alone is often empty for a tool-only step.
+///
 /// Uses `/api/chat`, which does NOT expose the KV-cache `context` handle — there is
 /// no manual cache reuse on this path. The status bar's `ctx:N%` indicator is fed
 /// from the rough prompt-token estimate computed by the caller.
@@ -2562,7 +2583,7 @@ fn stream_step_native_tools(
     user_message: String,
     tools: &tools::ToolRegistry,
     tx: &mpsc::Sender<agent::retry::PipelineResult>,
-) -> String {
+) -> (String, String) {
     let tool_defs = tools.ollama_tool_definitions();
     let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history_messages.len() + 2);
     messages.push(serde_json::json!({ "role": "system", "content": system_prompt }));
@@ -2570,6 +2591,7 @@ fn stream_step_native_tools(
     messages.push(serde_json::json!({ "role": "user", "content": user_message }));
 
     let mut prev_signature = String::new();
+    let mut tool_log = String::new();
 
     for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
         let tx_chunk = tx.clone();
@@ -2584,7 +2606,7 @@ fn stream_step_native_tools(
             },
         )) {
             Ok(r) => r,
-            Err(e) => return format!("ERROR: Native chat failed: {}", e),
+            Err(e) => return (format!("ERROR: Native chat failed: {}", e), tool_log),
         };
 
         if response.tool_calls.is_empty() {
@@ -2593,7 +2615,7 @@ fn stream_step_native_tools(
                 round,
                 response.content.chars().count()
             );
-            return response.content;
+            return (response.content, tool_log);
         }
 
         // Dispatch only the FIRST tool call (sequential agent loop — the model must
@@ -2609,7 +2631,7 @@ fn stream_step_native_tools(
                 "stream_step_native_tools round {}: repeating tool signature, finalizing step",
                 round
             );
-            return response.content;
+            return (response.content, tool_log);
         }
         prev_signature = signature;
 
@@ -2665,6 +2687,16 @@ fn stream_step_native_tools(
             result: result.clone(),
         });
 
+        // Record the call + result in the step's tool transcript. This is what the
+        // Eval step and the redo `[Previous attempt]` block read — the assistant
+        // text alone is empty for a tool-only step, so without this the eval model
+        // cannot see what the tools returned.
+        let status = if result.success { "success" } else { "error" };
+        tool_log.push_str(&format!(
+            "\n[Tool: {}]\nargs: {}\nresult ({}):\n{}\n",
+            tc.name, tc.arguments, status, result.output
+        ));
+
         // Append the tool result so the model can continue.
         messages.push(serde_json::json!({
             "role": "tool",
@@ -2677,7 +2709,7 @@ fn stream_step_native_tools(
         "stream_step_native_tools: hit MAX_TOOL_ROUNDS_PER_STEP={}, returning empty content",
         MAX_TOOL_ROUNDS_PER_STEP
     );
-    String::new()
+    (String::new(), tool_log)
 }
 
 /// Token budget for auto-injected skill bodies. Keeps the prompt bounded even when
@@ -2941,6 +2973,7 @@ fn spawn_eval_reflection(
     user_request: &str,
     plan: &str,
     exec_output: &str,
+    tool_log: &str,
     redo_count: u32,
     tx: mpsc::Sender<agent::retry::PipelineResult>,
 ) {
@@ -2967,6 +3000,7 @@ fn spawn_eval_reflection(
         String::new()
     };
     let exec_output = exec_output.to_string();
+    let tool_log = tool_log.to_string();
 
     tracing::info!(
         "spawning eval reflection: eval_model={}, exec_output={} bytes, redo_count={}",
@@ -3033,10 +3067,30 @@ fn spawn_eval_reflection(
             redo_cap_note
         );
 
+        // Tool-call transcript. The assistant text (exec output) is often empty for
+        // a tool-only step, so this is where the concrete results live — e.g. the
+        // count returned by `exec_shell`. Capped so a verbose tool can't crowd out
+        // the rest of the eval context.
+        let tool_results_section = if tool_log.trim().is_empty() {
+            String::new()
+        } else {
+            let max_tool_chars = 4000;
+            let tl = if tool_log.len() > max_tool_chars {
+                format!(
+                    "{}\n\n[...truncated, {} chars omitted]",
+                    &tool_log[..max_tool_chars],
+                    tool_log.len() - max_tool_chars
+                )
+            } else {
+                tool_log.clone()
+            };
+            format!("Tool results (what the tools actually returned):\n{}\n\n", tl)
+        };
+
         let eval_user = format!(
-            "User request:\n{}\n\nPlan:\n{}\n\nExecution output:\n{}\n\n\
+            "User request:\n{}\n\nPlan:\n{}\n\n{}Execution output:\n{}\n\n\
              Call submit_evaluation with your verdict.",
-            user_request, plan, truncated_output
+            user_request, plan, tool_results_section, truncated_output
         );
 
         let messages = vec![
@@ -3215,7 +3269,7 @@ fn run_eval_redo(
         tokens: util::text::estimate_tokens(&redo_input),
     });
     ui_state.last_user_input = redo_input.clone();
-    ui_state.start_thinking();
+    ui_state.start_thinking_phase("planning");
     spawn_request_for_mode(app_state, client, &redo_input, result_tx);
     app_state.is_processing = true;
 }
@@ -3244,6 +3298,24 @@ fn build_previous_attempt_block(
             };
             s.push_str(&format!(
                 "Previous execution (condensed):\n{}{}\n\n",
+                preview, ellipsis
+            ));
+        }
+    }
+    // The tool transcript usually carries the concrete results the previous
+    // attempt produced (command output, read-file contents, etc.) — without it a
+    // redo is blind to what the tools returned and repeats the same blind work.
+    if let Some(tl) = &app_state.last_exec_tool_log {
+        if !tl.trim().is_empty() {
+            let max = 2000usize;
+            let preview: String = tl.chars().take(max).collect();
+            let ellipsis = if tl.chars().count() > max {
+                "\n[…truncated]"
+            } else {
+                ""
+            };
+            s.push_str(&format!(
+                "Previous tool results:\n{}{}\n\n",
                 preview, ellipsis
             ));
         }

@@ -396,8 +396,16 @@ pub enum PipelineResult {
     },
     /// Streaming chunk — token-by-token output from the LLM
     StreamChunk { content: String },
-    /// Streaming finished — contains the full accumulated content
-    StreamDone { content: String },
+    /// Streaming finished — contains the full accumulated content.
+    ///
+    /// `content` is the assistant's text (the file source parsed by
+    /// `parse_file_changes`). `tool_log` is a transcript of the native tool
+    /// calls dispatched during the step(s) — name, arguments, and result — so
+    /// the Eval step and the redo `[Previous attempt]` block can see what the
+    /// tools actually returned (the assistant text alone is often empty for a
+    /// tool-only step). Kept separate from `content` so tool output can never
+    /// be mis-parsed as `### FILE:` blocks.
+    StreamDone { content: String, tool_log: String },
     /// Prompt metadata from a completed stream — used to drive the
     /// `ctx:N%` token-estimate indicator and overflow warnings.
     StreamMeta {
