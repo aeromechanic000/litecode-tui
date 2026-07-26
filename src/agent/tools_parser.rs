@@ -84,13 +84,14 @@ pub fn sanitize_output(text: &str) -> String {
 
 /// Returns true if `content` contains a meaningful natural-language answer —
 /// i.e. prose text OUTSIDE of `<tool_call>` blocks, `<tool_result>` blocks,
-/// `### FILE: …` file blocks, and fenced code blocks. Used by the executor's
-/// final-answer fallback to decide whether a tool-using step ended with no
-/// real answer (the model emitted only tool calls / file blocks / empty text
-/// and "finished" without addressing the user).
+/// `### FILE: …` file blocks, and fenced code blocks.
 ///
-/// Threshold: ≥3 surviving non-marker words counts as a real answer. Fewer
-/// than that is treated as stray markers / whitespace, triggering the fallback.
+/// Threshold: ≥3 surviving non-marker words counts as a real answer.
+///
+/// **Vestigial under Plan→Execute→Eval:** the Eval step (not a fallback) now
+/// writes the final answer, so nothing gates on this. Kept for its unit tests
+/// and as an optional internal signal.
+#[allow(dead_code)]
 pub fn has_final_answer(content: &str) -> bool {
     // Strip file blocks (### FILE: ... ``` ... ```) first, before generic fence
     // stripping, so the FILE marker and its fence are removed together.

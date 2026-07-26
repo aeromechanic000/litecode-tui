@@ -25,6 +25,7 @@ pub enum WizardStep {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSlot {
     Exec,
+    Plan,
     Eval,
 }
 
@@ -32,20 +33,23 @@ impl ModelSlot {
     fn label(&self) -> &'static str {
         match self {
             ModelSlot::Exec => "Exec",
+            ModelSlot::Plan => "Plan",
             ModelSlot::Eval => "Eval",
         }
     }
 
     fn description(&self) -> &'static str {
         match self {
-            ModelSlot::Exec => "Main coding & planning",
-            ModelSlot::Eval => "Review & quality assurance",
+            ModelSlot::Exec => "Step-by-step execution (required)",
+            ModelSlot::Plan => "Planning — generates the plan (Tab to reuse Exec)",
+            ModelSlot::Eval => "Review & reflection (Tab to reuse Exec)",
         }
     }
 
     fn next(self) -> Option<Self> {
         match self {
-            ModelSlot::Exec => Some(ModelSlot::Eval),
+            ModelSlot::Exec => Some(ModelSlot::Plan),
+            ModelSlot::Plan => Some(ModelSlot::Eval),
             ModelSlot::Eval => None,
         }
     }
@@ -59,12 +63,12 @@ const RESIDENCY_OPTIONS: [&str; 3] = ["none", "exec", "both"];
 const RESIDENCY_LABELS: [&str; 3] = [
     "None (default)",
     "Exec model only",
-    "Exec + Eval models",
+    "All configured models",
 ];
 const RESIDENCY_DESCRIPTIONS: [&str; 3] = [
     "Models loaded/unloaded normally by Ollama",
     "Keep exec model pinned in VRAM (keep_alive=-1)",
-    "Keep both exec and eval models pinned in VRAM",
+    "Keep exec + any distinct plan/eval models pinned in VRAM",
 ];
 const DEFAULT_RESIDENCY_INDEX: usize = 0; // none
 
@@ -78,6 +82,7 @@ struct WizardState {
     scroll_offset: usize,
     current_slot: ModelSlot,
     exec_model: Option<String>,
+    plan_model: Option<String>,
     eval_model: Option<String>,
     error_msg: Option<String>,
     context_index: usize,
@@ -101,6 +106,7 @@ impl WizardState {
             scroll_offset: 0,
             current_slot: ModelSlot::Exec,
             exec_model: None,
+            plan_model: None,
             eval_model: None,
             error_msg: None,
             context_index: DEFAULT_CONTEXT_INDEX,
@@ -109,6 +115,9 @@ impl WizardState {
         // Pre-fill from existing config if present
         if !existing_config.exec_model.is_empty() {
             state.exec_model = Some(existing_config.exec_model.clone());
+        }
+        if !existing_config.plan_model.is_empty() {
+            state.plan_model = Some(existing_config.plan_model.clone());
         }
         if !existing_config.eval_model.is_empty() {
             state.eval_model = Some(existing_config.eval_model.clone());
@@ -151,6 +160,7 @@ impl WizardState {
     fn jump_to_existing_model(&mut self) {
         let existing = match self.current_slot {
             ModelSlot::Exec => self.exec_model.as_deref(),
+            ModelSlot::Plan => self.plan_model.as_deref(),
             ModelSlot::Eval => self.eval_model.as_deref(),
         };
         if let Some(name) = existing {
@@ -170,6 +180,7 @@ impl WizardState {
     fn selected_model_for_slot(&self, slot: ModelSlot) -> &Option<String> {
         match slot {
             ModelSlot::Exec => &self.exec_model,
+            ModelSlot::Plan => &self.plan_model,
             ModelSlot::Eval => &self.eval_model,
         }
     }
@@ -177,6 +188,7 @@ impl WizardState {
     fn set_model_for_slot(&mut self, slot: ModelSlot, name: String) {
         match slot {
             ModelSlot::Exec => self.exec_model = Some(name),
+            ModelSlot::Plan => self.plan_model = Some(name),
             ModelSlot::Eval => self.eval_model = Some(name),
         }
     }
@@ -196,6 +208,7 @@ impl WizardState {
         Config {
             ollama_endpoint: self.url,
             exec_model: self.exec_model.unwrap_or_default(),
+            plan_model: self.plan_model.unwrap_or_default(),
             eval_model: self.eval_model.unwrap_or_default(),
             context_window_limit: CONTEXT_OPTIONS[self.context_index],
             model_residency: RESIDENCY_OPTIONS[self.residency_index].to_string(),
@@ -952,13 +965,15 @@ mod tests {
 
     #[test]
     fn model_slot_order() {
-        assert_eq!(ModelSlot::Exec.next(), Some(ModelSlot::Eval));
+        assert_eq!(ModelSlot::Exec.next(), Some(ModelSlot::Plan));
+        assert_eq!(ModelSlot::Plan.next(), Some(ModelSlot::Eval));
         assert_eq!(ModelSlot::Eval.next(), None);
     }
 
     #[test]
     fn model_slot_labels() {
         assert!(ModelSlot::Exec.label().contains("Exec"));
+        assert!(ModelSlot::Plan.label().contains("Plan"));
         assert!(ModelSlot::Eval.label().contains("Eval"));
     }
 
@@ -970,6 +985,7 @@ mod tests {
         assert_eq!(state.url, "http://127.0.0.1:11434");
         assert_eq!(state.current_slot, ModelSlot::Exec);
         assert!(state.exec_model.is_none());
+        assert!(state.plan_model.is_none());
         assert!(state.eval_model.is_none());
     }
 
@@ -978,13 +994,15 @@ mod tests {
         let config = Config {
             ollama_endpoint: "http://custom:9999".into(),
             exec_model: "qwen3:8b".into(),
-            eval_model: "qwen3:14b".into(),
+            plan_model: "qwen3:14b".into(),
+            eval_model: "qwen3:32b".into(),
             ..Config::default()
         };
         let state = WizardState::new(&config);
         assert_eq!(state.url, "http://custom:9999");
         assert_eq!(state.exec_model.as_deref(), Some("qwen3:8b"));
-        assert_eq!(state.eval_model.as_deref(), Some("qwen3:14b"));
+        assert_eq!(state.plan_model.as_deref(), Some("qwen3:14b"));
+        assert_eq!(state.eval_model.as_deref(), Some("qwen3:32b"));
     }
 
     #[test]
@@ -1009,8 +1027,10 @@ mod tests {
         let mut state = WizardState::new(&config);
         state.set_model_for_slot(ModelSlot::Exec, "qwen3:8b".into());
         assert_eq!(state.exec_model.as_deref(), Some("qwen3:8b"));
-        state.set_model_for_slot(ModelSlot::Eval, "qwen3:14b".into());
-        assert_eq!(state.eval_model.as_deref(), Some("qwen3:14b"));
+        state.set_model_for_slot(ModelSlot::Plan, "qwen3:14b".into());
+        assert_eq!(state.plan_model.as_deref(), Some("qwen3:14b"));
+        state.set_model_for_slot(ModelSlot::Eval, "qwen3:32b".into());
+        assert_eq!(state.eval_model.as_deref(), Some("qwen3:32b"));
     }
 
     #[test]
@@ -1019,13 +1039,15 @@ mod tests {
         let mut state = WizardState::new(&config);
         state.url = "http://ollama:1234".into();
         state.exec_model = Some("qwen3:8b".into());
-        state.eval_model = Some("qwen3:14b".into());
+        state.plan_model = Some("qwen3:14b".into());
+        state.eval_model = Some("qwen3:32b".into());
         state.context_index = 3; // 512k
         state.residency_index = 1; // exec
         let result = state.into_config(&config);
         assert_eq!(result.ollama_endpoint, "http://ollama:1234");
         assert_eq!(result.exec_model, "qwen3:8b");
-        assert_eq!(result.eval_model, "qwen3:14b");
+        assert_eq!(result.plan_model, "qwen3:14b");
+        assert_eq!(result.eval_model, "qwen3:32b");
         assert_eq!(result.context_window_limit, 524288);
         assert_eq!(result.model_residency, "exec");
         // Other fields preserved from base config

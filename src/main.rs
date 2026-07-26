@@ -113,7 +113,8 @@ fn main() -> Result<()> {
         config.ollama_endpoint
     );
     tracing::info!(
-        "models: exec={} eval={}",
+        "models: plan={} exec={} eval={}",
+        config.effective_plan_model(),
         config.exec_model,
         config.effective_eval_model()
     );
@@ -344,6 +345,7 @@ fn run_headless(
                     println!("---");
                 }
                 // Headless = Auto semantics: auto-execute the plan.
+                app_state.last_plan = Some(plan.clone());
                 spawn_execution_with_plan(&app_state, &prompt, &plan, tx.clone());
             }
             agent::retry::PipelineResult::StepStart {
@@ -351,6 +353,9 @@ fn run_headless(
                 total,
                 description,
             } => {
+                if step == 1 {
+                    eprintln!("◆ Exec");
+                }
                 eprintln!("[step {}/{}] {}", step, total, description);
                 if expected_steps.is_none() {
                     expected_steps = Some(total);
@@ -368,32 +373,44 @@ fn run_headless(
                 println!();
                 println!("---");
 
-                // Apply file changes (Auto mode).
+                // Apply file changes (Auto mode) — exec content is the file source.
                 let changes = agent::parse_file_changes(&sanitized);
                 if !changes.is_empty() {
                     apply_headless_changes(&mut app_state, &changes, &tx);
                 }
 
-                // Record assistant turn.
-                app_state.conversation_history.push(ConversationMessage {
-                    role: "assistant".into(),
-                    content: sanitized,
-                    tokens: 0,
-                });
-                app_state
-                    .current_session
-                    .add_message("assistant", &content);
-                let _ = session::persistence::save_session(&app_state.current_session);
-
                 completed_steps += 1;
                 let reached_total = expected_steps
                     .map(|t| completed_steps >= t)
                     .unwrap_or(true);
-                if reached_total {
-                    if let Err(e) = app_state.snapshot_manager.post_turn("headless") {
-                        tracing::debug!("post-turn snapshot skipped: {}", e);
+
+                // Stash exec context for the eval step.
+                app_state.last_exec_output = Some(sanitized.clone());
+                app_state.last_user_request = Some(prompt.clone());
+
+                let eval_will_run = reached_total
+                    && !sanitized.is_empty()
+                    && !app_state.config.eval_model.is_empty();
+                if eval_will_run {
+                    // Eval reflection owns the final answer; EvalReady finalizes.
+                    println!("◆ Eval");
+                    spawn_eval_reflection(
+                        &app_state,
+                        &prompt,
+                        app_state.last_plan.as_deref().unwrap_or(""),
+                        &sanitized,
+                        app_state.redo_count,
+                        tx.clone(),
+                    );
+                } else {
+                    // Short-circuit (single-model / empty): exec content is the answer.
+                    commit_assistant_answer(&mut app_state, &sanitized, &tx);
+                    if reached_total {
+                        if let Err(e) = app_state.snapshot_manager.post_turn("headless") {
+                            tracing::debug!("post-turn snapshot skipped: {}", e);
+                        }
+                        done = true;
                     }
-                    done = true;
                 }
             }
             agent::retry::PipelineResult::StreamMeta { .. } => {
@@ -426,9 +443,34 @@ fn run_headless(
                     }
                 }
             }
-            agent::retry::PipelineResult::EvalReady { evaluation } => {
+            agent::retry::PipelineResult::EvalReady { verdict, .. } => {
+                let summary = if verdict.summary.trim().is_empty() {
+                    app_state.last_exec_output.clone().unwrap_or_default()
+                } else {
+                    agent::tools_parser::sanitize_output(&verdict.summary)
+                };
                 println!();
-                println!("{}", evaluation);
+                println!("{}", summary);
+                commit_assistant_answer(&mut app_state, &summary, &tx);
+                if let Some(p) = &verdict.proposal {
+                    eprintln!(
+                        "[eval] result may be incomplete ({}): {} \
+                         — non-interactive; rerun with more detail if needed.",
+                        match p.kind {
+                            agent::retry::RedoKind::Further => "further round",
+                            agent::retry::RedoKind::Plan => "re-plan",
+                            agent::retry::RedoKind::None => "none",
+                        },
+                        p.reason
+                    );
+                }
+                if let Err(e) = app_state.snapshot_manager.post_turn("headless") {
+                    tracing::debug!("post-turn snapshot skipped: {}", e);
+                }
+                done = true;
+            }
+            agent::retry::PipelineResult::Status { message } => {
+                eprintln!("{}", message);
             }
             agent::retry::PipelineResult::SummaryReady { .. } => {
                 // Compaction notice — not surfaced in headless mode.
@@ -484,9 +526,12 @@ fn run_headless(
                     }
                 }
             }
-            agent::retry::PipelineResult::EvalReady { evaluation } => {
+            agent::retry::PipelineResult::EvalReady { verdict, .. } => {
                 println!();
-                println!("{}", evaluation);
+                println!("{}", verdict.summary);
+                if let Some(p) = &verdict.proposal {
+                    eprintln!("[eval] proposal: {}", p.reason);
+                }
             }
             _ => {}
         }
@@ -646,7 +691,8 @@ fn run_app(
             app_state.config.ollama_endpoint
         )));
         ui_state.add_output(OutputLine::System(format!(
-            "[Exec]:{} [Eval]:{}",
+            "[Plan]:{} [Exec]:{} [Eval]:{}",
+            app_state.config.effective_plan_model(),
             app_state.config.exec_model,
             app_state.config.effective_eval_model()
         )));
@@ -684,35 +730,49 @@ fn run_app(
             let mut warmed = Vec::new();
             if warmup_config.keep_exec_resident() && !warmup_config.exec_model.is_empty() {
                 let model = warmup_config.exec_model.clone();
-                let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
-                    evaluation: format!("[Residency] Warming up exec model: {}...", model),
+                let _ = warmup_tx.send(agent::retry::PipelineResult::Status {
+                    message: format!("[Residency] Warming up exec model: {}...", model),
                 });
                 match rt.block_on(client.warmup_model(&model)) {
                     Ok(()) => warmed.push(model.clone()),
                     Err(e) => {
-                        let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
-                            evaluation: format!("[Residency] Failed to warm up exec model '{}': {}", model, e),
+                        let _ = warmup_tx.send(agent::retry::PipelineResult::Status {
+                            message: format!("[Residency] Failed to warm up exec model '{}': {}", model, e),
                         });
                     }
                 }
             }
             if warmup_config.keep_eval_resident() {
                 let model = warmup_config.eval_model.clone();
-                let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
-                    evaluation: format!("[Residency] Warming up eval model: {}...", model),
+                let _ = warmup_tx.send(agent::retry::PipelineResult::Status {
+                    message: format!("[Residency] Warming up eval model: {}...", model),
                 });
                 match rt.block_on(client.warmup_model(&model)) {
                     Ok(()) => warmed.push(model.clone()),
                     Err(e) => {
-                        let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
-                            evaluation: format!("[Residency] Failed to warm up eval model '{}': {}", model, e),
+                        let _ = warmup_tx.send(agent::retry::PipelineResult::Status {
+                            message: format!("[Residency] Failed to warm up eval model '{}': {}", model, e),
+                        });
+                    }
+                }
+            }
+            if warmup_config.keep_plan_resident() {
+                let model = warmup_config.plan_model.clone();
+                let _ = warmup_tx.send(agent::retry::PipelineResult::Status {
+                    message: format!("[Residency] Warming up plan model: {}...", model),
+                });
+                match rt.block_on(client.warmup_model(&model)) {
+                    Ok(()) => warmed.push(model.clone()),
+                    Err(e) => {
+                        let _ = warmup_tx.send(agent::retry::PipelineResult::Status {
+                            message: format!("[Residency] Failed to warm up plan model '{}': {}", model, e),
                         });
                     }
                 }
             }
             if !warmed.is_empty() {
-                let _ = warmup_tx.send(agent::retry::PipelineResult::EvalReady {
-                    evaluation: format!("[Residency] Models pinned: {}", warmed.join(", ")),
+                let _ = warmup_tx.send(agent::retry::PipelineResult::Status {
+                    message: format!("[Residency] Models pinned: {}", warmed.join(", ")),
                 });
             }
         });
@@ -816,10 +876,9 @@ fn run_app(
                     continue;
                 }
                 agent::retry::PipelineResult::StreamDone { content } => {
-                    app_state.is_processing = false;
                     ui_state.stop_thinking();
                     ui_state.finish_stream();
-                    // Sanitize output for display
+                    // Sanitize output for display.
                     let content = agent::tools_parser::sanitize_output(&content);
                     tracing::info!("stream complete: {} bytes", content.len());
                     if content.len() < 100 {
@@ -831,42 +890,25 @@ fn run_app(
                     } else {
                         tracing::debug!("stream content (first 500 chars): {:.500}", content);
                     }
-                    // Record in conversation history
-                    if !content.is_empty() {
-                        let tokens = util::text::estimate_tokens(&content);
-                        tracing::debug!(
-                            "adding to conversation history: role=assistant, {} tokens",
-                            tokens
-                        );
-                        app_state.conversation_history.push(ConversationMessage {
-                            role: "assistant".into(),
-                            content: content.clone(),
-                            tokens,
-                        });
-                        // Auto-save session
-                        app_state.current_session.add_message("assistant", &content);
-                        auto_save_session(&app_state);
-                        let history_before = app_state.conversation_history.len();
-                        context::maybe_compact(
-                            &mut app_state.conversation_history,
-                            &app_state.config.exec_model,
-                        );
-                        if app_state.conversation_history.len() < history_before {
-                            tracing::info!(
-                                "conversation history compacted: {} -> {} messages",
-                                history_before,
-                                app_state.conversation_history.len()
-                            );
-                        }
-                        // Check if background summarization is needed
-                        if app_state.conversation_summary.is_none()
-                            || app_state.conversation_history.len() > 20
-                        {
-                            maybe_trigger_summarization(&app_state, result_tx.clone());
-                        }
+
+                    // Stash exec context for the eval step + redo loop.
+                    app_state.last_exec_output = Some(content.clone());
+                    // Preserve the ORIGINAL user request across redos so a "plan"
+                    // redo re-runs the original request, not a [Previous attempt]-
+                    // augmented redo_input. Only the first attempt of a turn sets it.
+                    if app_state.redo_count == 0 {
+                        app_state.last_user_request = Some(ui_state.last_user_input.clone());
                     }
+
                     let mode = app_state.mode;
-                    // Execute bash blocks in Auto mode, show hint in Edit mode
+                    // Eval owns the final answer when a distinct eval model runs;
+                    // otherwise (single-model / Plan) exec content stands as the answer.
+                    let eval_will_run = mode != AppMode::Plan
+                        && !content.is_empty()
+                        && !app_state.config.eval_model.is_empty();
+
+                    // Execute bash blocks (Auto) / show hint (Edit). Exec content is
+                    // the work performed — applied here regardless of eval.
                     if !content.is_empty() {
                         if mode == AppMode::Auto {
                             execute_bash_blocks(&app_state, &mut ui_state, &content);
@@ -884,7 +926,7 @@ fn run_app(
                             }
                         }
                     }
-                    // Handle file changes per mode
+                    // Handle file changes per mode (exec content is the file source).
                     if !content.is_empty() {
                         let changes = agent::parse_file_changes(&content);
                         if !changes.is_empty() {
@@ -957,19 +999,26 @@ fn run_app(
                             }
                         }
                     }
-                    // Post-execution eval review using eval model
-                    if mode != AppMode::Plan
-                        && !content.is_empty()
-                        && app_state.config.effective_eval_model() != app_state.config.exec_model
-                    {
-                        spawn_eval_review(
+
+                    if eval_will_run {
+                        // Eval reflection owns the final answer. Keep processing so
+                        // queued input is not drained mid-eval; EvalReady finalizes.
+                        ui_state.add_output(OutputLine::Phase("Eval".into()));
+                        spawn_eval_reflection(
                             &app_state,
                             &ui_state.last_user_input,
+                            app_state.last_plan.as_deref().unwrap_or(""),
                             &content,
+                            app_state.redo_count,
                             result_tx.clone(),
                         );
+                    } else {
+                        // Short-circuit (single-model or Plan): exec content is the
+                        // answer. Commit it and finalize the turn here.
+                        commit_assistant_answer(&mut app_state, &content, &result_tx);
+                        app_state.is_processing = false;
+                        ui_state.add_output(OutputLine::Separator);
                     }
-                    ui_state.add_output(OutputLine::Separator);
                 }
                 agent::retry::PipelineResult::StreamMeta {
                     total_prompt_tokens,
@@ -1011,6 +1060,7 @@ fn run_app(
                             format!("Plan skipped ({}). Executing directly...", error_detail),
                         ));
                         ui_state.start_thinking();
+                        app_state.last_plan = Some(String::new());
                         spawn_execution_with_plan(
                             &app_state,
                             &ui_state.last_user_input,
@@ -1022,6 +1072,7 @@ fn run_app(
                         if app_state.mode == AppMode::Auto || app_state.mode == AppMode::Plan {
                             // Auto/Plan mode: auto-execute
                             ui_state.start_thinking();
+                            app_state.last_plan = Some(plan.clone());
                             spawn_execution_with_plan(
                                 &app_state,
                                 &ui_state.last_user_input,
@@ -1045,6 +1096,9 @@ fn run_app(
                 } => {
                     ui_state.stop_thinking();
                     tracing::info!("executing step {}/{}: {}", step, total, description);
+                    if step == 1 {
+                        ui_state.add_output(OutputLine::Phase("Exec".into()));
+                    }
                     ui_state.add_output(OutputLine::System(format!(
                         "Step {}/{}: {}",
                         step, total, description
@@ -1113,14 +1167,71 @@ fn run_app(
                         tracing::info!("diagnostics passed for {} files", diag.files_checked);
                     }
                 }
-                agent::retry::PipelineResult::EvalReady { evaluation } => {
-                    tracing::info!("eval review: {} bytes", evaluation.len());
-                    ui_state.add_output(OutputLine::System(evaluation));
+                agent::retry::PipelineResult::EvalReady { verdict, model } => {
+                    tracing::info!(
+                        "eval reflection ({}): satisfied={} summary={} bytes proposal={}",
+                        model,
+                        verdict.satisfied,
+                        verdict.summary.len(),
+                        verdict.proposal.is_some()
+                    );
+                    // The eval summary is the canonical answer. Fall back to the
+                    // stashed exec content if the eval produced none.
+                    let summary = if verdict.summary.trim().is_empty() {
+                        app_state.last_exec_output.clone().unwrap_or_default()
+                    } else {
+                        agent::tools_parser::sanitize_output(&verdict.summary)
+                    };
+                    if !summary.trim().is_empty() {
+                        ui_state.add_output(OutputLine::Assistant(summary.clone()));
+                    }
+                    commit_assistant_answer(&mut app_state, &summary, &result_tx);
+
+                    // Decide: propose a redo, or finalize the turn.
+                    let proposal = if !verdict.satisfied
+                        && app_state.redo_count < MAX_REDOS_PER_TURN
+                    {
+                        verdict.proposal.clone()
+                    } else {
+                        None
+                    };
+                    match proposal {
+                        Some(p) if app_state.awaiting_confirmation => {
+                            // Edit file review still pending — hold the proposal and
+                            // surface it once the last file is reviewed. The turn's
+                            // LLM work is done, so allow the interactive review.
+                            app_state.pending_redo_proposal = Some(p);
+                            app_state.is_processing = false;
+                            ui_state.add_output(OutputLine::System(
+                                "Eval: result may be incomplete — a redo will be proposed \
+                                 after file review."
+                                    .into(),
+                            ));
+                        }
+                        Some(p) => {
+                            app_state.pending_redo_decision = Some(p);
+                            app_state.is_processing = false;
+                            ui_state.add_output(OutputLine::System(
+                                "Eval: result may be incomplete. Redo? y/n/o \
+                                 (y=accept proposal, n=keep result, o=your own instruction)"
+                                    .into(),
+                            ));
+                        }
+                        None => {
+                            // Satisfied (or redo cap reached): finalize the turn.
+                            ui_state.add_output(OutputLine::Separator);
+                            app_state.is_processing = false;
+                        }
+                    }
+                }
+                agent::retry::PipelineResult::Status { message } => {
+                    ui_state.add_output(OutputLine::System(message));
                 }
             }
 
-            // Drain next queued message if any
-            if !app_state.pending_queue.is_empty() {
+            // Drain next queued message only when the turn is truly complete —
+            // not while eval is pending or a redo/file/plan approval awaits.
+            if turn_is_complete(&app_state) && !app_state.pending_queue.is_empty() {
                 let next = app_state.pending_queue.remove(0);
                 tracing::info!(
                     "draining queued message: {:?} ({} remaining in queue)",
@@ -1134,6 +1245,22 @@ fn run_app(
                 ui_state.start_thinking();
                 spawn_request_for_mode(&mut app_state, &ollama_client, &next, result_tx.clone());
                 app_state.is_processing = true;
+            }
+        }
+
+        // If Edit file review has finished and the eval stashed a redo proposal,
+        // surface it now (runs every tick, so it needs no extra keypress).
+        if !app_state.awaiting_confirmation
+            && !app_state.is_processing
+            && app_state.pending_redo_decision.is_none()
+        {
+            if let Some(p) = app_state.pending_redo_proposal.take() {
+                app_state.pending_redo_decision = Some(p);
+                ui_state.add_output(OutputLine::System(
+                    "Eval: result may be incomplete. Redo? y/n/o \
+                     (y=accept proposal, n=keep result, o=your own instruction)"
+                        .into(),
+                ));
             }
         }
 
@@ -1284,6 +1411,7 @@ fn run_app(
                                     ui_state.add_output(OutputLine::System("Executing plan...".into()));
                                     ui_state.start_thinking();
                                     app_state.is_processing = true;
+                                    app_state.last_plan = Some(plan.clone());
                                     spawn_execution_with_plan(
                                         &app_state,
                                         &ui_state.last_user_input,
@@ -1309,6 +1437,50 @@ fn run_app(
                         && key.code == KeyCode::Char('o')
                     {
                         app_state.pending_plan = None;
+                        app_state.awaiting_other_input = true;
+                        ui_state.add_output(OutputLine::System(
+                            "Other: (type your response and press Enter)".into(),
+                        ));
+                        continue;
+                    }
+
+                    // Eval-redo approval: 'y' to run the proposed redo, 'n' to keep
+                    // the current result, 'o' for the user's own instruction.
+                    if app_state.pending_redo_decision.is_some()
+                        && key.modifiers == KeyModifiers::NONE
+                    {
+                        match key.code {
+                            KeyCode::Char('y') => {
+                                if let Some(proposal) = app_state.pending_redo_decision.take() {
+                                    run_eval_redo(
+                                        &mut app_state,
+                                        &ollama_client,
+                                        &mut ui_state,
+                                        proposal,
+                                        result_tx.clone(),
+                                    );
+                                }
+                                continue;
+                            }
+                            KeyCode::Char('n') => {
+                                if app_state.pending_redo_decision.take().is_some() {
+                                    ui_state.add_output(OutputLine::System(
+                                        "Keeping current result.".into(),
+                                    ));
+                                    ui_state.add_output(OutputLine::Separator);
+                                }
+                                continue;
+                            }
+                            _ => {} // fall through to 'o' handler and normal input
+                        }
+                    }
+
+                    // Eval-redo approval: 'o' for own instruction
+                    if app_state.pending_redo_decision.is_some()
+                        && key.modifiers == KeyModifiers::NONE
+                        && key.code == KeyCode::Char('o')
+                    {
+                        app_state.pending_redo_decision = None;
                         app_state.awaiting_other_input = true;
                         ui_state.add_output(OutputLine::System(
                             "Other: (type your response and press Enter)".into(),
@@ -1401,6 +1573,9 @@ fn run_app(
                             let input = ui_state.take_input();
                             if !input.is_empty() {
                                 app_state.record_input(input.clone());
+                                // A brand-new user request starts a fresh turn —
+                                // reset the eval-redo counter (redos bypass this).
+                                app_state.redo_count = 0;
                                 tracing::info!("user input: {}", input.trim());
                                 tracing::debug!(
                                     "conversation history: {} messages, queue: {}",
@@ -1956,6 +2131,7 @@ fn spawn_plan_then_execute(
     tx: mpsc::Sender<agent::retry::PipelineResult>,
 ) {
     let exec_model = app_state.config.exec_model.clone();
+    let plan_model = app_state.config.effective_plan_model().to_string();
     let endpoint = app_state.config.ollama_endpoint.clone();
     let connect_timeout = app_state.config.connect_timeout;
     let context_window_limit = app_state.config.context_window_limit;
@@ -1985,8 +2161,8 @@ fn spawn_plan_then_execute(
         matched_skills_block(&input, &app_state.skills, MAX_MATCHED_SKILL_TOKENS);
 
     tracing::info!(
-        "spawn_plan_then_execute: model={}, history_msgs={}, workspace={}, tools_chars={}",
-        exec_model,
+        "spawn_plan_then_execute: plan_model={}, history_msgs={}, workspace={}, tools_chars={}",
+        plan_model,
         app_state.conversation_history.len(),
         workspace.display(),
         tools_description.chars().count()
@@ -2026,7 +2202,7 @@ fn spawn_plan_then_execute(
             }
         };
 
-        // Quick plan step using exec model
+        // Quick plan step using the plan model (falls back to exec model).
         let project_listing = std::fs::read_dir(&workspace)
             .map(|entries| {
                 entries
@@ -2061,7 +2237,7 @@ fn spawn_plan_then_execute(
             ollama::chat::ChatMessage::user(&user_msg),
         ];
 
-        match rt.block_on(bg_client.chat(&exec_model, messages, false)) {
+        match rt.block_on(bg_client.chat(&plan_model, messages, false)) {
             Ok(resp) => {
                 let plan = resp.content;
                 let _ = tx.send(agent::retry::PipelineResult::PlanReady { plan: plan.clone() });
@@ -2072,9 +2248,9 @@ fn spawn_plan_then_execute(
             }
             Err(e) => {
                 // Plan step failed — fall back to direct streaming without plan
-                tracing::warn!("plan step failed for exec model '{}': {}", exec_model, e);
+                tracing::warn!("plan step failed for plan model '{}': {}", plan_model, e);
                 let _ = tx.send(agent::retry::PipelineResult::PlanReady {
-                    plan: format!("(plan unavailable: exec model '{}' — {})", exec_model, e),
+                    plan: format!("(plan unavailable: plan model '{}' — {})", plan_model, e),
                 });
             }
         }
@@ -2283,24 +2459,17 @@ fn spawn_execution_with_plan(
                 s
             };
 
-            let final_step_directive = if step_num == total_steps {
-                "This is the FINAL step of the plan — your response here is the answer the \
-                 user sees. After any tool calls, give a concise natural-language answer to \
-                 the original request.\n\n"
-            } else {
-                ""
-            };
-
             let user_msg = format!(
                 "Original request: {}\n\nPlan:\n{}\n{}Now execute ONLY step {} of {}: {}\n\n\
-                 {}Workflow for this step:\n\
+                 Workflow for this step:\n\
                  1. If previous steps created files, READ them first to recall their content\n\
                  2. Use tools (exec_shell, read_file, web_reader, web_search, ...) as needed \
                  for this step\n\
                  3. If this step requires creating or modifying a file, output it using the \
                  format below; otherwise skip the file format\n\
-                 4. ALWAYS end the step with a concise prose answer to what the user asked — \
-                 never end with only a tool call or empty output\n\n\
+                 4. End the step when its work is done. You do NOT need to write a prose \
+                 summary or a \"final answer\" — a later Eval step reviews the whole execution \
+                 and writes the concise answer the user sees.\n\n\
                  Output a file ONLY when a file change is needed, using this format:\n\
                  ### FILE: relative/path/to/file\n\
                  ### ACTION: create|modify\n\
@@ -2311,7 +2480,6 @@ fn spawn_execution_with_plan(
                 step_num,
                 total_steps,
                 step_desc,
-                final_step_directive,
             );
 
             let content = stream_step_native_tools(
@@ -2379,8 +2547,8 @@ const MAX_TOOL_ROUNDS_PER_STEP: usize = 5;
 /// tool calls, dispatch the first via the `ToolRegistry`, append the assistant turn
 /// (with its `tool_calls`) and the `tool`-role result to the message history, and
 /// re-call so the model sees the result and continues. Terminates when the model
-/// returns no tool calls (content is the step's final answer) or
-/// `MAX_TOOL_ROUNDS_PER_STEP` is hit.
+/// returns no tool calls (the step's content becomes exec output for the Eval
+/// step) or `MAX_TOOL_ROUNDS_PER_STEP` is hit.
 ///
 /// Uses `/api/chat`, which does NOT expose the KV-cache `context` handle — there is
 /// no manual cache reuse on this path. The status bar's `ctx:N%` indicator is fed
@@ -2402,46 +2570,6 @@ fn stream_step_native_tools(
     messages.push(serde_json::json!({ "role": "user", "content": user_message }));
 
     let mut prev_signature = String::new();
-    let mut tools_dispatched = 0usize;
-
-    // Final-answer fallback: if tools ran but the candidate has no prose answer,
-    // do one more /api/chat call with NO tool definitions and an explicit "answer
-    // now" instruction — with no tools available the model must respond in prose.
-    // `messages` is passed in (not captured) because the loop mutates it each round.
-    let finalize_native =
-        |msgs: &[serde_json::Value], candidate: String, dispatched: usize| -> String {
-            if dispatched > 0 && !crate::agent::tools_parser::has_final_answer(&candidate) {
-                tracing::info!(
-                    "stream_step_native_tools: step ended after {} tool dispatch(es) with no \
-                     prose answer — running final-answer fallback",
-                    dispatched
-                );
-                let mut ans_messages = msgs.to_vec();
-                ans_messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": "You have finished gathering information with the tools above. \
-                     Now answer the user's original request concisely in plain prose. Do NOT \
-                     call any tools. Do NOT write files. Just give the direct answer."
-                }));
-                let tx_chunk = tx.clone();
-                let answer = rt.block_on(client.chat_native_streaming(
-                    model,
-                    ans_messages,
-                    &[],
-                    |c: &str| {
-                        let _ = tx_chunk.send(agent::retry::PipelineResult::StreamChunk {
-                            content: c.to_string(),
-                        });
-                    },
-                ));
-                if let Ok(resp) = answer {
-                    if !resp.content.trim().is_empty() {
-                        return resp.content;
-                    }
-                }
-            }
-            candidate
-        };
 
     for round in 0..MAX_TOOL_ROUNDS_PER_STEP {
         let tx_chunk = tx.clone();
@@ -2465,7 +2593,7 @@ fn stream_step_native_tools(
                 round,
                 response.content.chars().count()
             );
-            return finalize_native(&messages, response.content, tools_dispatched);
+            return response.content;
         }
 
         // Dispatch only the FIRST tool call (sequential agent loop — the model must
@@ -2481,7 +2609,7 @@ fn stream_step_native_tools(
                 "stream_step_native_tools round {}: repeating tool signature, finalizing step",
                 round
             );
-            return finalize_native(&messages, response.content, tools_dispatched);
+            return response.content;
         }
         prev_signature = signature;
 
@@ -2536,7 +2664,6 @@ fn stream_step_native_tools(
         let _ = tx.send(agent::retry::PipelineResult::ToolResultReady {
             result: result.clone(),
         });
-        tools_dispatched += 1;
 
         // Append the tool result so the model can continue.
         messages.push(serde_json::json!({
@@ -2550,7 +2677,7 @@ fn stream_step_native_tools(
         "stream_step_native_tools: hit MAX_TOOL_ROUNDS_PER_STEP={}, returning empty content",
         MAX_TOOL_ROUNDS_PER_STEP
     );
-    finalize_native(&messages, String::new(), tools_dispatched)
+    String::new()
 }
 
 /// Token budget for auto-injected skill bodies. Keeps the prompt bounded even when
@@ -2798,18 +2925,30 @@ fn render_retry_result(ui_state: &mut ui::UiState, result: agent::retry::RetryRe
     }
 }
 
-/// Spawn a background eval review using the eval model.
-/// After execution completes, the eval model reviews whether the implementation
-/// fulfills the user's original request.
-fn spawn_eval_review(
+/// Maximum number of eval-proposed redos allowed in a single turn. Beyond this
+/// the eval step must not propose another redo (it accepts or hands control to
+/// the user), so an unhappy eval cannot loop forever.
+const MAX_REDOS_PER_TURN: u32 = 2;
+
+/// Spawn the eval-model reflection over a completed execution. The eval model
+/// judges whether the plan + execution satisfied the user's request, writes the
+/// concise final-answer summary (the canonical assistant turn), and — when
+/// unsatisfied — proposes a user-approved redo / further round.
+///
+/// Short-circuits (no-op) when no distinct eval model is configured.
+fn spawn_eval_reflection(
     app_state: &AppState,
     user_request: &str,
+    plan: &str,
     exec_output: &str,
+    redo_count: u32,
     tx: mpsc::Sender<agent::retry::PipelineResult>,
 ) {
-    let eval_model = app_state.config.effective_eval_model().to_string();
-    let exec_model = app_state.config.exec_model.clone();
-    if eval_model == exec_model || eval_model.is_empty() {
+    // Eval runs whenever an eval model is explicitly configured — even if it is the
+    // same model as exec (the reflection still yields a clean answer-only summary).
+    // Short-circuit only when no eval model is set at all.
+    let eval_model = app_state.config.eval_model.clone();
+    if eval_model.is_empty() {
         return;
     }
 
@@ -2817,19 +2956,30 @@ fn spawn_eval_review(
     let connect_timeout = app_state.config.connect_timeout;
     let context_window_limit = app_state.config.context_window_limit;
     let user_request = user_request.to_string();
+    let plan = plan.to_string();
+    let redo_cap_note = if redo_count >= MAX_REDOS_PER_TURN {
+        format!(
+            "You have already proposed the maximum of {} redo(s) this turn. Set redo_kind \
+             to \"none\" regardless of quality — do not propose another redo.",
+            MAX_REDOS_PER_TURN
+        )
+    } else {
+        String::new()
+    };
     let exec_output = exec_output.to_string();
 
     tracing::info!(
-        "spawning eval review: eval_model={}, exec_output={} bytes",
+        "spawning eval reflection: eval_model={}, exec_output={} bytes, redo_count={}",
         eval_model,
-        exec_output.len()
+        exec_output.len(),
+        redo_count
     );
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                tracing::error!("eval review runtime error: {}", e);
+                tracing::error!("eval reflection runtime error: {}", e);
                 return;
             }
         };
@@ -2843,12 +2993,12 @@ fn spawn_eval_review(
         let client = match ollama::OllamaClient::new(&bg_config) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("eval review client error: {}", e);
+                tracing::error!("eval reflection client error: {}", e);
                 return;
             }
         };
 
-        // Truncate exec output if too long for eval context
+        // Truncate exec output if too long for eval context.
         let max_output_chars = 8000;
         let truncated_output = if exec_output.len() > max_output_chars {
             format!(
@@ -2860,35 +3010,262 @@ fn spawn_eval_review(
             exec_output.clone()
         };
 
+        let eval_system = format!(
+            "You are the EVALUATION stage of a Plan→Execute→Eval coding agent. A separate \
+             executor already produced the work below. Judge whether that execution satisfies \
+             the user's original request, and write the concise final answer the user sees.\n\n\
+             You MUST call the `submit_evaluation` tool exactly once with:\n\
+             - satisfied: true if the execution fully addresses the request; false ONLY on a \
+             clear, concrete shortfall (missing file, wrong behavior, unanswered question). \
+             Bias toward true — do not mark false for style, wording, or minor preferences.\n\
+             - summary: the concise, answer-only response to the user. State what was done / \
+             the answer directly. Do NOT include chain-of-thought, reasoning steps, or rules \
+             copied from any instructions. Keep it short.\n\
+             - redo_kind: \"none\" when satisfied; \"further\" for one more targeted pass with \
+             a specific follow-up; \"plan\" to re-plan and re-execute from scratch. Only set \
+             non-\"none\" when satisfied=false.\n\
+             - redo_reason: 1-2 sentences on the concrete shortfall (empty when satisfied).\n\
+             - redo_request: the exact follow-up request to run for a \"further\" redo (empty \
+             otherwise).\n\n{}\n\n\
+             The execution output may contain tool calls, file blocks (### FILE:), and command \
+             results — treat those as the work performed. Files mentioned were already written \
+             to disk.",
+            redo_cap_note
+        );
+
+        let eval_user = format!(
+            "User request:\n{}\n\nPlan:\n{}\n\nExecution output:\n{}\n\n\
+             Call submit_evaluation with your verdict.",
+            user_request, plan, truncated_output
+        );
+
         let messages = vec![
-            ollama::chat::ChatMessage::system(
-                "You are a code review evaluator. Your job is to assess whether \
-                 an implementation fulfills the user's original request. \
-                 Be concise. Start with PASS or FAIL, then list any issues or \
-                 missing parts. Keep your review under 500 words."
-            ),
-            ollama::chat::ChatMessage::user(format!(
-                "User request:\n{}\n\nImplementation output:\n{}\n\n\
-                 Does this implementation fulfill the user's request? \
-                 Start with PASS or FAIL.",
-                user_request, truncated_output
-            )),
+            serde_json::json!({ "role": "system", "content": eval_system }),
+            serde_json::json!({ "role": "user", "content": eval_user }),
         ];
 
-        match rt.block_on(client.chat(&eval_model, messages, false)) {
-            Ok(resp) => {
-                let _ = tx.send(agent::retry::PipelineResult::EvalReady {
-                    evaluation: format!("[Eval: {}]\n{}", eval_model, resp.content),
-                });
+        let eval_tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "submit_evaluation",
+                "description": "Submit your evaluation: satisfaction verdict, concise final-answer summary, and (if unsatisfied) a redo proposal.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "satisfied": { "type": "boolean", "description": "true if the execution fully satisfies the request" },
+                        "summary": { "type": "string", "description": "Concise answer-only summary for the user (no chain-of-thought or copied rules)" },
+                        "redo_kind": { "type": "string", "enum": ["none", "further", "plan"], "description": "none=satisfied; further=one more targeted pass; plan=re-plan from scratch" },
+                        "redo_reason": { "type": "string", "description": "Why unsatisfactory (1-2 sentences). Empty if satisfied." },
+                        "redo_request": { "type": "string", "description": "Suggested follow-up request for a 'further' redo. Empty otherwise." }
+                    },
+                    "required": ["satisfied", "summary", "redo_kind"]
+                }
             }
+        });
+
+        // The eval summary is delivered as one EvalReady event (not streamed — MVP).
+        let response = rt.block_on(client.chat_native_streaming(
+            &eval_model,
+            messages,
+            &[eval_tool],
+            |_c: &str| {},
+        ));
+
+        let verdict = match response {
+            Ok(resp) => parse_eval_verdict(&resp),
             Err(e) => {
-                tracing::warn!("eval review failed: {}", e);
-                let _ = tx.send(agent::retry::PipelineResult::EvalReady {
-                    evaluation: format!("[Eval] Review skipped: {}", e),
-                });
+                tracing::warn!("eval reflection failed: {}", e);
+                agent::retry::EvalVerdict::satisfied(format!("[Eval] reflection failed: {}", e))
             }
-        }
+        };
+        let _ = tx.send(agent::retry::PipelineResult::EvalReady {
+            verdict,
+            model: eval_model.clone(),
+        });
     });
+}
+
+/// Parse the eval model's `submit_evaluation` tool call into an `EvalVerdict`.
+/// No tool call (or unparseable args) → bias to satisfied, using any text content
+/// as the summary (never leaves the turn without an answer).
+fn parse_eval_verdict(resp: &ollama::chat::ChatResponse) -> agent::retry::EvalVerdict {
+    use agent::retry::{EvalVerdict, RedoKind, RedoProposal};
+    if let Some(tc) = resp.tool_calls.first() {
+        let args = &tc.arguments;
+        let satisfied = args.get("satisfied").and_then(|v| v.as_bool()).unwrap_or(true);
+        let summary = args
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let redo_kind = match args
+            .get("redo_kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+        {
+            "further" => RedoKind::Further,
+            "plan" => RedoKind::Plan,
+            _ => RedoKind::None,
+        };
+        let proposal = if !satisfied && redo_kind != RedoKind::None {
+            let reason = args
+                .get("redo_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let request = args
+                .get("redo_request")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(RedoProposal {
+                kind: redo_kind,
+                reason,
+                request,
+            })
+        } else {
+            None
+        };
+        // Fall back to text content if the model gave no summary string.
+        let summary = if summary.trim().is_empty() {
+            resp.content.trim().to_string()
+        } else {
+            summary
+        };
+        EvalVerdict {
+            satisfied,
+            summary,
+            proposal,
+        }
+    } else {
+        EvalVerdict::satisfied(resp.content.trim())
+    }
+}
+
+/// Push the finalized assistant answer into history + session, run compaction,
+/// and trigger background summarization if warranted. Shared by the StreamDone
+/// short-circuit (exec content as the answer) and EvalReady (eval summary as the
+/// answer) — only one of the two runs per turn.
+fn commit_assistant_answer(
+    app_state: &mut AppState,
+    content: &str,
+    result_tx: &mpsc::Sender<agent::retry::PipelineResult>,
+) {
+    if content.trim().is_empty() {
+        return;
+    }
+    let tokens = util::text::estimate_tokens(content);
+    tracing::debug!("adding to conversation history: role=assistant, {} tokens", tokens);
+    app_state.conversation_history.push(ConversationMessage {
+        role: "assistant".into(),
+        content: content.to_string(),
+        tokens,
+    });
+    app_state.current_session.add_message("assistant", content);
+    auto_save_session(app_state);
+    let history_before = app_state.conversation_history.len();
+    context::maybe_compact(
+        &mut app_state.conversation_history,
+        &app_state.config.exec_model,
+    );
+    if app_state.conversation_history.len() < history_before {
+        tracing::info!(
+            "conversation history compacted: {} -> {} messages",
+            history_before,
+            app_state.conversation_history.len()
+        );
+    }
+    if app_state.conversation_summary.is_none() || app_state.conversation_history.len() > 20 {
+        maybe_trigger_summarization(app_state, result_tx.clone());
+    }
+}
+
+/// Run an eval-proposed redo: build a new request carrying a condensed
+/// `[Previous attempt]` block, bump the redo counter, and spawn the next
+/// Plan→Execute→Eval cycle.
+fn run_eval_redo(
+    app_state: &mut AppState,
+    client: &ollama::OllamaClient,
+    ui_state: &mut ui::UiState,
+    proposal: agent::retry::RedoProposal,
+    result_tx: mpsc::Sender<agent::retry::PipelineResult>,
+) {
+    use agent::retry::RedoKind;
+    let base_request = match &proposal.kind {
+        RedoKind::Further if !proposal.request.trim().is_empty() => proposal.request.clone(),
+        // Plan redo, or a Further redo with no concrete request: re-run the original.
+        _ => app_state.last_user_request.clone().unwrap_or_default(),
+    };
+    let prior = build_previous_attempt_block(app_state, &proposal);
+    let redo_input = if prior.trim().is_empty() {
+        base_request
+    } else {
+        format!("{}\n\n{}", base_request, prior)
+    };
+
+    app_state.redo_count = app_state.redo_count.saturating_add(1);
+    ui_state.add_output(OutputLine::System(format!(
+        "Running proposed redo ({}/{})…",
+        app_state.redo_count, MAX_REDOS_PER_TURN
+    )));
+    ui_state.add_output(OutputLine::User(redo_input.clone()));
+    app_state.conversation_history.push(ConversationMessage {
+        role: "user".into(),
+        content: redo_input.clone(),
+        tokens: util::text::estimate_tokens(&redo_input),
+    });
+    ui_state.last_user_input = redo_input.clone();
+    ui_state.start_thinking();
+    spawn_request_for_mode(app_state, client, &redo_input, result_tx);
+    app_state.is_processing = true;
+}
+
+/// Build a condensed `[Previous attempt]` context block from the stashed plan +
+/// exec output and the eval's rationale, to inject into a redo request.
+fn build_previous_attempt_block(
+    app_state: &AppState,
+    proposal: &agent::retry::RedoProposal,
+) -> String {
+    let mut s =
+        String::from("[Previous attempt — improve on it; do not repeat the same mistakes]\n");
+    if let Some(plan) = &app_state.last_plan {
+        if !plan.trim().is_empty() {
+            s.push_str(&format!("Previous plan:\n{}\n\n", plan));
+        }
+    }
+    if let Some(exec) = &app_state.last_exec_output {
+        if !exec.trim().is_empty() {
+            let max = 2000usize;
+            let preview: String = exec.chars().take(max).collect();
+            let ellipsis = if exec.chars().count() > max {
+                "\n[…truncated]"
+            } else {
+                ""
+            };
+            s.push_str(&format!(
+                "Previous execution (condensed):\n{}{}\n\n",
+                preview, ellipsis
+            ));
+        }
+    }
+    if !proposal.reason.trim().is_empty() {
+        s.push_str(&format!(
+            "Why it was unsatisfactory: {}\n",
+            proposal.reason.trim()
+        ));
+    }
+    s
+}
+
+/// Whether the current turn is fully complete — no LLM work in flight and no
+/// approval (redo / plan / file-confirmation) pending. Gates draining the
+/// pending input queue so messages never interleave with a pending eval or
+/// approval.
+fn turn_is_complete(app_state: &AppState) -> bool {
+    !app_state.is_processing
+        && app_state.pending_redo_decision.is_none()
+        && app_state.pending_plan.is_none()
+        && !app_state.awaiting_confirmation
 }
 
 fn spawn_request_for_mode(
@@ -3741,6 +4118,143 @@ fn run_lsp_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// parse_eval_verdict: a satisfied `submit_evaluation` tool call yields a
+    /// satisfied verdict with the summary and no proposal.
+    #[test]
+    fn eval_verdict_satisfied_from_tool_call() {
+        let resp = ollama::chat::ChatResponse {
+            content: String::new(),
+            tool_calls: vec![ollama::chat::NativeToolCall {
+                name: "submit_evaluation".into(),
+                arguments: serde_json::json!({
+                    "satisfied": true,
+                    "summary": "Created src/foo.rs with the endpoint.",
+                    "redo_kind": "none"
+                }),
+                id: None,
+            }],
+            model: "eval".into(),
+        };
+        let v = parse_eval_verdict(&resp);
+        assert!(v.satisfied);
+        assert_eq!(v.summary, "Created src/foo.rs with the endpoint.");
+        assert!(v.proposal.is_none());
+    }
+
+    /// parse_eval_verdict: an unsatisfied `further` verdict yields a proposal
+    /// carrying the reason and the suggested follow-up request.
+    #[test]
+    fn eval_verdict_redo_proposal_from_tool_call() {
+        let resp = ollama::chat::ChatResponse {
+            content: String::new(),
+            tool_calls: vec![ollama::chat::NativeToolCall {
+                name: "submit_evaluation".into(),
+                arguments: serde_json::json!({
+                    "satisfied": false,
+                    "summary": "Partial: endpoint lacks error handling.",
+                    "redo_kind": "further",
+                    "redo_reason": "No error handling on the POST path.",
+                    "redo_request": "Add error handling to the POST endpoint in src/foo.rs"
+                }),
+                id: None,
+            }],
+            model: "eval".into(),
+        };
+        let v = parse_eval_verdict(&resp);
+        assert!(!v.satisfied);
+        let p = v.proposal.expect("proposal present");
+        assert_eq!(p.kind, agent::retry::RedoKind::Further);
+        assert_eq!(
+            p.request,
+            "Add error handling to the POST endpoint in src/foo.rs"
+        );
+        assert!(p.reason.contains("error handling"));
+    }
+
+    /// parse_eval_verdict: no tool call → bias to satisfied, content is the summary
+    /// (the turn never ends without an answer).
+    #[test]
+    fn eval_verdict_no_tool_call_biases_satisfied() {
+        let resp = ollama::chat::ChatResponse {
+            content: "42".into(),
+            tool_calls: vec![],
+            model: "eval".into(),
+        };
+        let v = parse_eval_verdict(&resp);
+        assert!(v.satisfied);
+        assert_eq!(v.summary, "42");
+        assert!(v.proposal.is_none());
+    }
+
+    #[test]
+    fn previous_attempt_block_contents() {
+        let mut state = AppState::new(
+            config::Config::default(),
+            std::path::PathBuf::from("/tmp/test"),
+        );
+        state.last_plan = Some("1. do thing\n2. done".into());
+        state.last_exec_output =
+            Some("### FILE: a.rs\n```rust\nfn main() {}\n```".into());
+        let proposal = agent::retry::RedoProposal {
+            kind: agent::retry::RedoKind::Plan,
+            reason: "Missing tests.".into(),
+            request: String::new(),
+        };
+        let block = build_previous_attempt_block(&state, &proposal);
+        assert!(block.contains("[Previous attempt"));
+        assert!(block.contains("Previous plan:"));
+        assert!(block.contains("1. do thing"));
+        assert!(block.contains("Previous execution (condensed):"));
+        assert!(block.contains("Missing tests."));
+    }
+
+    #[test]
+    fn previous_attempt_block_empty_when_nothing_stashed() {
+        let state = AppState::new(
+            config::Config::default(),
+            std::path::PathBuf::from("/tmp/test"),
+        );
+        let proposal = agent::retry::RedoProposal {
+            kind: agent::retry::RedoKind::Further,
+            reason: String::new(),
+            request: String::new(),
+        };
+        // Only the header line — no plan/exec/reason sections.
+        assert_eq!(
+            build_previous_attempt_block(&state, &proposal),
+            "[Previous attempt — improve on it; do not repeat the same mistakes]\n"
+        );
+    }
+
+    /// turn_is_complete is true only when idle with no pending approval of any kind.
+    #[test]
+    fn turn_complete_predicate() {
+        let mut state = AppState::new(
+            config::Config::default(),
+            std::path::PathBuf::from("/tmp/test"),
+        );
+        assert!(turn_is_complete(&state)); // idle by default
+
+        state.is_processing = true;
+        assert!(!turn_is_complete(&state));
+        state.is_processing = false;
+
+        state.pending_redo_decision = Some(agent::retry::RedoProposal {
+            kind: agent::retry::RedoKind::Further,
+            reason: "x".into(),
+            request: "y".into(),
+        });
+        assert!(!turn_is_complete(&state));
+        state.pending_redo_decision = None;
+
+        state.pending_plan = Some("plan".into());
+        assert!(!turn_is_complete(&state));
+        state.pending_plan = None;
+
+        state.awaiting_confirmation = true;
+        assert!(!turn_is_complete(&state));
+    }
 
     /// Phase A: `apply_plan_prompt` must substitute both `{MAX_LINES}` and `{TOOLS}`
     /// into the planner system prompt. The planner uses text-only tool awareness —

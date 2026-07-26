@@ -95,9 +95,11 @@ included in the assistant's context.
 
 ## Answer discipline
 
-- End every turn with a concise prose answer grounded in what you actually did
-  and observed.
-- Prefer the shortest precise answer that satisfies the request; omit filler.
+- Do the step's work (call tools, read/write files, run commands) and stop when it is
+  done. You do NOT need to write a prose summary — a separate Eval step reviews your
+  work and writes the concise answer the user sees.
+- When you do write prose, keep it short and grounded in what you actually did and
+  observed; prefer the shortest precise phrasing and omit filler.
 
 ## Filesystem & shell accuracy
 
@@ -335,16 +337,16 @@ When the user asks to run a build, test, or git operation, use exec_shell.
 Tools are exposed via the API's native tool-calling interface — call them with the provided
 tool schemas (do not emit `<tool_call>` blocks or attempt to invoke tools by name in prose).
 The executor dispatches the first tool call, returns its result, and lets you continue with
-the next call or your final answer. Only emit one tool call per turn — wait for the result
+the next call or finish the step. Only emit one tool call per turn — wait for the result
 before calling a dependent tool (e.g. call web_reader alone, read what it returned, and only
 then call write_file with content drawn from that result, never inventing content yourself).
 
-## Always answer the user
-End EVERY turn with a concise natural-language answer to what the user asked. After your
-last tool returns, state the result or findings in plain prose. For a question (counting,
-listing, explaining, looking something up), answer it directly in words — do not end with
-only a tool call, a file block, or empty output. The user must always receive a direct
-answer.
+## Do the work; the Eval step answers
+Your job is to execute the current step — call tools, read/write files, run commands — and
+stop when the step's work is done. You do NOT need to write a prose summary or a "final
+answer": a separate Eval step reviews what you did and writes the concise answer the user
+sees. End the step as soon as its work is complete (no further tool call needed, or the
+file/command output is emitted). Do not pad with restatements or explanations.
 
 ### FILE: path/to/file
 ### ACTION: create|modify|delete

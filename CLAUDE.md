@@ -29,7 +29,7 @@ src/
 │                        maybe_compact (truncation), compact_with_summary (LLM-powered)
 ├── prompt.rs            PromptBuilder: layered system prompt construction
 │                        (identity, mode, skills, project context, volatile tail)
-├── wizard.rs            First-run setup wizard (Ollama URL, 2-tier model selection)
+├── wizard.rs            First-run setup wizard (Ollama URL, 3-tier model selection: Plan/Exec/Eval)
 │
 ├── ui/
 │   ├── mod.rs           TUI rendering: status bar (with ctx:% indicator), chat panel,
@@ -55,8 +55,9 @@ src/
 │   ├── tools_parser.rs  sanitize_output() scrubs forged tool-call markers from
 │   │                    display (native tool calls arrive via Ollama's structured
 │   │                    `tool_calls` array, but models can still echo forged markers
-│   │                    in their content); has_final_answer() drives the
-│   │                    final-answer fallback.
+│   │                    in their content). has_final_answer() is a prose-detection
+│   │                    helper, vestigial under Plan→Execute→Eval (the Eval step —
+│   │                    not a fallback — produces the final answer).
 │   ├── prompts.rs       System prompts per model tier, model-size-adaptive templates
 │   ├── retry.rs         chat_with_retry() with exponential backoff,
 │   │                    ErrorClass (Retryable/Permanent) error classification,
@@ -154,9 +155,9 @@ The planner and executor both flow through `/api/chat`. The executor uses Ollama
   (parsed into `NativeToolCall`); the loop dispatches the first one, appends the
   assistant turn (with its `tool_calls`) and a `tool`-role result message, then
   re-calls `/api/chat` so the model sees the result. Terminates when the model returns
-  no tool calls (content is the step's final answer) or `MAX_TOOL_ROUNDS_PER_STEP = 5`
-  rounds elapse. Signature-repeat detection (same `name:arguments` as the previous
-  round) also terminates the loop.
+  no tool calls (the step's content becomes exec output for the Eval step) or
+  `MAX_TOOL_ROUNDS_PER_STEP = 5` rounds elapse. Signature-repeat detection (same
+  `name:arguments` as the previous round) also terminates the loop.
 
 - **Why native, not text-format:** thinking models (e.g. `qwen3.5`) put tool intent
   into their reasoning and stop with empty content on `/api/generate`; they emit native
@@ -172,8 +173,9 @@ For each plan step, up to `MAX_TOOL_ROUNDS_PER_STEP = 5` rounds:
 
 1. Call `chat_native_streaming` with `tools = ollama_tool_definitions()`. Streamed
    content tokens emit `PipelineResult::StreamChunk` for live display.
-2. If `response.tool_calls.is_empty()` → step done; the content is the answer
-   (subject to the final-answer fallback below).
+2. If `response.tool_calls.is_empty()` → step done; the step's content becomes part
+   of the exec output the Eval step later reflects on. The exec step owes no prose
+   answer (see *Final-Answer Guarantee*).
 3. Else take the **first** tool call only (sequential agent loop — the model must see
    a tool's result before emitting a dependent call).
 4. Echo the assistant turn + `tool_calls` to the message history.
@@ -181,19 +183,27 @@ For each plan step, up to `MAX_TOOL_ROUNDS_PER_STEP = 5` rounds:
    `ToolResultReady`.
 6. Append the `tool`-role result message and re-call.
 
-**Final-answer fallback**: if tools ran but the candidate content lacks a prose answer
-(`tools_parser::has_final_answer()` returns false — fewer than 3 non-tool/file/code-fence
-words), one more `/api/chat` call is made with empty `tools=[]` and an explicit
-"answer now in prose" instruction. The model must respond in plain text. A no-op when
-no tools ran.
+**No per-step final-answer fallback.** A step may legitimately end with only tool
+calls or `### FILE:` blocks — that raw output is carried forward as exec content for
+the Eval step, which judges satisfaction and writes the turn's final answer. The exec
+model is told to call the next tool or finish the step; it is never asked to produce a
+prose answer here.
 
-### Pipeline flow
+### Pipeline flow — Plan → Execute → Eval
 
-1. Exec model generates a numbered plan via `OllamaClient::chat` (with `{TOOLS}` in
-   the system prompt, no `tools=` field).
-2. Plan displayed for approval (Edit mode) or auto-executed (Plan / Auto mode).
-3. Each step executed via `stream_step_native_tools`.
-4. `PipelineResult::StreamMeta` emitted at the end with a rough prompt-token estimate.
+1. **Plan.** The **plan model** (`effective_plan_model()`) generates a numbered plan
+   via `OllamaClient::chat` (with `{TOOLS}` in the system prompt, no `tools=`
+   field).
+2. The plan is displayed for approval (Edit mode) or auto-executed (Plan / Auto mode).
+3. **Execute.** Each step runs via `stream_step_native_tools`; step outputs are
+   concatenated into one exec output. `PipelineResult::StreamMeta` is emitted at the
+   end with a rough prompt-token estimate.
+4. **Eval.** The eval model reflects over the plan + exec output, judges
+   whether the user's request was satisfied, and writes the turn's final answer (a
+   concise summary). If unsatisfied, it proposes a user-approved redo / further round.
+   See *Eval-Model Reflection & Redo Loop*.
+
+The exec output is **not** the user-facing answer — the Eval step is.
 
 ---
 
@@ -240,20 +250,48 @@ Enter key
   → main loop receives: StreamChunk (tokens), StreamDone (content),
     StreamMeta (prompt token count, model)
   → update app_state.total_prompt_tokens, refresh ctx:% status bar
-  → parse file changes → mode-dependent apply flow
+  → parse file changes → mode-dependent apply flow   (exec output is the file source)
+  → EvalReady → eval summary becomes the final answer; if unsatisfied,
+    ask y/n/o to redo / further-round
   → drain pending_queue if non-empty
 ```
 
 ---
 
-## Two-Tier Model Pipeline
+## Three-Tier Model Pipeline
+
+> All three tiers are wired: `plan_model` + `effective_plan_model()` in `config.rs`,
+> the planner call in `spawn_plan_then_execute`, a Plan slot in the wizard
+> (Exec → Plan → Eval; Tab skips a slot to reuse Exec), and plan-model warmup. Each
+> tier falls back to `exec_model` when its own field is empty.
 
 | Tier | Size | Role | Config Field |
 |------|------|------|-------------|
-| Exec | 6-14B | Main work — planning, file generation, per-step tool dispatch | `exec_model` |
-| Eval | 14B+ | Review — check results, quality assurance | `eval_model` |
+| Plan | 8B+ | Planning — turn the request into a numbered, tool-aware plan | `plan_model` |
+| Exec | 6-14B | Execution — per-step tool dispatch, file generation | `exec_model` |
+| Eval | 14B+ | Reflection — judge the result, write the concise final-answer summary, and (when unsatisfied) propose a redo / further round | `eval_model` |
 
 Prompts adapt to model size via `agent::prompts::system_prompt_for_size()`: short/directive for small, standard+examples for medium, full/nuanced for large.
+
+Each tier falls back to `exec_model` when its own field is empty
+(`config::effective_plan_model()` / `effective_eval_model()`), so a single-model
+setup still works — set only `exec_model`. A stronger `plan_model` (and `eval_model`)
+improves plan quality and reflection; the plan and exec models may be the same, but
+separating them lets a larger model do the reasoning while a smaller, faster model
+does the step-by-step work.
+
+**How it runs.** `spawn_plan_then_execute` (`src/main.rs`) calls the **plan model**
+(`effective_plan_model()`) to generate the plan via `OllamaClient::chat` (text-only
+tool awareness — `{TOOLS}` in the system prompt, no `tools=` field). After each
+executed turn (when `mode != Plan` and an `eval_model` is configured),
+`spawn_eval_reflection` calls the **eval model** with a single `submit_evaluation`
+native tool. The eval model may equal the exec model — the reflection still yields a
+clean answer-only summary; only an empty `eval_model` short-circuits (exec content
+then stands as the answer). The eval verdict is `satisfied`, a concise answer-only
+`summary` (the canonical assistant turn), and an optional redo `proposal`. Satisfied
+paths commit the summary and finalize the turn; unsatisfied paths offer a y/n/o redo
+(see *Eval-Model Reflection & Redo Loop*). Each phase is labeled in the UI: `◆ Plan`,
+`◆ Exec`, `◆ Eval` (`OutputLine::Plan` / `OutputLine::Phase`).
 
 ---
 
@@ -323,6 +361,7 @@ Sessions stored as JSON at `~/.litepilot/sessions/{uuid}.json` with atomic write
 ollama_endpoint = "http://127.0.0.1:11434"
 connect_timeout = 15
 context_window_limit = 262144
+plan_model = "qwen3:14b"
 exec_model = "qwen3:8b"
 eval_model = "qwen3:14b"
 default_mode = "edit"
@@ -375,24 +414,158 @@ task-specific methodologies that auto-attach when the task matches.
 
 ## Final-Answer Guarantee
 
-Every turn ends with a natural-language answer to the user, even after tool use.
-This is enforced by prompt rules plus a fallback:
+Every turn ends with a natural-language answer to the user, even after tool use or
+file output. Under the **Plan → Execute → Eval** workflow this is the **Eval** step's
+job, not the executor's — there is no exec-model fallback that asks the executor for
+prose.
 
-- **Base identity** (`prompt.rs`): an "Always answer the user" rule tells the
-  model to end every turn with prose, never only tool calls / file blocks / empty.
-- **Planner** (`agent::prompts::QUICK_PLAN_SYSTEM`): every plan's LAST step must
-  answer the request in plain text (summarize for file tasks; answer directly for
-  questions).
-- **Per-step workflow** (`spawn_execution_with_plan`): file output is conditional,
-  the final step is flagged as the answer step, and every step must end with a
-  prose answer.
-- **Tool-loop continuation** (`stream_step_native_tools`): after a tool result,
-  the model is told to either call the next tool or give the final answer in prose.
-- **Fallback**: a tool-using step that ends with no prose answer — detected by
-  `tools_parser::has_final_answer()` (≥3 words outside tool-call / tool-result /
-  `### FILE:` / fenced-code blocks) — triggers one more `/api/chat` call with
-  empty `tools=[]` that explicitly asks for the answer. Streams live like a
-  normal round; a no-op when no tools ran.
+- **The Eval step always emits a prose answer.** After execution, the eval model
+  reflects on the plan + exec output and writes a concise summary that *is* the
+  user-facing final answer (see *Eval-Model Reflection & Redo Loop*). The executor's
+  job is to call tools and write files; its raw output is the eval step's input, not
+  the answer.
+- **If no `eval_model` is configured** (empty), the eval step is a no-op and the
+  exec output stands as the answer directly — so the guarantee still holds, just
+  without a separate reflection pass. (An `eval_model` equal to `exec_model` still
+  runs the eval step — the reflection yields a clean summary either way.)
+- **If the eval step judges the result unsatisfied**, the turn still ends with an
+  answer: either the user approves a redo (which itself ends with an eval answer) or
+  declines (`n`) and keeps the current summary. The user is never left with only tool
+  calls / file blocks / empty content.
+
+Routing the answer through the larger eval model makes the guarantee stronger than an
+exec-model fallback would: the final prose is written by the model best suited to
+judge the work.
+
+## Eval-Model Reflection & Redo Loop
+
+> Implemented in `src/main.rs` (`spawn_eval_reflection`, `parse_eval_verdict`,
+> `run_eval_redo`, `build_previous_attempt_block`, `commit_assistant_answer`,
+> `turn_is_complete`) and `src/agent/retry.rs` (`EvalVerdict` / `RedoProposal` /
+> `RedoKind`, carried on `PipelineResult::EvalReady`).
+
+The eval model is the reflection stage that closes the plan→execute loop. After
+every executed turn it judges whether the plan + execution actually satisfied the
+user's request, writes the concise final-answer summary, and — when it judges the
+result unsatisfactory — proposes a redo or a further round that the user approves.
+This is what makes the two-tier pipeline meaningful: the eval model owns the final
+answer.
+
+### When it runs
+
+- **Always**, once per turn, immediately after `spawn_execution_with_plan` emits
+  its final `StreamDone` (the concatenated exec content). It does **not** check
+  `has_final_answer()` first — there is no "did the exec answer?" gate; the eval
+  step unconditionally reflects on the whole execution.
+- **Short-circuit to a no-op** only when no `eval_model` is configured (empty). An
+  `eval_model` equal to `exec_model` still runs — the reflection produces a clean
+  summary, and the model is already warm so there is no reload cost. The eval call
+  checks `config.eval_model.is_empty()` before spawning.
+- **Cost note:** this adds one extra `/api/chat` call on every turn, on top of
+  planning + execution. For local inference that is a per-turn latency cost; the
+  short-circuit above keeps the no-`eval_model` configuration free of it.
+
+### Inputs
+
+The eval call receives: (1) the **original user request** (`ui_state.last_user_input`
+/ the `current_goal`), (2) the **plan** (the `plan` passed to
+`spawn_execution_with_plan`), and (3) the **execution output** — the same `content`
+emitted in the final `StreamDone` (file `### FILE:` blocks, tool results, exec
+prose). A truncation guard like the current 8000-char cap applies.
+
+### Output (structured)
+
+Reuse the existing `PipelineResult::EvalReady` channel, but expand its payload from
+a display string to a small structured verdict so the loop can branch:
+
+- `satisfied: bool` — does the execution fulfill the request? **Bias toward
+  `true`**: a 14B model judging an 8B model's work is itself noisy, so the eval
+  prompt should propose a redo only on a clear failure, not on style nitpicks —
+  otherwise every turn nags the user.
+- `summary: String` — the concise final answer the user sees. Focused on answering
+  the request with the necessary details; it must **not** echo thinking logic,
+  chain-of-thought, or rules copied from the system prompt / instructions. This
+  `summary` is the canonical assistant turn stored in `conversation_history` and
+  shown to the user.
+- `proposal: Option<RedoProposal>` — present only when `satisfied == false`:
+  `kind` ∈ {`FurtherRound` (one more targeted pass with a suggested request),
+  `RedoPlan` (re-plan and re-execute from scratch)}, a one/two-sentence rationale,
+  and the suggested follow-up request text.
+
+### File changes vs. prose answer — keep them separate
+
+The **execution output stays the source of file changes.** The existing post-
+`StreamDone` apply flow (`parse_file_changes` → mode-dependent apply) parses
+`### FILE:` / `### ACTION:` blocks from the *exec* `content`, and must keep doing
+so. The eval `summary` is prose only — it never becomes the file source. So a turn
+that produced files applies them from exec output, and *additionally* shows the
+eval summary as the user-facing answer.
+
+### Satisfied path
+
+1. The eval `summary` is sanitized (`tools_parser::sanitize_output`) and promoted
+   to the assistant turn — rendered via `OutputLine::Assistant` and pushed into
+   `conversation_history`.
+2. File changes from the exec `content` flow through the normal apply path (Edit
+   confirmation / Auto apply / Plan hint).
+3. Turn ends; `pending_queue` drains.
+
+### Unsatisfied path — user-approved redo
+
+When `satisfied == false`, surface the proposal and ask the user for approval,
+reusing the existing interactive primitives (the `pending_plan` / `awaiting_other_input`
+handlers in `src/main.rs`):
+
+- A new awaiting flag (e.g. `pending_redo_decision: Option<RedoProposal>`) in the
+  same family as `pending_plan`, set after `EvalReady` instead of `PlanReady`.
+- The prompt follows the established wording pattern and uses the **same approval
+  vocabulary as the other prompts** (y/n/o):
+  `Eval: result may be incomplete. Redo? y/n/o`
+  `(y=accept proposal, n=keep current result, o=type your own instruction)`.
+- Key handling mirrors the plan-approval interceptor (`y/n/o`); `o` flips
+  `awaiting_other_input = true` so the user's typed instruction reroutes to
+  `spawn_request_for_mode` — the same path the existing `o` feedback uses.
+- Choices: `y` → run the proposed `FurtherRound` / `RedoPlan`; `n` → keep the
+  current result (apply any exec files, end turn — the user is never forced into a
+  redo); `o` → free-text steering treated as a fresh request with prior-execution
+  context attached (next bullet).
+- **Redo cap.** At most a small number (e.g. 2) of eval-proposed redos per turn;
+  beyond that the eval must stop proposing and either accept or hand control to
+  the user, so an unhappy eval cannot loop forever.
+
+### Context injection on redo (how the next attempt improves)
+
+When the user approves a redo (or types `o` steering), the next turn carries the
+prior attempt so the exec model does not repeat its mistakes. Two existing seams,
+used together:
+
+- A `[Previous attempt]` block appended to the next turn's context, mirroring the
+  in-plan `[Previous steps completed]` block already built in
+  `spawn_execution_with_plan` — it should carry the prior plan, a condensed view of
+  the prior exec output (files touched + key results), and the eval's rationale +
+  suggested request.
+- The volatile `PromptBuilder` fields (`set_volatile` / `set_current_goal`, set per
+  turn inside `spawn_request_for_mode`) carry the user's approved steering as the
+  new `current_goal` so it lands at the prompt edge for small-model attention.
+
+The prior exec output is summarized/condensed, not echoed verbatim, to respect the
+context budget (see *Context Window Management*).
+
+### Open decisions (to pin down before implementing)
+
+- **Auto mode.** Auto has no confirmation today. Should an eval-proposed redo
+  auto-run (respecting the redo cap) or always ask? Recommendation: always ask — a
+  meta-decision about re-planning is worth a confirmation even in Auto.
+- **Headless `-p/--prompt`.** Interactive approval is impossible. Recommendation:
+  skip the redo loop in headless — emit the eval `summary` as the final answer, and
+  if `satisfied == false`, print the proposal as a non-blocking note rather than
+  blocking.
+- **Exec fallback — removed (decided).** No per-step exec-model `tools=[]` answer
+  call; the Eval step is the sole final-answer source (see *Final-Answer
+  Guarantee*). `has_final_answer()` becomes vestigial and can be dropped when the
+  eval step lands.
+- **Eval prompt.** Must strongly bias toward PASS and forbid copying rules /
+  chain-of-thought into the summary (the summary must be answer-only).
 
 ## Naming Conventions
 

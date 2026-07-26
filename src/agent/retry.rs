@@ -1,6 +1,52 @@
 use crate::ollama::chat::ChatMessage;
 use crate::ollama::OllamaClient;
 
+/// What the eval model proposes when it judges execution unsatisfactory.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RedoKind {
+    /// No redo proposed (execution satisfied the request, or redo cap reached).
+    None,
+    /// One more targeted pass with a specific follow-up request.
+    Further,
+    /// Re-plan and re-execute from scratch.
+    Plan,
+}
+
+/// A redo proposal from the eval step. Present on `EvalVerdict` only when the
+/// execution did not satisfy the request and the redo cap has not been reached.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedoProposal {
+    pub kind: RedoKind,
+    /// One/two-sentence rationale (why the result is unsatisfactory).
+    pub reason: String,
+    /// The suggested follow-up request (used verbatim for `Further`; ignored
+    /// for `Plan`, which re-uses the original user request).
+    pub request: String,
+}
+
+/// Structured verdict produced by the eval-model reflection step.
+///
+/// `summary` is the concise, answer-only final answer the user sees — it must
+/// not echo chain-of-thought or rules copied from the system prompt. `proposal`
+/// is `Some` only when `satisfied == false` and the redo cap has not been hit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalVerdict {
+    pub satisfied: bool,
+    pub summary: String,
+    pub proposal: Option<RedoProposal>,
+}
+
+impl EvalVerdict {
+    /// Convenience: a satisfied verdict carrying the given prose as the summary.
+    pub fn satisfied(summary: impl Into<String>) -> Self {
+        Self {
+            satisfied: true,
+            summary: summary.into(),
+            proposal: None,
+        }
+    }
+}
+
 /// What kind of response we expect — determines how to validate it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ResponseKind {
@@ -380,8 +426,17 @@ pub enum PipelineResult {
     DiagnosticReady {
         result: crate::agent::diagnostics::DiagnosticResult,
     },
-    /// Eval model review of execution results
-    EvalReady { evaluation: String },
+    /// Eval-model reflection over plan + execution. `verdict.summary` is the
+    /// canonical final answer; `verdict.proposal` (when present) drives the
+    /// user-approved redo / further-round loop.
+    EvalReady {
+        verdict: EvalVerdict,
+        model: String,
+    },
+    /// Generic one-line status message (e.g. model-residency warmup notices).
+    /// Distinct from `EvalReady` so startup notices are not mistaken for an
+    /// eval verdict and promoted to an assistant answer.
+    Status { message: String },
 }
 
 #[cfg(test)]

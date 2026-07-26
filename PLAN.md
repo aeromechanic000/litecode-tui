@@ -958,3 +958,171 @@ M16.1 A1–A5 (skills auto-inject)   make "keep skills" real first
 ```
 
 M16.1 landed first (established the replacement mechanism, no behavior change for non-matching inputs). M16.2 was pure dead-code removal — the compiler flagged every dangling reference, so behavior could not change. Done on a `remove-codebase` branch.
+
+---
+
+## Phase 17 — Plan → Execute → Eval (no exec fallback) (v3.2)
+
+**Status: DONE (automated).** M17.1–M17.7 complete; M17.8 automated verification
+complete (build clean, 307 tests pass, zero new clippy warnings). Only the live
+manual check against a running Ollama with a distinct eval model remains.
+
+Reference: `CLAUDE.md` → *Execution Pipeline Architecture*, *Final-Answer Guarantee*,
+*Eval-Model Reflection & Redo Loop*, and `PLAN.md` (this phase).
+
+The two-tier model pipeline is currently a fiction: `eval_model` is invoked only
+cosmetically (`spawn_eval_review` → `OutputLine::System`, discarded), while the
+exec model owns the final answer via the `finalize_native` fallback (an empty-
+`tools=[]` `/api/chat` call). This phase makes the workflow **Plan → Execute →
+Eval**: the Eval step always reflects after execution, writes the concise
+final-answer summary that becomes the canonical assistant turn, judges
+satisfaction, and — when unsatisfied — proposes a user-approved redo / further
+round carrying prior-execution context.
+
+### M17.0 Locked design decisions
+
+1. **No exec-model fallback.** Exec step content is intermediate work; the Eval
+   summary is the answer. `has_final_answer()` becomes vestigial.
+2. **Eval always runs** after execution when `effective_eval_model() != exec_model`
+   and `mode != Plan`; **no-op** (exec content stands as the answer) otherwise.
+3. **Structured verdict via native tool-calling** — a single `submit_evaluation`
+   tool the eval model must call: `{satisfied, summary, redo_kind, redo_reason,
+   redo_request}`. Parsed from `NativeToolCall.arguments` (already a JSON value).
+   **Bias toward `satisfied=true`**; no tool call → content is the summary, PASS.
+4. **File changes stay sourced from exec content** (`parse_file_changes` at
+   StreamDone). The eval summary is prose only.
+5. **Unsatisfied → y/n/o approval** (mirrors `pending_plan`). `y` = redo;
+   `n` = keep; `o` = free-text steering. **Redo cap = 2 per turn.**
+6. **Headless (`-p`):** print summary + proposal note; never block.
+7. **Eval summary not streamed** (MVP) — arrives as one `EvalReady` event.
+
+### M17.1 Types & pipeline contract — P0
+
+**Tasks:**
+- [x] Add `RedoKind { None, Further, Plan }`, `RedoProposal { kind, reason,
+      request }`, `EvalVerdict { satisfied, summary, proposal }` to
+      `src/agent/retry.rs`.
+- [x] Change `PipelineResult::EvalReady { evaluation: String }` →
+      `EvalReady { verdict: EvalVerdict, model: String }`.
+- [x] Compile-fix both consumers (TUI `main.rs:1116`, headless `429/487`) with
+      placeholder logic fleshed out in M17.5/M17.7.
+
+**Files:** `src/agent/retry.rs`, `src/main.rs`
+
+### M17.2 Remove exec fallback — P0
+
+**Tasks:**
+- [x] `stream_step_native_tools`: delete the `finalize_native` closure; the three
+      exit points return `response.content` / `response.content` / `String::new()`.
+      Drop the empty-`tools=[]` call.
+- [x] `spawn_execution_with_plan`: drop `final_step_directive`; change user_msg
+      rule #4 from "ALWAYS end the step with prose" → "End when the step's work is
+      done — you do NOT write a prose summary; a later Eval step answers the user."
+- [x] `QUICK_PLAN_SYSTEM` (`prompts.rs`): replace "Final answer step (REQUIRED)"
+      with "the last step is just the last work step; an Eval step summarizes."
+- [x] `CODING_SYSTEM` (`prompts.rs`): drop any "answer in prose" directive.
+
+**Files:** `src/main.rs`, `src/agent/prompts.rs`
+
+### M17.3 Eval reflection step — P0
+
+**Tasks:**
+- [x] Rewrite `spawn_eval_review` → `spawn_eval_reflection(app_state, user_request,
+      plan, exec_output, redo_count, tx)`:
+  - Build one-element `submit_evaluation` tool def (JSON schema).
+  - System prompt: judge satisfaction (**bias PASS**); write a concise
+    **answer-only** summary (no CoT/rules); if unsatisfied, propose
+    `further`/`plan` + reason + suggested request; if `redo_count >= MAX_REDOS`,
+    "do not propose a redo."
+  - Call `chat_native_streaming(eval_model, messages, &[eval_tool], no-op cb)`.
+  - Parse `tool_calls[0].arguments` → `EvalVerdict`; no tool call →
+    `{satisfied:true, summary:content}`.
+  - Emit `EvalReady { verdict, model }`.
+
+**Files:** `src/main.rs`
+
+### M17.4 StreamDone split (TUI) — P0
+
+**Tasks (`main.rs:818-973`):**
+- [x] Keep: sanitize, `finish_stream`, file-change apply per mode, bash blocks.
+- [x] Drop: pushing exec content to `conversation_history`; `Separator`;
+      post-snapshot/recap-finalize; setting `is_processing=false` (when eval runs).
+- [x] Stash exec content + original request + plan on `app_state`.
+- [x] If distinct eval model && `mode != Plan`: `spawn_eval_reflection(...)`,
+      leave `is_processing=true`.
+- [x] Else (short-circuit): push exec content as the assistant message, post-
+      snapshot, recap, `Separator`, `is_processing=false`.
+
+**Files:** `src/main.rs`, `src/app.rs`
+
+### M17.5 EvalReady handler (TUI) — P0
+
+**Tasks (`main.rs:1116`):**
+- [x] Sanitize + promote `verdict.summary` (fall back to stashed exec content if
+      empty) → `conversation_history` (assistant) + `OutputLine::Assistant`.
+- [x] `maybe_compact` + summarize trigger; post-snapshot (if not done); recap.
+- [x] If `satisfied || proposal.is_none() || redo_count >= cap`: `Separator`;
+      `is_processing=false`.
+- [x] Else: if `awaiting_confirmation` → stash in `pending_redo_proposal` + note;
+      else set `pending_redo_decision` + y/n/o prompt + `is_processing=false`.
+
+**Files:** `src/main.rs`
+
+### M17.6 Redo approval + drain guard — P0
+
+**Tasks:**
+- [x] `app.rs`: add `pending_redo_decision`, `pending_redo_proposal` (stash),
+      `redo_count`, `last_exec_output`, `last_user_request`, `last_plan`;
+      `const MAX_REDOS: u32 = 2`. Reset `redo_count=0` at fresh request.
+- [x] New key handler (mirror `main.rs:1278`): `y` → build redo input
+      (`Further`→`proposal.request`; `Plan`→`last_user_request`) + `[Previous
+      attempt]` block; `spawn_request_for_mode`; `redo_count+=1`;
+      `is_processing=true`. `n` → clear + `Separator` + `is_processing=false`.
+      `o` → `awaiting_other_input=true`.
+- [x] When Edit file confirmation finishes, promote stashed
+      `pending_redo_proposal` → `pending_redo_decision`.
+- [x] Drain guard (`main.rs:1123`): only drain when `!is_processing &&
+      pending_redo_decision.is_none() && !awaiting_confirmation &&
+      pending_plan.is_none()`.
+
+**Files:** `src/main.rs`, `src/app.rs`
+
+### M17.7 Headless — P1
+
+**Tasks (`main.rs:429-432, 487-490`):**
+- [x] `EvalReady`: print summary; if unsatisfied, print proposal note; no block.
+
+**Files:** `src/main.rs`
+
+### M17.8 Tests & verification — P0
+
+- [x] Unit tests: `EvalVerdict` parsing (satisfied/summary/proposal + no-tool-call
+      fallback); redo-input builder (with `[Previous attempt]`); drain-guard
+      predicate.
+- [x] `cargo build` clean; `cargo test --bin litepilot` = 307 passed / 0 failed / 1
+      ignored (was 301, +6 new); `cargo clippy` introduces **zero new warnings**
+      (5 pre-existing in untouched files: baseline is 6).
+- [ ] Manual (needs live Ollama + distinct eval model): satisfied path (summary
+      shown, exec content absent from history); unsatisfied path (`y` triggers redo
+      with context); single-model short-circuit.
+
+### M17.9 Implementation order
+
+```
+M17.1 (types + contract)        compiler-guided; consumers stubbed
+  → M17.2 (remove fallback)     small, behavior-changing, build-green
+  → M17.3 (eval reflection)     the core new feature
+  → M17.4 (StreamDone split)    wires eval in; drain guard critical
+  → M17.5 (EvalReady TUI)       canonical answer + redo trigger
+  → M17.6 (redo approval)       closes the loop
+  → M17.7 (headless)            parity
+  → M17.8 (tests)               verify
+```
+
+### M17.10 Risks
+
+- **Eval tool-call reliability** — mitigated by no-tool-call → PASS fallback.
+- **`is_processing` lifecycle** — the drain guard is the critical correctness fix.
+- **Edit file-confirmation × eval-redo ordering** — stash-and-promote resolves it.
+- **Latency** — +1 eval-model call/turn (documented; short-circuit for 1-model).
+- **Eval judging its own kind** — bias-PASS prompt + redo cap limit false-redo spam.

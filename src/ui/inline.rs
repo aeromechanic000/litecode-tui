@@ -206,6 +206,13 @@ fn render_line(ol: &OutputLine, theme: &Theme, width: usize) -> Vec<Line<'static
             lines
         }
 
+        OutputLine::Phase(name) => vec![Line::from(Span::styled(
+            format!("\u{25c6} {}", name), // ◆
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ))],
+
         OutputLine::Separator => vec![Line::from(vec![
             Span::styled(
                 "\u{2500}".repeat(20), // ────
@@ -379,6 +386,7 @@ pub fn estimate_line_count(lines: &[OutputLine], width: u16) -> u16 {
                     }
                 }
             }
+            OutputLine::Phase(_) => count += 1,
             OutputLine::Separator => count += 1,
         }
     }

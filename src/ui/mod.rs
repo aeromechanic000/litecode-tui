@@ -53,6 +53,8 @@ pub enum OutputLine {
     Thinking(()),
     Pending(String),
     Plan(String),
+    /// A phase header (e.g. "Exec", "Eval") rendered like the Plan header (◆).
+    Phase(String),
     Separator,
 }
 

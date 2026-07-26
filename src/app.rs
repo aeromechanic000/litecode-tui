@@ -84,6 +84,20 @@ pub struct AppState {
     pub pending_queue: Vec<String>,
     pub conversation_history: Vec<ConversationMessage>,
     pub pending_plan: Option<String>,
+    /// Eval-redo loop: the proposal awaiting a y/n/o decision (the active prompt).
+    pub pending_redo_decision: Option<crate::agent::retry::RedoProposal>,
+    /// Stashed redo proposal held while Edit file-confirmation is active; promoted
+    /// to `pending_redo_decision` once the last file is reviewed.
+    pub pending_redo_proposal: Option<crate::agent::retry::RedoProposal>,
+    /// Redos already run this turn; caps auto-proposed redos at MAX_REDOS_PER_TURN.
+    pub redo_count: u32,
+    /// Last execution output (exec content) — input to the eval step and to the
+    /// `[Previous attempt]` context injected on a redo.
+    pub last_exec_output: Option<String>,
+    /// The original user request for the current turn (drives eval + redo).
+    pub last_user_request: Option<String>,
+    /// The plan that was executed for the current turn (drives eval + redo).
+    pub last_plan: Option<String>,
     pub prompt_builder: PromptBuilder,
     pub conversation_summary: Option<String>,
     pub summarizer_config: SummarizerConfig,
@@ -153,6 +167,12 @@ impl AppState {
             pending_queue: Vec::new(),
             conversation_history: Vec::new(),
             pending_plan: None,
+            pending_redo_decision: None,
+            pending_redo_proposal: None,
+            redo_count: 0,
+            last_exec_output: None,
+            last_user_request: None,
+            last_plan: None,
             prompt_builder,
             conversation_summary: None,
             summarizer_config: SummarizerConfig::default(),

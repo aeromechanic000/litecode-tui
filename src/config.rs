@@ -41,6 +41,7 @@ pub struct Config {
     pub connect_timeout: u64,
     pub exec_model: String,
     pub eval_model: String,
+    pub plan_model: String,
     pub default_mode: String,
     pub auto_mode_only_workspace: bool,
     pub enable_auto_syntax_check: bool,
@@ -70,6 +71,7 @@ impl Default for Config {
             connect_timeout: 15,
             exec_model: String::new(),
             eval_model: String::new(),
+            plan_model: String::new(),
             default_mode: "edit".to_string(),
             auto_mode_only_workspace: true,
             enable_auto_syntax_check: true,
@@ -248,6 +250,25 @@ impl Config {
     pub fn keep_eval_resident(&self) -> bool {
         self.model_residency == "both" && !self.eval_model.is_empty()
     }
+
+    /// The model used for planning. Falls back to `exec_model` when unset, so a
+    /// single-model configuration still plans with the exec model.
+    pub fn effective_plan_model(&self) -> &str {
+        if self.plan_model.is_empty() {
+            &self.exec_model
+        } else {
+            &self.plan_model
+        }
+    }
+
+    /// Whether the plan model should be kept resident in Ollama. Only when a
+    /// distinct plan model is configured and residency is enabled — avoids warming
+    /// a model identical to exec (already resident).
+    pub fn keep_plan_resident(&self) -> bool {
+        self.model_residency == "both"
+            && !self.plan_model.is_empty()
+            && self.plan_model != self.exec_model
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +367,14 @@ mod tests {
         assert!(config.keep_exec_resident());
         assert!(config.keep_eval_resident());
 
+        // Plan model: resident only when set and distinct from exec.
+        config.plan_model = "qwen3:32b".into();
+        assert!(config.keep_plan_resident());
+        config.plan_model = config.exec_model.clone(); // same as exec
+        assert!(!config.keep_plan_resident());
+        config.plan_model = String::new(); // unset
+        assert!(!config.keep_plan_resident());
+
         // "both" but no eval model set → keep_eval_resident is false
         config.eval_model = String::new();
         assert!(!config.keep_eval_resident());
@@ -376,6 +405,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.effective_eval_model(), "qwen3:8b");
+    }
+
+    #[test]
+    fn empty_plan_falls_back_to_exec() {
+        let config = Config {
+            plan_model: String::new(),
+            exec_model: "qwen3:8b".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_plan_model(), "qwen3:8b");
+    }
+
+    #[test]
+    fn plan_model_used_when_set() {
+        let config = Config {
+            plan_model: "qwen3:32b".into(),
+            exec_model: "qwen3:8b".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_plan_model(), "qwen3:32b");
     }
 
     #[test]
