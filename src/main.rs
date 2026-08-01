@@ -3044,28 +3044,10 @@ fn spawn_eval_reflection(
             exec_output.clone()
         };
 
-        let eval_system = format!(
-            "You are the EVALUATION stage of a Plan→Execute→Eval coding agent. A separate \
-             executor already produced the work below. Judge whether that execution satisfies \
-             the user's original request, and write the concise final answer the user sees.\n\n\
-             You MUST call the `submit_evaluation` tool exactly once with:\n\
-             - satisfied: true if the execution fully addresses the request; false ONLY on a \
-             clear, concrete shortfall (missing file, wrong behavior, unanswered question). \
-             Bias toward true — do not mark false for style, wording, or minor preferences.\n\
-             - summary: the concise, answer-only response to the user. State what was done / \
-             the answer directly. Do NOT include chain-of-thought, reasoning steps, or rules \
-             copied from any instructions. Keep it short.\n\
-             - redo_kind: \"none\" when satisfied; \"further\" for one more targeted pass with \
-             a specific follow-up; \"plan\" to re-plan and re-execute from scratch. Only set \
-             non-\"none\" when satisfied=false.\n\
-             - redo_reason: 1-2 sentences on the concrete shortfall (empty when satisfied).\n\
-             - redo_request: the exact follow-up request to run for a \"further\" redo (empty \
-             otherwise).\n\n{}\n\n\
-             The execution output may contain tool calls, file blocks (### FILE:), and command \
-             results — treat those as the work performed. Files mentioned were already written \
-             to disk.",
-            redo_cap_note
-        );
+        // Eval criteria live in `agent::prompts::EVAL_SYSTEM` (a `pub const`) so the
+        // runtime-evidence rule can be drift-guarded by a unit test. The `{}` placeholder
+        // carries the redo-cap note (empty when redos remain this turn).
+        let eval_system = agent::prompts::EVAL_SYSTEM.replace("{}", &redo_cap_note);
 
         // Tool-call transcript. The assistant text (exec output) is often empty for
         // a tool-only step, so this is where the concrete results live — e.g. the

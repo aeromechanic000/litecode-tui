@@ -23,6 +23,13 @@ File-as-memory planning:
 - Design each step to write its output to a file immediately — the file becomes the agent's memory for subsequent steps.
 - Later steps should reference files written by earlier steps (e.g. "Read index.html from step 2, then add the CSS link").
 
+Verification (mandatory for runnable output):
+- Any step that creates or edits runnable code (a script, program, or shell command) MUST
+  be followed by a step that RUNS it via exec_shell and observes the actual output.
+- If the deliverable is a runnable result (e.g. "translate and print", "compute and show",
+  "fetch and display"), the run step IS the final step — do NOT stop after writing the file.
+- Reading code is not verification. A plan that writes code but never runs it is incomplete.
+
 Closing step:
 - The LAST step is simply the last work step of the plan — you do NOT need a separate
   "answer" step. Do not write a step whose only purpose is to summarize in prose.
@@ -37,6 +44,23 @@ Output format: numbered steps, one per line:
 2. Use web_search to research the latest authentication API
 3. Create file skeleton
 ..."#;
+
+/// Eval-stage system prompt for `spawn_eval_reflection` (`src/main.rs`). The single `{}`
+/// placeholder is filled at runtime with the redo-cap note (an empty `String` when redos
+/// remain this turn). Kept here as a `pub const` — peer to `QUICK_PLAN_SYSTEM` — so the
+/// runtime-evidence rule can be drift-guarded by a unit test, like the planner prompt.
+pub const EVAL_SYSTEM: &str = r#"You are the EVALUATION stage of a Plan→Execute→Eval coding agent. A separate executor already produced the work below. Judge whether that execution satisfies the user's original request, and write the concise final answer the user sees.
+
+You MUST call the `submit_evaluation` tool exactly once with:
+- satisfied: true ONLY if the execution fully addresses the request AND, for any task that produces runnable code or commands, that code was actually EXECUTED via exec_shell and produced the expected output. If files or code were written but never run, that is a concrete shortfall: set satisfied=false, redo_kind="further", and redo_request to run the file/command via exec_shell, show its output, and fix any error. Do NOT judge runnable code by reading it — runtime evidence is required. Bias toward true only after seeing that output; never mark true on looks alone.
+- summary: the concise, answer-only response to the user. State what was done / the answer directly. Do NOT include chain-of-thought, reasoning steps, or rules copied from any instructions. Keep it short.
+- redo_kind: "none" when satisfied; "further" for one more targeted pass with a specific follow-up; "plan" to re-plan and re-execute from scratch. Only set non-"none" when satisfied=false.
+- redo_reason: 1-2 sentences on the concrete shortfall (empty when satisfied).
+- redo_request: the exact follow-up request to run for a "further" redo (empty otherwise).
+
+{}
+
+The execution output may contain tool calls, file blocks (### FILE:), and command results — treat those as the work performed. Files mentioned were already written to disk."#;
 
 #[allow(dead_code)]
 pub const COMPACT_SYSTEM: &str = r#"Summarize this conversation into key points: decisions made, files created/modified, important context. Keep it under 200 words."#;
@@ -240,6 +264,44 @@ mod tests {
         assert_eq!(
             system_prompt_for_size(&ModelSize::Large),
             LARGE_MODEL_SYSTEM
+        );
+    }
+
+    /// Guards the runnable-output verification rule in `QUICK_PLAN_SYSTEM` against prompt
+    /// drift. We cannot deterministically assert that the *model* obeys (that needs a
+    /// live Ollama call), but we can lock in that the planner prompt *instructs* it to
+    /// add a run step via `exec_shell` for any runnable deliverable. Before this rule the
+    /// planner prompt named no execution tool, so the agent wrote code but never ran it.
+    /// If these anchors disappear, the agent silently regresses to that failure mode.
+    #[test]
+    fn planner_prompt_requires_run_step_for_runnable_output() {
+        assert!(
+            QUICK_PLAN_SYSTEM.contains("exec_shell"),
+            "planner prompt must name exec_shell as the tool for verifying runnable output"
+        );
+        assert!(
+            QUICK_PLAN_SYSTEM.contains("runnable"),
+            "planner prompt must require running/verifying runnable output before finishing"
+        );
+    }
+
+    /// Symmetric drift guard for the eval stage. `EVAL_SYSTEM` must (a) demand runtime
+    /// evidence — not static code reading — before marking a runnable task satisfied, and
+    /// (b) carry exactly one `{}` placeholder for the redo-cap note injected at runtime.
+    #[test]
+    fn eval_prompt_requires_runtime_evidence() {
+        assert!(
+            EVAL_SYSTEM.contains("exec_shell"),
+            "eval prompt must require runnable code be executed via exec_shell before satisfied=true"
+        );
+        assert!(
+            EVAL_SYSTEM.contains("runtime evidence"),
+            "eval prompt must reject static code reading in favor of runtime evidence"
+        );
+        assert_eq!(
+            EVAL_SYSTEM.matches("{}").count(),
+            1,
+            "EVAL_SYSTEM must have exactly one '{{}}' placeholder for the redo-cap note"
         );
     }
 }
