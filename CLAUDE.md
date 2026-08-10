@@ -79,7 +79,9 @@ src/
 │   └── seatbelt.rs      macOS Seatbelt sandbox (compiled profile)
 │
 ├── search/
-│   ├── mod.rs           SearchEngine: DuckDuckGo HTML scraping, result truncation
+│   ├── mod.rs           SearchEngine: multi-backend web search (Bing / Baidu /
+│   │                    SearXNG / DuckDuckGo), region-aware fallback chain
+│   │                    (auto_switch_network_region), result truncation
 │   └── cache.rs         SearchCache: disk-based cache with TTL expiry
 │
 ├── project/
@@ -94,7 +96,8 @@ src/
 ├── skills/
 │   ├── mod.rs           SkillRegistry: load/lookup/trigger matching
 │   ├── parser.rs        Markdown + YAML frontmatter skill parser
-│   └── builtin.rs       Built-in skills population to ~/.litepilot/skills/
+│   └── builtin.rs       Seeds built-in skills into ~/.litepilot/skills/ at
+│                        startup (only-if-missing, never overwrites)
 │
 ├── approval.rs          Risk classification (Safe/Write/Destructive), command classification
 ├── hooks.rs             JsonlSink: structured event logging (turn start/complete, tool events)
@@ -367,6 +370,9 @@ eval_model = "qwen3:14b"
 default_mode = "edit"
 max_retries = 3
 enable_free_web_search = true
+auto_switch_network_region = true   # on backend failure, try region-reachable fallbacks
+web_search_backend = "bing"          # bing | baidu | duckduckgo | searxng (bing is reachable in mainland China)
+# searxng_url = "http://localhost:8080"   # optional self-hosted SearXNG instance (bypasses regional blocks)
 search_cache_valid_days = 30
 max_search_context_tokens = 2048
 
@@ -375,6 +381,26 @@ primary = "cyan"
 accent = "magenta"
 warning = "yellow"
 ```
+
+### Web search backends
+
+`web_search` queries a configurable backend and, when
+`auto_switch_network_region = true` (the default), falls through to
+region-reachable alternatives on failure so search still works behind a regional
+network block (e.g. mainland China, where DuckDuckGo is blocked). The configured
+backend (`web_search_backend`) is tried first — strict preference; the fallback
+order is SearXNG (only when `searxng_url` is set — a self-hosted instance
+bypasses blocks entirely) → Bing (reachable in CN, broad coverage) → Baidu
+(CN-local) → DuckDuckGo. With `auto_switch_network_region = false`, only the
+configured backend is used.
+
+Each backend request has a 15s timeout, so a blocked backend fails fast instead
+of hanging the turn. Only non-empty results are cached, so a blocked/empty
+response never poisons the cache. When every backend is unreachable,
+`web_search` surfaces a distinct "all backends unreachable" error (hinting at a
+regional block) rather than a bare failure — and the global instructions tell
+the agent to treat repeated cross-host timeouts as a regional block, not a
+per-site outage.
 
 Config loading: project-local → global → defaults.
 
@@ -395,8 +421,13 @@ rules) that should apply on every turn.
 ### 2. Skills — invoked or auto-triggered
 Skills live as Markdown + YAML frontmatter files in `~/.litepilot/skills/`
 (`name`, `description`, `trigger: keyword1, keyword2`). `SkillRegistry` loads
-them at startup; `populate_skills` writes the built-in skills only if absent
-(never overwrites user edits).
+them at startup. Also at startup, `Config::ensure_dirs_for` → `populate_skills`
+**seeds the built-in skills into the global `~/.litepilot/skills/`** — always the
+global dir, even when a project-local `.litepilot/` is the effective config dir.
+The built-ins are: `search`, `review`, `explain`, `simplify`, `test`. Each is
+written **only if missing** — existing files are never overwritten, so your edits
+are safe. Seeding covers *only* these built-ins: a skill you add or delete
+yourself is never re-created or restored.
 
 - **By invocation**: the user types `/skill_name args` → `spawn_skill_request`
   appends the skill body to the system prompt.
@@ -575,7 +606,7 @@ context budget (see *Context Window Management*).
 
 ## Testing Strategy
 
-- **Unit tests**: Each module has `#[cfg(test)] mod tests` inline. ~300 tests.
+- **Unit tests**: Each module has `#[cfg(test)] mod tests` inline. ~325 tests.
 - **Integration tests**: `tests/` directory. Tests needing live Ollama marked `#[ignore]`.
 - **Sandbox tests**: Verify path traversal blocking, command allowlist enforcement.
 - **Property tests**: `proptest` for config parsing, diff generation, token estimation.

@@ -152,11 +152,17 @@ Key routing: Shift+Tab, Ctrl+C, Ctrl+S, Enter, Esc, Backspace, PageUp/Down, Tab,
 
 ### M6.2 Web search DONE
 
-`src/search/mod.rs` — DuckDuckGo HTML scraping, result truncation.
-`src/search/cache.rs` — Disk cache with TTL expiry.
+`src/search/mod.rs` — multi-backend web search (Bing / Baidu / SearXNG /
+DuckDuckGo) with a region-aware fallback chain, per-backend HTML/JSON parsing,
+and result truncation.
+`src/search/cache.rs` — Disk cache with TTL expiry (only non-empty results cached).
 UI toggle (Ctrl+S) shows SEARCH:ON/OFF in status bar.
-When enabled, web search runs automatically and results injected into LLM context.
-`WebSearch` tool registered in ToolRegistry for agent loop access.
+Backend selection is config-driven (`web_search_backend`,
+`auto_switch_network_region`, `searxng_url`). The `web_search` and `web_reader`
+tools are registered in ToolRegistry and called by the model directly; when
+`auto_switch_network_region` is on, a blocked backend falls through to
+region-reachable alternatives so search still works behind a regional block
+(e.g. mainland China, where DuckDuckGo is blocked).
 
 ---
 

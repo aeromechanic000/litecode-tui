@@ -12,6 +12,13 @@ fn default_max_file_lines() -> usize {
     60
 }
 
+/// Default search backend. Bing is reachable in mainland China (where
+/// DuckDuckGo is blocked) and covers both Chinese and international queries,
+/// so it works out of the box in network-restricted regions.
+fn default_web_search_backend() -> String {
+    "bing".to_string()
+}
+
 /// Theme colors stored as hex strings (e.g. "#315DFC").
 /// All other UI colors are derived from these three — normal text and
 /// backgrounds use terminal defaults ("reset").
@@ -53,6 +60,18 @@ pub struct Config {
     pub enable_away_summary: bool,
     pub search_cache_valid_days: u64,
     pub max_search_context_tokens: usize,
+    /// Which search backend `web_search` queries first: "bing" (default),
+    /// "baidu", "duckduckgo", or "searxng". Honored strictly — when
+    /// `auto_switch_network_region` is off only this backend is used. When on,
+    /// it is tried first and region-reachable fallbacks follow on failure.
+    #[serde(default = "default_web_search_backend")]
+    pub web_search_backend: String,
+    /// URL of a self-hosted SearXNG instance (e.g. "http://localhost:8080").
+    /// When set, SearXNG joins the backend fallback chain; with
+    /// `web_search_backend = "searxng"` it is used first. A self-hosted
+    /// instance bypasses regional blocks entirely.
+    #[serde(default)]
+    pub searxng_url: Option<String>,
     pub max_retries: usize,
     #[serde(default = "default_context_window")]
     pub context_window_limit: u64,
@@ -83,6 +102,8 @@ impl Default for Config {
             enable_away_summary: true,
             search_cache_valid_days: 30,
             max_search_context_tokens: 2048,
+            web_search_backend: default_web_search_backend(),
+            searxng_url: None,
             max_retries: 3,
             context_window_limit: 262144,
             max_file_lines: 60,

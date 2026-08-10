@@ -32,13 +32,13 @@ cargo test
 | agent/syntax.rs | 3 | Language detection by extension and path, nonexistent file |
 | agent/auto_run.rs | 1 | MAX_RETRIES constant |
 | app.rs | 7 | Mode cycle, permissions per mode, mode parsing, pending actions, state switch |
-| config.rs | 11 | Defaults, load/save roundtrip, TOML serialization, theme roundtrip, validation, proptest |
+| config.rs | 16 | Defaults, load/save roundtrip, TOML serialization, theme roundtrip, validation, proptest |
 | ollama/mod.rs | 3 | Client construction, ping connection refused, list models connection refused |
 | ollama/chat.rs | 3 | Message constructors, request serialization, model not found |
 | ollama/model.rs | 7 | Size classification, context window, parameter estimation |
 | sandbox/mod.rs | 6 | Path traversal, outside workspace, symlink, command allowlist/blocklist |
 | sandbox/executor.rs | 3 | Echo execution, blocked command, CWD execution |
-| search/mod.rs | 4 | URL encoding, truncation, disabled search, toggle |
+| search/mod.rs | 17 | Backend parse + fallback-chain ordering, Bing/Baidu/SearXNG parsers, query-language classification, URL + percent encoding, entity unescape, truncation, disabled, toggle |
 | search/cache.rs | 4 | Set/get, miss, expiry, case-insensitive hash |
 | project/mod.rs | 2 | File tree listing, gitignore exclusion |
 | project/file_ops.rs | 5 | Plan mode blocks, edit mode allows, auto mode applies, outside workspace, delete |

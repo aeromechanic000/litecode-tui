@@ -50,7 +50,14 @@ impl Tool for WebSearch {
             Err(e) => Ok(ToolResult::err(
                 "web_search",
                 call_id,
-                format!("Search failed: {}", e),
+                format!(
+                    "Search failed: {}. This usually means a regional network \
+                     block (e.g. mainland China blocks DuckDuckGo, and a \
+                     self-hosted SearXNG may be unreachable too). Set \
+                     web_search_backend to a reachable backend (bing or baidu) \
+                     or configure searxng_url.",
+                    e
+                ),
             )),
         }
     }

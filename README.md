@@ -22,7 +22,7 @@ No cloud. No API keys. Nothing leaves your machine. I run on two local models �
 
 **I remember our conversations.** Sessions saved to `~/.litepilot/sessions/`. Resume anytime with `--resume`.
 
-**I can search the web.** Optional DuckDuckGo search, cached locally on your disk.
+**I can search the web.** Multi-backend web search (Bing/Baidu/SearXNG/DuckDuckGo) with region-aware fallback — keeps working behind regional blocks like mainland China. Cached on disk.
 
 ## Getting Started
 
@@ -179,7 +179,7 @@ src/
 │                          run diagnostics, scrub fake tool calls
 ├── tools/               Tool definitions I use in the agent loop (file ops, search, shell)
 ├── sandbox/             My security: path validation, command filtering, platform sandboxes
-├── search/              DuckDuckGo search with disk cache
+├── search/              Multi-backend web search (Bing/Baidu/SearXNG/DuckDuckGo) with region-aware fallback + disk cache
 ├── project/             File tree, git status, file operations, UV toolchain
 ├── session/             Session persistence (JSON)
 ├── skills/              Loadable skills (markdown + YAML frontmatter); invoked via
