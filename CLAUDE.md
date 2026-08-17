@@ -419,15 +419,33 @@ This is the home for short, universal conventions (e.g. filesystem/shell accurac
 rules) that should apply on every turn.
 
 ### 2. Skills — invoked or auto-triggered
+
+> **Default-skills convention:** unless a skill is explicitly marked as
+> device-local / user-private (in this file or the skill's own frontmatter), every
+> skill that exists in the LitePilot repo is a **default skill of LitePilot** and
+> must ship with the installation. A new default skill is added by placing its
+> `.md` in `src/skills_builtin/` and registering it in `BUILTIN_SKILLS`
+> (`src/skills/builtin.rs`) — merely dropping it into `~/.litepilot/skills/`
+> makes it device-local only, and it will be missing from every other install.
+
 Skills live as Markdown + YAML frontmatter files in `~/.litepilot/skills/`
 (`name`, `description`, `trigger: keyword1, keyword2`). `SkillRegistry` loads
 them at startup. Also at startup, `Config::ensure_dirs_for` → `populate_skills`
 **seeds the built-in skills into the global `~/.litepilot/skills/`** — always the
 global dir, even when a project-local `.litepilot/` is the effective config dir.
-The built-ins are: `search`, `review`, `explain`, `simplify`, `test`. Each is
-written **only if missing** — existing files are never overwritten, so your edits
-are safe. Seeding covers *only* these built-ins: a skill you add or delete
-yourself is never re-created or restored.
+The built-ins are: `search`, `review`, `explain`, `simplify`, `test`,
+`translate`, `count-files`. Each is written **only if missing** — existing files
+are never overwritten, so your edits are safe. Seeding covers *only* these
+built-ins: a skill you add or delete yourself is never re-created or restored
+(deleting a built-in's file *is* detected — see the startup check below).
+
+**Startup missing-skill check.** `populate_skills` returns the names of the
+built-ins it restored; `ensure_dirs_for` propagates that list to `main.rs`, which
+logs it (`tracing::info!`, after logger init) and prints
+`Restored missing built-in skill(s): …` to **stderr** (both TUI and headless
+modes; stderr so piped `-p` stdout stays clean), so a default skill deleted by
+accident (or absent from an upgrade) is silently healed and visibly reported,
+never silently missing.
 
 - **By invocation**: the user types `/skill_name args` → `spawn_skill_request`
   appends the skill body to the system prompt.

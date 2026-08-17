@@ -147,19 +147,23 @@ impl Config {
 
     /// Initialize directory structure and populate built-in skills.
     /// Used for both global (~/.litepilot) and project-local (.litepilot) dirs.
-    pub fn ensure_dirs_for(workspace: &Path) -> Result<PathBuf> {
+    /// Returns the effective config dir plus the names of built-in skills that
+    /// were missing and have been restored.
+    pub fn ensure_dirs_for(workspace: &Path) -> Result<(PathBuf, Vec<String>)> {
         let dir = Self::effective_dir(workspace);
         Self::create_dir_structure(&dir)?;
 
         // Always populate skills in global ~/.litepilot/skills/
         let global_dir = Self::config_dir()?;
-        let _ = crate::skills::builtin::populate_skills(&global_dir.join("skills"));
+        let restored_skills =
+            crate::skills::builtin::populate_skills(&global_dir.join("skills"))
+                .unwrap_or_default();
 
         // Seed global instructions.md (effective dir) with default conventions
         // if missing — never overwrites user edits.
         let _ = crate::prompt::ProjectInstructions::ensure_global_instructions(&dir);
 
-        Ok(dir)
+        Ok((dir, restored_skills))
     }
 
     fn create_dir_structure(dir: &Path) -> Result<()> {

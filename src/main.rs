@@ -96,7 +96,7 @@ fn main() -> Result<()> {
     }
 
     // Setup config — use project-local .litepilot if present, else global ~/.litepilot
-    let litepilot_dir = config::Config::ensure_dirs_for(&workspace)?;
+    let (litepilot_dir, restored_skills) = config::Config::ensure_dirs_for(&workspace)?;
     let config = config::Config::load_for_workspace(&workspace).unwrap_or_else(|_| {
         let default = config::Config::default();
         let _ = default.save(&litepilot_dir.join("config.toml"));
@@ -105,6 +105,18 @@ fn main() -> Result<()> {
 
     // Initialize file logging (guard must live until app exits)
     let _log_guard = logger::init(&litepilot_dir);
+
+    // Report built-in skills restored by the startup check (after logger init
+    // so the event is logged, and to stderr so piped stdout stays clean).
+    if !restored_skills.is_empty() {
+        let msg = format!(
+            "Restored missing built-in skill{}: {}",
+            if restored_skills.len() > 1 { "s" } else { "" },
+            restored_skills.join(", ")
+        );
+        tracing::info!("{}", msg);
+        eprintln!("{}", msg);
+    }
 
     tracing::info!(
         "LitePilot v{} starting | workspace={} | endpoint={}",
