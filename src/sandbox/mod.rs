@@ -36,7 +36,10 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "bun", "deno", "go", "gcc", "g++", "make", "cmake", "git", "curl", "wget", "ls", "cat", "head",
     "tail", "find", "grep", "rg", "fd", "echo", "pwd", "which", "env", "dotnet", "java", "javac",
     "bash", "sh", "zsh", "docker", "podman", "pytest", "jest", "vitest", "mkdir", "touch", "cp",
-    "mv", "test",
+    "mv", "test", // read-only system inspection (macOS and/or Linux); mutating tools with
+    // destructive subcommands (diskutil, hdiutil) are deliberately excluded
+    "df", "du", "stat", "file", "wc", "uname", "hostname", "id", "whoami", "date", "uptime", "ps",
+    "sysctl", "free", "lsblk", "sw_vers", "vm_stat", "system_profiler",
 ];
 
 #[allow(dead_code)]
@@ -184,6 +187,32 @@ mod tests {
             assert!(
                 sandbox.validate_command(cmd, &[]).is_ok(),
                 "Command {} should be allowed",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_inspection_commands_pass() {
+        let (_dir, sandbox) = setup();
+        for cmd in &["df", "du", "stat", "sysctl", "sw_vers", "system_profiler"] {
+            assert!(
+                sandbox.validate_command(cmd, &[]).is_ok(),
+                "Command {} should be allowed",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_inspection_tools_still_rejected() {
+        // diskutil/hdiutil have destructive subcommands (eraseDisk, attach -nomount)
+        // and are deliberately kept off the allowlist
+        let (_dir, sandbox) = setup();
+        for cmd in &["diskutil", "hdiutil"] {
+            assert!(
+                sandbox.validate_command(cmd, &[]).is_err(),
+                "Command {} should be rejected",
                 cmd
             );
         }

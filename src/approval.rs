@@ -44,7 +44,9 @@ pub fn classify_command(cmd: &str, args: &[&str]) -> RiskLevel {
     // Read-only commands
     let safe = [
         "ls", "cat", "head", "tail", "find", "grep", "rg", "fd", "echo", "pwd", "which", "env",
-        "git", "status", "diff", "log", "show", "branch",
+        "git", "status", "diff", "log", "show", "branch", // read-only system inspection
+        "df", "du", "stat", "file", "wc", "uname", "hostname", "id", "whoami", "date", "uptime",
+        "ps", "sysctl", "free", "lsblk", "sw_vers", "vm_stat", "system_profiler",
     ];
     if safe.contains(&base) {
         // git subcommands: only read-only ones are safe
@@ -207,6 +209,9 @@ mod tests {
         );
         assert_eq!(classify_command("git", &["status"]), RiskLevel::Safe);
         assert_eq!(classify_command("git", &["log"]), RiskLevel::Safe);
+        assert_eq!(classify_command("df", &["-h"]), RiskLevel::Safe);
+        assert_eq!(classify_command("stat", &["file.txt"]), RiskLevel::Safe);
+        assert_eq!(classify_command("sw_vers", &[]), RiskLevel::Safe);
     }
 
     #[test]

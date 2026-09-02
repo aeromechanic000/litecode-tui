@@ -313,7 +313,7 @@ File change confirmation in Edit mode requires y/n/a for every file change. Risk
 ## Sandbox Security
 
 - **Path validation**: Canonicalize paths, reject `..` traversal, block symlink escape outside workspace
-- **Command filtering**: Allowlist (cargo, python, node, npm, git, make, gcc, go, uv) + Blocklist (sudo, rm -rf /, chmod 777, mkfs, dd)
+- **Command filtering**: Allowlist (cargo, python, node, npm, git, make, gcc, go, uv + read-only inspection commands: df, du, stat, ps, sysctl, uname, sw_vers, system_profiler, …) + Blocklist (sudo, rm -rf /, chmod 777, mkfs, dd). Tools with destructive subcommands (diskutil, hdiutil) are deliberately excluded from the allowlist — disk-capacity questions are answerable via `df` / `system_profiler` / `lsblk`.
 - **Platform sandboxes**: Linux Landlock, macOS Seatbelt (compiled policy)
 - **Mode enforcement**: File writes blocked at code level in Plan mode
 
